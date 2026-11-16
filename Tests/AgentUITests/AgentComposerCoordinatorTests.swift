@@ -1,0 +1,179 @@
+import AgentCore
+import AppKit
+import XCTest
+@testable import AgentUI
+
+@MainActor
+final class AgentComposerCoordinatorTests: XCTestCase {
+    override func setUp() async throws {
+        await MainActor.run { AgentComposerCoordinator.recentlyUsed = [] }
+    }
+
+    /// Waits for the suggestions loaded in the background to show, failing
+    /// after a timeout long enough for a busy machine.
+    private func suggestions(_ surface: AgentPaneView, _ loaded: ([AgentComposerSuggestion]) -> Bool,
+                             file: StaticString = #filePath, line: UInt = #line) async throws {
+        let deadline = Date().addingTimeInterval(5)
+        while !loaded(surface.suggestions.items) {
+            guard Date() < deadline else {
+                return XCTFail("suggestions did not load: \(surface.suggestions.items.map(\.title))", file: file, line: line)
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
+    func testProviderCommandSelectionPreservesCommandForNativeExecution() async throws {
+        let surface = AgentPaneView(frame: NSRect(x: 0, y: 0, width: 700, height: 700))
+        let coordinator = AgentComposerCoordinator(surface: surface)
+        coordinator.providerCommands = ["compact", "context", "clear"]
+        surface.composer.string = "/compact"
+        surface.composer.setSelectedRange(NSRange(location: 8, length: 0))
+        coordinator.changed()
+        XCTAssertEqual(surface.suggestions.items.first?.kind, .providerCommand)
+        XCTAssertTrue(coordinator.handle(#selector(NSResponder.insertTab(_:))))
+        XCTAssertEqual(surface.composer.string, "/compact ")
+        XCTAssertFalse(coordinator.performTypedAction(), "Provider commands must reach the provider")
+        // The provider's /clear would reset its context under a transcript that still shows it.
+        var action: String?
+        coordinator.onAction = { action = $0 }
+        surface.composer.string = "/clear"
+        XCTAssertTrue(coordinator.performTypedAction())
+        XCTAssertEqual(action, "clear-conversation")
+    }
+
+    func testMenuHidesUnusableCommandsAndKeepsIdentitiesUnique() async throws {
+        let surface = AgentPaneView(frame: NSRect(x: 0, y: 0, width: 700, height: 700))
+        let coordinator = AgentComposerCoordinator(surface: surface)
+        coordinator.providerCommands = ["compact", "heapdump", "__remote-workflow", "clear", "model", "code-review", "status"]
+        coordinator.loadSkills = { [.init(id: "/s/code-review/SKILL.md", name: "code-review", description: "",
+                                          path: ServerPath("/s/code-review/SKILL.md"), instructions: ""),
+                                    .init(id: "/s/notes/SKILL.md", name: "notes", description: "",
+                                          path: ServerPath("/s/notes/SKILL.md"), instructions: "")] }
+        surface.composer.string = "/"
+        surface.composer.setSelectedRange(NSRange(location: 1, length: 0))
+        coordinator.changed()
+        try await suggestions(surface) { $0.contains { $0.title == "/skill:notes" } }
+        let items = surface.suggestions.items
+        let titles = items.map(\.title)
+        XCTAssertEqual(Set(items.map(\.id)).count, items.count)
+        XCTAssertEqual(titles.filter { $0 == "/clear" }.count, 1)
+        XCTAssertEqual(items.first { $0.title == "/clear" }?.kind, .action)
+        XCTAssertEqual(titles.filter { $0 == "/status" }.count, 1)
+        for hidden in ["/heapdump", "/__remote-workflow", "/access", "/skill:code-review"] {
+            XCTAssertFalse(titles.contains(hidden), hidden)
+        }
+        XCTAssertTrue(titles.contains("/code-review"))
+        XCTAssertTrue(titles.contains("/skill:notes"))
+        surface.composer.string = "/skill:code"
+        surface.composer.setSelectedRange(NSRange(location: 11, length: 0))
+        coordinator.changed()
+        XCTAssertEqual(surface.suggestions.items.first?.title, "/skill:code-review", "Browsing skills lists every skill")
+    }
+
+    /// Claude reports its commands in the snapshot; they must survive the wire and reach the `/` menu.
+    func testClaudeCommandsFromTheServerReachTheSlashMenu() async throws {
+        _ = NSApplication.shared
+        let session = SessionId(), project = ProjectId()
+        var sent = AgentChatSnapshot(session: session, project: project, provider: .claude, providerSession: "claude-1",
+                                     status: .idle, revision: 2)
+        sent.commands = ["review-pr", "heapdump", "__internal"]
+        let decoded = try WireJSON.decode(AgentChatSnapshot.self, from: WireJSON.encode(sent))
+        let controller = AgentPaneController(session: session, project: project, provider: .claude) { _ in decoded }
+        defer { controller.dispose() }
+        controller.refresh()
+        let deadline = Date().addingTimeInterval(5)
+        while controller.snapshot == nil, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        let composer = controller.surface.composer
+        composer.string = "/"
+        composer.setSelectedRange(NSRange(location: 1, length: 0))
+        controller.textDidChange(Notification(name: NSText.didChangeNotification, object: composer))
+        let titles = controller.surface.suggestions.items.map(\.title)
+        XCTAssertTrue(titles.contains("/review-pr"), "\(titles)")
+        XCTAssertFalse(titles.contains("/heapdump"))
+        XCTAssertFalse(titles.contains("/__internal"))
+    }
+
+    func testProviderCommandsAndSkillsComeBeforeNavigation() async throws {
+        let surface = AgentPaneView(frame: NSRect(x: 0, y: 0, width: 700, height: 700))
+        let coordinator = AgentComposerCoordinator(surface: surface)
+        coordinator.providerCommands = ["review", "compact"]
+        coordinator.loadSkills = { [.init(id: "s", name: "notes", description: "Take notes", path: ServerPath("/s/SKILL.md"), instructions: "")] }
+        surface.composer.string = "/"
+        surface.composer.setSelectedRange(NSRange(location: 1, length: 0))
+        coordinator.changed()
+        try await suggestions(surface) { $0.contains { $0.title == "/skill:notes" } }
+        let titles = surface.suggestions.items.map(\.title)
+        XCTAssertEqual(Array(titles.prefix(3)), ["/review", "/compact", "/skill:notes"])
+        XCTAssertEqual(surface.suggestions.items.first { $0.title == "/skill:notes" }?.subtitle, "Take notes")
+    }
+
+    func testCommandNameIgnoresPaths() {
+        XCTAssertEqual(AgentComposerCoordinator.commandName(in: "  /compact focus on tests"), "compact")
+        XCTAssertEqual(AgentComposerCoordinator.commandName(in: "/skill:review now"), "skill:review")
+        XCTAssertNil(AgentComposerCoordinator.commandName(in: "/Users/me/App.swift crashes"))
+        XCTAssertNil(AgentComposerCoordinator.commandName(in: "/ hello"))
+        XCTAssertNil(AgentComposerCoordinator.commandName(in: "compact"))
+    }
+
+    func testMentionSelectionReplacesOnlyTokenAndAttachesThreadContext() async throws {
+        let surface = AgentPaneView(frame: NSRect(x: 0, y: 0, width: 700, height: 700))
+        let coordinator = AgentComposerCoordinator(surface: surface)
+        coordinator.loadFiles = { ["Sources/Reader.swift"] }
+        coordinator.loadThreads = { [.init(id: "thread", title: "Reader review", context: "Assistant: relevant earlier answer")] }
+        var context = ""
+        coordinator.onContext = { _, text in context = text }
+        surface.composer.string = "Compare @re with this"
+        surface.composer.setSelectedRange(NSRange(location: 11, length: 0))
+        coordinator.changed()
+        try await suggestions(surface) { $0.first?.kind == .thread }
+        surface.suggestions.moveSelection(-surface.suggestions.selectedIndex)
+        XCTAssertTrue(coordinator.handle(#selector(NSResponder.insertTab(_:))))
+        XCTAssertTrue(surface.composer.string.hasPrefix("Compare @\"Reader review\" "))
+        XCTAssertTrue(surface.composer.string.hasSuffix("with this"))
+        XCTAssertTrue(context.contains("relevant earlier answer"))
+        XCTAssertTrue(surface.suggestions.isHidden)
+    }
+
+    func testEscapeDismissesAndSkillsUseRealInstructions() async throws {
+        let surface = AgentPaneView(frame: NSRect(x: 0, y: 0, width: 700, height: 700))
+        let coordinator = AgentComposerCoordinator(surface: surface)
+        coordinator.loadSkills = { [.init(id: "review", name: "review", description: "Review native code",
+                                          path: ServerPath("/workspace/.claude/skills/review/SKILL.md"), instructions: "Check layout constraints.")] }
+        surface.composer.string = "/skill:rev"
+        surface.composer.setSelectedRange(NSRange(location: 10, length: 0))
+        coordinator.changed()
+        try await suggestions(surface) { $0.first?.title == "/skill:review" }
+        var context = ""
+        coordinator.onContext = { _, value in context = value }
+        XCTAssertTrue(coordinator.handle(#selector(NSResponder.insertNewline(_:))))
+        XCTAssertTrue(context.contains("Check layout constraints."))
+        XCTAssertTrue(context.contains("/workspace/.claude/skills/review"))
+        surface.composer.string = "/"
+        surface.composer.setSelectedRange(NSRange(location: 1, length: 0))
+        coordinator.changed()
+        XCTAssertTrue(coordinator.handle(#selector(NSResponder.cancelOperation(_:))))
+        coordinator.changed()
+        XCTAssertTrue(surface.suggestions.isHidden)
+    }
+
+    func testProviderCommandsAreDescribedAndUsedOnesLeadTheMenu() async throws {
+        let surface = AgentPaneView(frame: NSRect(x: 0, y: 0, width: 700, height: 700))
+        let coordinator = AgentComposerCoordinator(surface: surface)
+        coordinator.providerCommands = ["review", "compact", "deploy"]
+        coordinator.loadSkills = { [.init(id: "d", name: "deploy", description: "Ship to staging", path: ServerPath("/d/SKILL.md"), instructions: "")] }
+        surface.composer.string = "/"
+        surface.composer.setSelectedRange(NSRange(location: 1, length: 0))
+        coordinator.changed()
+        try await suggestions(surface) { $0.contains { $0.title == "/deploy" && $0.subtitle == "Ship to staging" } }
+        let compact = try XCTUnwrap(surface.suggestions.items.first { $0.title == "/compact" })
+        XCTAssertEqual(compact.subtitle, "Summarize the conversation to free context")
+        surface.composer.string = "/comp"
+        surface.composer.setSelectedRange(NSRange(location: 5, length: 0))
+        coordinator.changed()
+        XCTAssertTrue(coordinator.handle(#selector(NSResponder.insertTab(_:))))
+        surface.composer.string = "/"
+        surface.composer.setSelectedRange(NSRange(location: 1, length: 0))
+        coordinator.changed()
+        XCTAssertEqual(surface.suggestions.items.first?.title, "/compact", "A command just used leads an empty menu")
+    }
+}

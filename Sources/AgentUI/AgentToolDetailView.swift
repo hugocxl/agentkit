@@ -1,0 +1,712 @@
+import AgentCore
+import AppKit
+
+@MainActor
+final class AgentToolDisclosure: NSView, NSTextViewDelegate {
+    override var isFlipped: Bool { true }
+    var fetchAttachment: AgentAttachmentCache.Fetch?
+    var onPreviewAttachments: ((String, [AgentChatAttachmentDescriptor], Int) -> Void)?
+    var onHeightChanged: (() -> Void)?
+    private let images = AgentToolImagesView(frame: .zero)
+    private let htmlCard = AgentHtmlDocumentCard(frame: .zero)
+    private var htmlTitles: [String: String] = [:]
+    private var htmlTitleTask: Task<Void, Never>?
+    private var htmlTitleKey: String?
+    /// Called when a button of the HTML document card is pressed.
+    var onHTMLDocument: ((AgentHtmlDocumentCard.Action, AgentHtmlDocumentReference) -> Void)?
+    /// Whether the card of the current item is showing.
+    var showsHTMLDocument: Bool { !htmlCard.isHidden }
+    var htmlDocumentCard: AgentHtmlDocumentCard { htmlCard }
+    var onOpenFile: ((String, Int?) -> Void)?
+    var workspaceRoot: String?
+    var onOpenToolDiff: ((String, AgentToolActivity) -> Void)?
+    var onDisclosure: (() -> Void)?
+    /// Opens the steps of the agent this tool call started.
+    var onOpenSubagent: ((String) -> Void)? { didSet { needsLayout = true } }
+    /// Shows the tool's whole output, which the server keeps when the transcript can't.
+    var onShowFullOutput: ((String) -> Void)?
+    var onRunShellCommand: ((String) -> Void)?
+    private let fullOutput = PillButton("Show full output", style: .plain)
+    private let header = AgentToolHeader(frame: .zero)
+    private let stepsButton = PillButton("Show steps", style: .plain)
+    private var showsSteps: Bool { onOpenSubagent != nil && item?.tool?.category == .subagent }
+    /// The bordered box an open tool call shows its result in.
+    private let box = ThemedBackground(color: { $0.fg.withAlphaComponent(0.035) })
+    private var hoverArea: NSTrackingArea?
+    private let body = AgentRichTextView(frame: .zero)
+    private let command = AgentRichTextView(frame: .zero)
+    private let exitStatus = AgentRichTextView(frame: .zero)
+    private let replArguments = AgentReplArguments(frame: .zero)
+    private var usesReplArguments: Bool { usesArgumentPanel && AgentReplArguments.accepts(item?.tool) }
+    private let argumentScroll = AgentPassThroughScrollView(frame: .zero)
+    private var restoredArgumentPosition: NSPoint?
+    var argumentScrollPosition: NSPoint { usesReplArguments ? replArguments.scrollPosition : restoredArgumentPosition ?? argumentScroll.contentView.bounds.origin }
+    func restoreArgumentScrollPosition(_ position: NSPoint) { restoredArgumentPosition = position; replArguments.restoreScrollPosition(position) }
+    private var scrollsArguments: Bool { usesArgumentPanel && AgentToolPresentation.argumentsNeedScroll(item?.tool?.input) }
+    private let scroll = AgentPassThroughScrollView(frame: .zero)
+    private let fileSearch = AgentFileSearchPanel(frame: .zero)
+    private let fileChange = AgentFileChangePanel(frame: .zero)
+    private let webSearch = AgentWebSearchPanel(frame: .zero)
+    private var item: AgentChatItem?
+    private var expanded = false
+    var grouped = false { didSet { needsLayout = true } }
+    private var headerHeight: CGFloat { 30 }
+    /// The gap between the header and the result box, and the box's inner padding.
+    private static let boxGap: CGFloat = 6
+    private static let boxPadding: CGFloat = 12
+    private var contentTop: CGFloat { headerHeight + Self.boxGap + Self.boxPadding }
+    /// The space below a result box, before the next row.
+    private static let boxTrailing: CGFloat = 6
+    private var theme = AgentTheme.shared
+    private var restoredScrollPosition: NSPoint?
+    private var bodyHeights: [CGFloat: CGFloat] = [:]
+    private var usesArgumentPanel: Bool {
+        guard let activity = item?.tool, !activity.presentsCommand else { return false }
+        if activity.presentation == .dynamicTool { return true }
+        return activity.presentation == nil && (activity.fileChanges ?? []).isEmpty
+            && [.read, .search, .other].contains(activity.category ?? .other)
+    }
+
+    var outputScrollPosition: NSPoint {
+        if item?.tool?.presentation == .fileChange { return fileChange.outputScrollPosition }
+        return restoredScrollPosition ?? scroll.contentView.bounds.origin
+    }
+    func restoreOutputScrollPosition(_ position: NSPoint?) {
+        restoredScrollPosition = position
+        fileChange.restoreOutputScrollPosition(position)
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        header.translatesAutoresizingMaskIntoConstraints = true
+        header.alignment = .left
+        header.font = AppFont.system(14)
+        header.lineBreakMode = .byTruncatingTail
+        header.imagePosition = .imageLeading
+        header.imageScaling = .scaleProportionallyDown
+        header.onPress = { [weak self] in
+            guard let self else { return }
+            self.onDisclosure?()
+        }
+        body.delegate = self
+        command.delegate = self
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.borderType = .noBorder
+        scroll.documentView = body
+        box.cornerRadius = 8
+        box.layer?.borderWidth = 1
+        box.isHidden = true
+        addSubview(box)
+        addSubview(images)
+        images.isHidden = true
+        images.onHeightChanged = { [weak self] in self?.onHeightChanged?() }
+        images.onPreview = { [weak self] item, attachments, index in self?.onPreviewAttachments?(item, attachments, index) }
+        addSubview(header)
+        addSubview(htmlCard)
+        htmlCard.isHidden = true
+        htmlCard.onAction = { [weak self] action in
+            guard let reference = self?.htmlCard.reference else { return }
+            self?.onHTMLDocument?(action, reference)
+        }
+        addSubview(scroll)
+        argumentScroll.drawsBackground = false
+        argumentScroll.hasVerticalScroller = true
+        argumentScroll.autohidesScrollers = true
+        argumentScroll.borderType = .noBorder
+        argumentScroll.isHidden = true
+        addSubview(argumentScroll)
+        addSubview(replArguments)
+        replArguments.isHidden = true
+        addSubview(command)
+        addSubview(exitStatus)
+        addSubview(fileSearch)
+        fileSearch.isHidden = true
+        addSubview(fileChange)
+        fileChange.isHidden = true
+        fileChange.onOpenDiff = { [weak self] in
+            guard let self, let item = self.item, let activity = item.tool else { return }
+            self.onOpenToolDiff?(item.id, activity)
+        }
+        addSubview(webSearch)
+        webSearch.isHidden = true
+        webSearch.onOpenURL = { NSWorkspace.shared.open($0) }
+        command.isHidden = true
+        exitStatus.isHidden = true
+        stepsButton.font = AppFont.small
+        stepsButton.isHidden = true
+        stepsButton.translatesAutoresizingMaskIntoConstraints = true
+        stepsButton.setAccessibilityLabel("Show the agent's steps")
+        stepsButton.onPress = { [weak self] in
+            guard let self, let id = self.item?.id else { return }
+            self.onOpenSubagent?(id)
+        }
+        addSubview(stepsButton)
+        fullOutput.font = AppFont.small
+        fullOutput.isHidden = true
+        fullOutput.translatesAutoresizingMaskIntoConstraints = true
+        fullOutput.onPress = { [weak self] in
+            guard let self, let id = self.item?.id else { return }
+            self.onShowFullOutput?(id)
+        }
+        addSubview(fullOutput)
+        header.menuProvider = { [weak self] in self?.actionsMenu() }
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
+        addTrackingArea(area)
+        hoverArea = area
+    }
+    override func mouseEntered(with event: NSEvent) { header.hovered = true }
+    override func mouseExited(with event: NSEvent) { header.hovered = false }
+
+    func update(_ item: AgentChatItem, expanded: Bool, theme: AgentTheme) {
+        guard self.item != item || self.theme !== theme || self.expanded != expanded else { return }
+        self.item = item
+        self.expanded = expanded
+        refresh(theme: theme)
+    }
+
+    func refresh(theme: AgentTheme) {
+        self.theme = theme
+        guard let item else { return }
+        bodyHeights.removeAll(keepingCapacity: true)
+        let activity = item.tool
+        let status = AgentToolRowPresentation.status(item)
+        let title = activity.map { AgentToolPresentation.displayName($0) } ?? String(item.text.prefix(240))
+        let operation = activity.flatMap { AgentToolPresentation.operation($0, root: workspaceRoot) }
+        let statusText = status.rawValue.capitalized
+        switch activity?.category {
+        case .command: header.activityIcon = .terminal
+        case .read: header.activityIcon = .eye
+        case .search: header.activityIcon = .search
+        case .edit: header.activityIcon = .pencil
+        case .web: header.activityIcon = .globe
+        case .subagent: header.activityIcon = .cpu
+        default: header.activityIcon = item.workContext?.itemType == "reasoning" ? .brain : .wrench
+        }
+        let hasText = [item.detail, activity?.input, activity?.output].contains { $0?.isEmpty == false }
+        header.isEnabled = hasText || activity?.exitCode != nil || !(activity?.filePaths ?? []).isEmpty
+            || !(activity?.fileChanges ?? []).isEmpty || !(activity?.urls ?? []).isEmpty
+            || (usesArgumentPanel && (item.attachments ?? []).contains { $0.mimeType.hasPrefix("image/") })
+        header.expanded = expanded
+        header.timestamp = activity?.startedAt
+        header.chipColor = theme.fgDim
+        header.plateColor = theme.fg.withAlphaComponent(0.06)
+        box.theme = theme
+        box.layer?.borderColor = theme.fg.withAlphaComponent(0.1).cgColor
+        let indicatesFailure = AgentToolRowPresentation.indicatesFailure(activity, status: status)
+        header.iconColor = indicatesFailure ? AgentToolRowPresentation.failureIconColor(theme: theme) : theme.fgDim
+        header.focusColor = theme.accent
+        header.title = title
+        header.operation = operation
+        let skipped = AgentToolNonExecution.label(item.workContext?.toolNonExecutionKind)
+        let outcome = AgentToolRowPresentation.outcome(activity, status: status)
+        let counts = activity.flatMap(AgentToolPresentation.changeCounts).map { "+\($0.additions) −\($0.deletions)" }
+        let notes = [counts, skipped, outcome, Self.thinkingTime(item)].compactMap { $0 }
+        header.suffix = notes.isEmpty ? nil : notes.joined(separator: " · ")
+        header.running = status == .running
+        header.labelColor = theme.fg
+        header.needsDisplay = true
+        header.toolTip = ([([title, operation, statusText, skipped, outcome].compactMap { $0 }).joined(separator: " · ")] + [header.timestampTooltip].compactMap { $0 }).joined(separator: "\n")
+        let isFileSearch = activity?.presentation == .fileSearch
+        fileSearch.isHidden = !expanded || !isFileSearch
+        if isFileSearch {
+            fileSearch.update(activity?.fileSearchDetails, root: workspaceRoot, theme: theme)
+            header.isEnabled = fileSearch.hasContent
+        }
+        let isFileChange = activity?.presentation == .fileChange
+        fileChange.isHidden = !expanded || !isFileChange
+        if isFileChange, let activity {
+            fileChange.update(activity, root: workspaceRoot, theme: theme)
+            header.isEnabled = true
+        }
+        let isWebSearch = activity?.presentation == .webSearch
+        webSearch.isHidden = !expanded || !isWebSearch
+        if isWebSearch, let activity {
+            webSearch.update(activity, theme: theme)
+            header.isEnabled = webSearch.hasContent
+        }
+        box.isHidden = !expanded || !header.isEnabled
+        header.setAccessibilityLabel((header.isEnabled ? (expanded ? "Collapse " : "Expand ") : "") + title + (operation.map { " " + $0 } ?? "") + ", " + statusText
+            + (skipped.map { ", " + $0 } ?? "") + (outcome.map { ", " + $0 } ?? "") + (indicatesFailure ? ", tool call failed" : ""))
+        // The open or closed state is a value of its own, not only words in the label.
+        header.setAccessibilityExpanded(header.isEnabled && expanded)
+        body.setAccessibilityLabel("Output of " + title)
+        command.setAccessibilityLabel("Command")
+        scroll.isHidden = !expanded || isWebSearch || isFileChange || isFileSearch
+        images.isHidden = !expanded || !usesArgumentPanel
+        refreshHTMLDocument(item, status: status, theme: theme)
+        images.fetch = fetchAttachment
+        if expanded, usesArgumentPanel { images.update(item, theme: theme) }
+        let isCommand = activity?.presentsCommand == true
+        argumentScroll.isHidden = !expanded || !scrollsArguments
+        if scrollsArguments {
+            if command.superview !== argumentScroll.contentView { argumentScroll.documentView = command }
+        } else if command.superview !== self {
+            argumentScroll.documentView = nil
+            addSubview(command)
+        }
+        replArguments.isHidden = !expanded || !usesReplArguments
+        if usesReplArguments, let activity { replArguments.update(activity, theme: theme) }
+        command.isHidden = !expanded || !(isCommand || usesArgumentPanel) || usesReplArguments
+        exitStatus.isHidden = !expanded || !isCommand || activity?.exitCode == nil || activity?.exitCode == 0
+        if expanded, isCommand, var activity {
+            activity.status = status
+            let source = NSMutableAttributedString(attributedString: AgentCommandPresentation.text("> ", color: theme.fgDim))
+            source.append(AgentCommandPresentation.source(activity, theme: theme))
+            command.setContent(source)
+            body.setContent(AgentToolText.linkingPathLines(AgentCommandPresentation.output(activity, theme: theme), theme: theme))
+            exitStatus.setContent(AgentCommandPresentation.text(exitStatus.isHidden ? "" : "exit \(activity.exitCode ?? 0)", color: theme.danger))
+        } else if expanded, usesArgumentPanel {
+            command.setContent(AgentToolText.linkingPathLines(AgentToolPresentation.arguments(activity?.input, theme: theme), theme: theme))
+            var presented = activity ?? AgentToolActivity()
+            presented.status = status
+            if presented.category == .subagent, presented.outputIsJSON != true, let report = presented.output, !report.isEmpty {
+                // An agent's report is Markdown written for the reader.
+                body.setContent(AgentMarkdown.render(report, theme: theme))
+            } else {
+                body.setContent(AgentToolText.linkingPathLines(images.hasImages ? AgentToolPresentation.output(presented.output, isJSON: presented.outputIsJSON == true, theme: theme) : AgentToolPresentation.completedOutput(presented, theme: theme), theme: theme))
+            }
+            exitStatus.setContent(AgentCommandPresentation.text("", color: theme.fgMuted))
+        } else if expanded && !isWebSearch && !isFileChange && !isFileSearch { body.setContent(AgentToolText.content(item, theme: theme)) }
+        body.selectedTextAttributes = [.backgroundColor: theme.accent.withAlphaComponent(0.22)]
+        command.selectedTextAttributes = body.selectedTextAttributes
+        exitStatus.selectedTextAttributes = body.selectedTextAttributes
+        needsLayout = true
+    }
+
+    /// Shows the card for a provider HTML document below the header, collapsed or expanded,
+    /// so the document is visible without opening the tool call. The title is read once
+    /// from the retained bytes.
+    private func refreshHTMLDocument(_ item: AgentChatItem, status: AgentToolActivity.Status, theme: AgentTheme) {
+        let reference = usesArgumentPanel ? AgentHtmlDocumentReference.find(in: item) : nil
+        guard let reference else {
+            htmlTitleTask?.cancel(); htmlTitleTask = nil
+            htmlCard.isHidden = true
+            return
+        }
+        let available = item.isComplete && status == .completed && fetchAttachment != nil
+        let key = reference.itemID + "/" + reference.attachmentID
+        let cached = htmlTitles[key]
+        htmlCard.isHidden = false
+        htmlCard.update(reference, documentTitle: cached.flatMap { $0.isEmpty ? nil : $0 }, available: available, theme: theme)
+        if htmlTitleKey != key { htmlTitleTask?.cancel(); htmlTitleTask = nil }
+        guard available, cached == nil, htmlTitleTask == nil, let fetch = fetchAttachment,
+              let attachment = item.attachments?.first(where: { $0.id == reference.attachmentID }) else { return }
+        htmlTitleKey = key
+        htmlTitleTask = Task { [weak self] in
+            let data = try? await fetch(reference.itemID, attachment)
+            guard !Task.isCancelled, let self else { return }
+            self.htmlTitleTask = nil
+            if self.htmlTitles.count >= 16 { self.htmlTitles.removeAll() }
+            let title = data.flatMap { AgentHtmlDocumentReference.title(in: $0) }
+            self.htmlTitles[key] = title ?? ""
+            guard let title, self.htmlCard.reference == reference else { return }
+            self.htmlCard.update(reference, documentTitle: title, available: self.htmlCard.isAvailable, theme: self.theme)
+        }
+    }
+
+    /// How long a finished reasoning row took, from a second up.
+    static func thinkingTime(_ item: AgentChatItem) -> String? {
+        guard item.tool == nil, item.workContext?.itemType == "reasoning", item.isComplete,
+              let start = item.createdAt, let end = item.updatedAt, end.timeIntervalSince(start) >= 1 else { return nil }
+        return AgentTurnTime.duration(end.timeIntervalSince(start))
+    }
+
+    /// The tool's actions: what it opened, ran or produced.
+    func actionsMenu() -> NSMenu? {
+        guard let item, let activity = item.tool else { return nil }
+        var items: [NSMenuItem] = []
+        let path = activity.filePaths?.first ?? activity.fileChangeDetails?.fileName ?? activity.fileChanges?.first?.path
+        if let path, !path.isEmpty {
+            items.append(ClosureMenuItem("Open File") { [weak self] in self?.onOpenFile?(path, nil) })
+            items.append(ClosureMenuItem("Copy Path") { Self.copy(path) })
+        }
+        let command = activity.presentsCommand ? AgentCommandPresentation.command(activity) : ""
+        if !command.isEmpty {
+            items.append(ClosureMenuItem("Copy Command") { Self.copy(command) })
+            if onRunShellCommand != nil {
+                items.append(ClosureMenuItem("Run in Terminal") { [weak self] in self?.onRunShellCommand?(command) })
+            }
+        }
+        if let output = activity.output, !output.isEmpty {
+            items.append(ClosureMenuItem("Copy Output") { Self.copy(output) })
+        }
+        if activity.fullOutputBytes != nil, onShowFullOutput != nil {
+            items.append(ClosureMenuItem("Show Full Output") { [weak self] in self?.onShowFullOutput?(item.id) })
+        }
+        if activity.presentation == .fileChange, onOpenToolDiff != nil {
+            items.append(ClosureMenuItem("Open Diff") { [weak self] in self?.onOpenToolDiff?(item.id, activity) })
+        }
+        guard !items.isEmpty else { return nil }
+        let menu = NSMenu()
+        for entry in items { menu.addItem(entry) }
+        return menu
+    }
+
+    private static func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    func height(for width: CGFloat) -> CGFloat {
+        guard expanded, header.isEnabled else { return headerHeight + (htmlCard.isHidden ? 0 : AgentHtmlDocumentCard.height + 8) }
+        let inner = innerWidth(width)
+        if item?.tool?.presentation == .fileSearch { return boxedHeight(fileSearch.arrange(width: inner, apply: false)) }
+        if item?.tool?.presentation == .fileChange {
+            fileChange.compactControls = (window?.contentView?.bounds.width ?? 640) >= 640
+            return boxedHeight(fileChange.arrange(width: inner, apply: false))
+        }
+        if item?.tool?.presentation == .webSearch { return boxedHeight(webSearch.arrange(width: inner, apply: false)) }
+        if item?.tool?.presentsCommand == true || usesArgumentPanel {
+            return commandLayout(width: width).height
+        }
+        return boxedHeight(min(256, bodyHeight(for: inner)))
+    }
+
+    private func innerWidth(_ width: CGFloat) -> CGFloat { max(1, width - 2 * Self.boxPadding) }
+
+    /// The row height when the box holds `content` points of result.
+    private func boxedHeight(_ content: CGFloat) -> CGFloat {
+        contentTop + content + Self.boxPadding + Self.boxTrailing
+    }
+
+    /// The result's area inside the box of a row `height` points tall.
+    private func contentFrame(height: CGFloat) -> NSRect {
+        NSRect(x: Self.boxPadding, y: contentTop, width: innerWidth(bounds.width),
+               height: max(0, height - contentTop - Self.boxPadding - Self.boxTrailing))
+    }
+
+    private func commandLayout(width: CGFloat) -> (card: NSRect, source: NSRect, images: NSRect, output: NSRect, exit: NSRect, height: CGFloat) {
+        let x = Self.boxPadding
+        let width = innerWidth(width)
+        let top = contentTop
+        var y = top
+        var card = NSRect(x: x, y: y, width: width, height: 0)
+        if !htmlCard.isHidden {
+            card.size.height = AgentHtmlDocumentCard.height
+            y = card.maxY
+        }
+        func frame(_ text: AgentRichTextView, limit: CGFloat = .greatestFiniteMagnitude) -> NSRect {
+            guard !text.string.isEmpty else { return NSRect(x: x, y: y, width: width, height: 0) }
+            if y > top { y += 6 }
+            let rounded = text.height(for: width)
+            let measured = text.textContainer.flatMap { text.layoutManager?.usedRect(for: $0).maxY } ?? rounded
+            let rect = NSRect(x: x, y: y, width: width, height: min(limit, measured))
+            y = rect.maxY
+            return rect
+        }
+        let source: NSRect
+        if usesReplArguments {
+            source = NSRect(x: x, y: y, width: width, height: replArguments.arrange(width: width, apply: false))
+            y = source.maxY
+        } else { source = frame(command, limit: scrollsArguments ? 320 : .greatestFiniteMagnitude) }
+        var imageFrame = NSRect(x: x, y: y, width: width, height: 0)
+        if usesArgumentPanel && images.hasImages {
+            if y > top { y += 6 }
+            imageFrame = NSRect(x: x, y: y, width: width, height: images.arrange(width: width, apply: false))
+            y = imageFrame.maxY
+        }
+        let output = frame(body, limit: 320)
+        let exit = frame(exitStatus)
+        return (card, source, imageFrame, output, exit, y + Self.boxPadding + Self.boxTrailing)
+    }
+
+    private func bodyHeight(for width: CGFloat) -> CGFloat {
+        if let height = bodyHeights[width] { return height }
+        let height = body.height(for: width)
+        if bodyHeights.count >= 4 { bodyHeights.removeAll(keepingCapacity: true) }
+        bodyHeights[width] = height
+        return height
+    }
+
+    override func layout() {
+        super.layout()
+        stepsButton.isHidden = !showsSteps
+        fullOutput.isHidden = !(expanded && item?.tool?.fullOutputBytes != nil && onShowFullOutput != nil)
+        let fullWidth = fullOutput.isHidden ? 0 : ceil(fullOutput.fittingSize.width)
+        let stepsWidth = stepsButton.isHidden ? 0 : ceil(stepsButton.fittingSize.width)
+        let trailing = (stepsWidth > 0 ? stepsWidth + 8 : 0) + (fullWidth > 0 ? fullWidth + 8 : 0)
+        header.frame = NSRect(x: 0, y: 0, width: header.naturalWidth(maximum: max(0, bounds.width - trailing)), height: headerHeight)
+        var x = header.frame.maxX + 8
+        if !stepsButton.isHidden {
+            stepsButton.setTitleColor(theme.fgDim)
+            stepsButton.frame = NSRect(x: x, y: 3, width: stepsWidth, height: 24)
+            x = stepsButton.frame.maxX + 8
+        }
+        if !fullOutput.isHidden {
+            fullOutput.setTitleColor(theme.fgDim)
+            fullOutput.frame = NSRect(x: x, y: 3, width: fullWidth, height: 24)
+        }
+        box.frame = NSRect(x: 0, y: headerHeight + Self.boxGap, width: bounds.width,
+                           height: max(0, bounds.height - headerHeight - Self.boxGap - Self.boxTrailing))
+        if !expanded, !htmlCard.isHidden {
+            htmlCard.frame = NSRect(x: 2, y: headerHeight, width: max(1, bounds.width - 4), height: AgentHtmlDocumentCard.height)
+            htmlCard.layoutSubtreeIfNeeded()
+            return
+        }
+        if expanded, item?.tool?.presentation == .fileSearch {
+            fileSearch.frame = contentFrame(height: bounds.height)
+            fileSearch.layoutSubtreeIfNeeded()
+            return
+        }
+        if expanded, item?.tool?.presentation == .fileChange {
+            fileChange.frame = contentFrame(height: bounds.height)
+            fileChange.layoutSubtreeIfNeeded()
+            return
+        }
+        if expanded, item?.tool?.presentation == .webSearch {
+            webSearch.frame = contentFrame(height: bounds.height)
+            webSearch.layoutSubtreeIfNeeded()
+            return
+        }
+        if expanded {
+            let follow = scroll.contentView.bounds.maxY >= body.bounds.height - 8
+            if item?.tool?.presentsCommand == true || usesArgumentPanel {
+                let frames = commandLayout(width: bounds.width)
+                if usesReplArguments {
+                    replArguments.frame = frames.source
+                    replArguments.layoutSubtreeIfNeeded()
+                } else if scrollsArguments {
+                    argumentScroll.frame = frames.source
+                    let contentWidth = max(1, argumentScroll.contentSize.width)
+                    command.frame = NSRect(x: 0, y: 0, width: contentWidth, height: command.height(for: contentWidth))
+                    if let position = restoredArgumentPosition {
+                        command.scroll(NSPoint(x: 0, y: min(max(0, position.y), max(0, command.frame.height - argumentScroll.contentSize.height))))
+                        restoredArgumentPosition = nil
+                    }
+                } else { command.frame = frames.source }
+                htmlCard.frame = frames.card
+                htmlCard.layoutSubtreeIfNeeded()
+                images.frame = frames.images
+                images.layoutSubtreeIfNeeded()
+                scroll.frame = frames.output
+                exitStatus.frame = frames.exit
+            } else {
+                scroll.frame = contentFrame(height: bounds.height)
+            }
+            let width = max(1, scroll.contentSize.width)
+            body.frame = NSRect(x: 0, y: 0, width: width, height: bodyHeight(for: width))
+            if let position = restoredScrollPosition {
+                body.scroll(NSPoint(x: 0, y: min(position.y, max(0, body.bounds.height - scroll.contentSize.height))))
+                restoredScrollPosition = nil
+            } else if follow, item?.tool?.presentsCommand == true {
+                body.scroll(NSPoint(x: 0, y: max(0, body.bounds.height - scroll.contentSize.height)))
+            }
+        }
+    }
+
+    func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        guard let url = link as? URL ?? (link as? String).flatMap(URL.init(string:)) else { return true }
+        if url.scheme == "agent-file", let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           let path = components.queryItems?.first(where: { $0.name == "path" })?.value {
+            let line = components.queryItems?.first(where: { $0.name == "line" })?.value.flatMap(Int.init)
+            onOpenFile?(path, line)
+        } else if url.scheme == "https" || url.scheme == "http" {
+            NSWorkspace.shared.open(url)
+        }
+        return true
+    }
+}
+
+/// Kept separate from views so output, diff colors and safe link targets are directly testable.
+@MainActor
+enum AgentToolText {
+    static func content(_ item: AgentChatItem, theme: AgentTheme) -> NSAttributedString {
+        let activity = item.tool
+        // Reasoning is prose that streams into one row, not tool output.
+        if activity == nil, item.workContext?.itemType == "reasoning" {
+            return AgentMarkdown.plain(bounded(item.detail ?? item.text), theme: theme, muted: true)
+        }
+        let result = NSMutableAttributedString(string: "")
+        func heading(_ text: String) {
+            if result.length > 0 { result.append(NSAttributedString(string: "\n\n")) }
+            result.append(NSAttributedString(string: text + "\n", attributes: [.font: AppFont.system(11, weight: .semibold), .foregroundColor: theme.fgDim]))
+        }
+        if let input = activity?.input, !input.isEmpty {
+            heading(activity?.presentsCommand == true ? "Command" : "Input")
+            result.append(AgentMarkdown.plain(readableInput(input), theme: theme, monospaced: true))
+        }
+        for change in activity?.fileChanges ?? [] {
+            heading(change.path)
+            if let diff = change.diff {
+                let displayed = change.kind == "add" && !diff.hasPrefix("+")
+                    ? diff.components(separatedBy: "\n").map { "+" + $0 }.joined(separator: "\n") : diff
+                result.append(diffText(displayed, theme: theme))
+            }
+        }
+        if let output = activity?.output ?? (activity == nil ? item.detail : nil), !output.isEmpty {
+            heading("Output")
+            result.append(terminalText(output, theme: theme, terminal: activity?.presentsCommand == true))
+        }
+        if let code = activity?.exitCode {
+            heading("Exit code: \(code)")
+        }
+        for path in activity?.filePaths ?? [] where !(activity?.fileChanges?.contains(where: { $0.path == path }) ?? false) {
+            heading(path)
+        }
+        for url in activity?.urls ?? [] { heading(url) }
+        if result.length == 0 { result.append(AgentMarkdown.plain(item.detail ?? "No output", theme: theme, muted: true, monospaced: true)) }
+        addLinks(to: result, paths: activity?.filePaths ?? [], theme: theme)
+        return result
+    }
+
+    private static let pathLine = try? NSRegularExpression(
+        pattern: #"(?<![\w/.~-])((?:\.{1,2}/|~/|/)?(?:[\w.@+-]+/)*[\w.@+-]+\.[A-Za-z0-9]{1,10}):(\d+)(?::\d+)?"#)
+
+    /// `text` with each `path:line` that names a source file linked, so a compiler error
+    /// or a search hit opens at its line.
+    static func linkingPathLines(_ text: NSAttributedString, theme: AgentTheme) -> NSAttributedString {
+        guard text.length <= 64 * 1024, text.string.contains(":"), let pattern = pathLine else { return text }
+        let string = text.string as NSString
+        let matches = pattern.matches(in: text.string, range: NSRange(location: 0, length: string.length))
+        guard !matches.isEmpty else { return text }
+        let result = NSMutableAttributedString(attributedString: text)
+        for match in matches {
+            let candidate = string.substring(with: match.range)
+            guard case .file(let path, let line)? = AgentResponseLink.inferredFile(candidate), line != nil,
+                  result.attribute(.link, at: match.range.location, effectiveRange: nil) == nil else { continue }
+            var components = URLComponents()
+            components.scheme = "agent-file"
+            components.queryItems = [URLQueryItem(name: "path", value: path), URLQueryItem(name: "line", value: line.map(String.init))]
+            if let url = components.url { result.addAttributes([.link: url, .foregroundColor: theme.accent], range: match.range) }
+        }
+        return result
+    }
+
+    static func readableInput(_ input: String) -> String {
+        guard let data = input.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) else { return bounded(input) }
+        if let files = object as? [[String: Any]] {
+            return bounded(files.map { file in
+                let path = file["path"] as? String ?? "File"
+                let kind = (file["kind"] as? [String: Any])?["type"] as? String
+                return path + (kind.map { " · " + $0 } ?? "")
+            }.joined(separator: "\n"))
+        }
+        guard let fields = object as? [String: Any] else { return bounded(input) }
+        return bounded(fields.keys.sorted().map { key in
+            let value = fields[key]
+            let text = value as? String ?? value.map { String(describing: $0) } ?? ""
+            return key.replacingOccurrences(of: "_", with: " ").capitalized + ": " + text
+        }.joined(separator: "\n"))
+    }
+
+    static func diffText(_ diff: String, theme: AgentTheme) -> NSAttributedString {
+        let result = NSMutableAttributedString(string: "")
+        for line in bounded(diff).components(separatedBy: "\n") {
+            let color: NSColor = line.hasPrefix("+") && !line.hasPrefix("+++") ? theme.diffAdd
+                : line.hasPrefix("-") && !line.hasPrefix("---") ? theme.diffRemove : theme.fgMuted
+            result.append(NSAttributedString(string: line + "\n", attributes: [.font: AppFont.mono(12), .foregroundColor: color]))
+        }
+        return result
+    }
+
+    static func terminalText(_ source: String, theme: AgentTheme, terminal: Bool) -> NSAttributedString {
+        // A carriage return overwrites the current progress line, as in the source renderer's command fixture.
+        let source = bounded(source).components(separatedBy: "\n").map {
+            $0.components(separatedBy: "\r").last ?? ""
+        }.joined(separator: "\n")
+        let result = NSMutableAttributedString(string: "")
+        let expression = try? NSRegularExpression(pattern: "\u{1b}\\[[0-9;]*[A-Za-z]")
+        let ns = source as NSString
+        var offset = 0
+        var color = theme.fg
+        let palette: [Int: NSColor] = [30: .black, 31: .systemRed, 32: .systemGreen, 33: .systemYellow,
+                                      34: .systemBlue, 35: .systemPurple, 36: .systemTeal, 37: .white]
+        func append(_ range: NSRange) {
+            guard range.length > 0 else { return }
+            var attributes: [NSAttributedString.Key: Any] = [.font: AppFont.mono(12), .foregroundColor: color]
+            if terminal { attributes[.backgroundColor] = theme.fg.withAlphaComponent(0.045) }
+            result.append(NSAttributedString(string: ns.substring(with: range), attributes: attributes))
+        }
+        for match in expression?.matches(in: source, range: NSRange(location: 0, length: ns.length)) ?? [] {
+            append(NSRange(location: offset, length: match.range.location - offset))
+            let escape = ns.substring(with: match.range)
+            if escape.hasSuffix("m") {
+                for code in escape.dropFirst(2).dropLast().split(separator: ";").compactMap({ Int($0) }) {
+                    if code == 0 || code == 39 { color = theme.fg }
+                    else if let next = palette[code] ?? palette[code - 60] { color = next }
+                }
+            }
+            offset = NSMaxRange(match.range)
+        }
+        append(NSRange(location: offset, length: ns.length - offset))
+        return result
+    }
+
+    private static func bounded(_ text: String) -> String {
+        text.count > 32_000 ? "[Earlier output omitted from preview]\n" + String(text.suffix(32_000)) : text
+    }
+
+    private static func addLinks(to text: NSMutableAttributedString, paths: [String], theme: AgentTheme) {
+        let ns = text.string as NSString
+        let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+        for match in detector?.matches(in: text.string, range: NSRange(location: 0, length: text.length)) ?? [] {
+            guard let url = match.url, ["http", "https"].contains(url.scheme ?? "") else { continue }
+            text.addAttributes([.link: url, .foregroundColor: theme.accent], range: match.range)
+        }
+        for path in Set(paths) where !path.isEmpty {
+            var search = NSRange(location: 0, length: ns.length)
+            while search.length > 0 {
+                let range = ns.range(of: path, range: search)
+                guard range.location != NSNotFound else { break }
+                var components = URLComponents()
+                components.scheme = "agent-file"
+                components.queryItems = [URLQueryItem(name: "path", value: path)]
+                let suffix = ns.substring(from: NSMaxRange(range))
+                if suffix.hasPrefix(":"), let line = Int(suffix.dropFirst().prefix(while: \.isNumber)), line > 0 {
+                    components.queryItems?.append(URLQueryItem(name: "line", value: String(line)))
+                }
+                if let url = components.url { text.addAttributes([.link: url, .foregroundColor: theme.accent], range: range) }
+                search = NSRange(location: NSMaxRange(range), length: ns.length - NSMaxRange(range))
+            }
+        }
+    }
+}
+
+/// Ordinary tool failures keep the source label quiet and mark the category icon.
+/// Provider error/result flags have already been normalized into the lifecycle status.
+@MainActor
+enum AgentToolRowPresentation {
+    /// The tool's lifecycle as the row shows it. A finished item whose tool still
+    /// says running never got its result: older servers left a stopped turn's tools
+    /// that way, so it reads as interrupted rather than running forever.
+    static func status(_ item: AgentChatItem) -> AgentToolActivity.Status {
+        let status = item.tool?.status ?? (item.isComplete ? .completed : .running)
+        return item.isComplete && status == .running ? .interrupted : status
+    }
+
+    /// The muted note after a tool's name: how it ended, if not plainly, and how long it
+    /// took when that was at least a second. Failure is spelled out, not left to the tint.
+    static func outcome(_ activity: AgentToolActivity?, status: AgentToolActivity.Status) -> String? {
+        var parts: [String] = []
+        let exitCode = activity?.presentsCommand == true ? activity?.exitCode : nil
+        switch status {
+        case .interrupted: parts.append("Interrupted")
+        case .failed: parts.append(exitCode.map { $0 != 0 ? "exit \($0)" : "Failed" } ?? "Failed")
+        case .completed: if let exitCode, exitCode != 0 { parts.append("exit \(exitCode)") }
+        case .running, .denied: break
+        }
+        if status == .completed || status == .failed, let started = activity?.startedAt, let completed = activity?.completedAt {
+            let seconds = completed.timeIntervalSince(started)
+            if seconds >= 1 { parts.append(AgentTurnTime.duration(seconds)) }
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    static func indicatesFailure(_ activity: AgentToolActivity?, status: AgentToolActivity.Status) -> Bool {
+        if status == .failed || status == .denied { return true }
+        return activity?.presentsCommand == true && (activity?.exitCode ?? 0) != 0
+    }
+
+    static func failureIconColor(theme: AgentTheme) -> NSColor {
+        theme.danger.withAlphaComponent(theme.danger.alphaComponent * 0.28)
+    }
+}

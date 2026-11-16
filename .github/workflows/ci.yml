@@ -1,0 +1,29 @@
+name: Validate
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check Apple silicon toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          swift --version
+      - name: Build, test, and bundle the standalone example
+        run: scripts/validate.sh
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: validation-logs
+          path: build/validation
