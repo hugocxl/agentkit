@@ -138,3 +138,19 @@ final class AgentTableResizeTests: XCTestCase {
         XCTAssertGreaterThan(heights[2], heights[0], "The narrow width still wraps")
     }
 }
+
+extension AgentDragSelectionTests {
+    func testNextFailureAndScrollKeysReachTheConversation() throws {
+        let pane = AgentPaneController(session: SessionId(), project: ProjectId(), provider: .claude) { _ in throw CancellationError() }
+        defer { pane.dispose() }
+        var snapshot = AgentChatSnapshot(session: pane.session, project: ProjectId(), provider: .claude, status: .idle, revision: 1)
+        snapshot.items = [AgentChatItem(kind: .user, text: "Build it"),
+                          AgentChatItem(id: "ok", kind: .tool, text: "Bash", tool: .init(name: "Bash", status: .completed)),
+                          AgentChatItem(id: "bad", kind: .tool, text: "Bash", tool: .init(name: "Bash", status: .failed))]
+        XCTAssertFalse(pane.performConversationShortcut(.agentNextFailure), "Nothing has failed yet")
+        pane.surface.render(snapshot)
+        XCTAssertTrue(pane.performConversationShortcut(.agentNextFailure))
+        XCTAssertTrue(pane.performConversationShortcut(.scrollToBottom))
+        XCTAssertFalse(pane.performConversationShortcut(.submitAgentAnswers), "Without a form the key goes on to the composer")
+    }
+}

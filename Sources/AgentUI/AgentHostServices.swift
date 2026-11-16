@@ -8,6 +8,7 @@ public struct AgentHostServices {
     public var directory: () -> String?
     public var isLocal: () -> Bool
     public var readFile: ((FilesRequest) async throws -> FilesReply)?
+    public var supportsFileWriteParents: () -> Bool = { false }
     public var supportsRangedReads: () -> Bool = { true }
     public var openFile: ((String, Int?, Int?) throws -> Void)?
     public var openBrowser: ((URL) throws -> Void)?
@@ -16,6 +17,7 @@ public struct AgentHostServices {
     public var pullRequestPreview: ((URL) async throws -> GitPullRequestPreview)?
     public var repositoryOrigin: (() async throws -> String?)?
     public var workspaceDescription: (() -> String?)?
+    public var loadThreads: (() async throws -> [AgentMentionThread])?
     public var loadFiles: (() async throws -> [String])?
     public var remoteImages: () -> RemoteImagePolicy = { AgentSettings().remoteImages }
 
@@ -33,6 +35,7 @@ final class AgentHostActions: AgentConversationProjectActions {
     private var preview: AgentConversationMediaWindow?
     private var metadataTask: Task<Void, Never>?
     private var metadataLoaded = false
+    private var metadataGeneration: UInt64 = 0
 
     init(surface: AgentPaneView, session: SessionId, services: AgentHostServices) {
         self.surface = surface; self.session = session; self.services = services
@@ -50,11 +53,16 @@ final class AgentHostActions: AgentConversationProjectActions {
         guard let read = services.readFile else { throw ModelError("File access is unavailable in this application.") }
         return read
     }
+    func connectionChanged() {
+        metadataGeneration &+= 1
+        metadataTask?.cancel(); metadataTask = nil; metadataLoaded = false
+    }
     func refreshProjectMetadata() {
         guard !metadataLoaded, metadataTask == nil, let fetch = services.repositoryOrigin else { return }
+        let generation = metadataGeneration
         metadataTask = Task { [weak self] in
             guard let self else { return }
-            defer { self.metadataTask = nil }
+            defer { if self.metadataGeneration == generation { self.metadataTask = nil } }
             do {
                 let origin = try await fetch()
                 try Task.checkCancellation()
@@ -73,7 +81,7 @@ final class AgentHostActions: AgentConversationProjectActions {
         try await AgentConversationFileActions.media(path, cwd: cwd, scope: scope(), ranged: services.supportsRangedReads(), read: reader())
     }
     func writeProjectFile(_ relativePath: String, contents: String, cwd: String?) async throws -> String {
-        try await AgentConversationFileActions.writeProjectFile(relativePath, contents: contents, cwd: cwd, scope: scope(), read: reader())
+        try await AgentConversationFileActions.writeProjectFile(relativePath, contents: contents, cwd: cwd, scope: scope(), createParents: services.supportsFileWriteParents(), read: reader())
     }
     func pullRequestPreview(_ url: URL) async throws -> GitPullRequestPreview {
         guard let fetch = services.pullRequestPreview else { throw ModelError("Pull request previews are unavailable.") }

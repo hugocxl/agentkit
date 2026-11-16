@@ -10,6 +10,8 @@ public final class AgentConversationViewController: NSViewController {
     private var observation: Task<Void, Never>?
     public let connection: AgentConnection
 
+    /// Whether keyboard focus is in the composer rather than the transcript.
+    public var composerHasFocus: Bool { controller.view.window?.firstResponder === controller.surface.composer }
     public var snapshot: AgentChatSnapshot? { controller.snapshot }
     public var selectedProvider: AgentChatProvider { controller.selection.provider }
     public var conversationTitle: String { controller.title }

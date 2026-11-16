@@ -475,3 +475,18 @@ final class AgentLinkFaviconTests: XCTestCase {
     ]
     """########
 }
+
+extension AgentLinkFaviconTests {
+    func testBundledHostMarksKeepSignatureHuesWithoutFetching() throws {
+        let favicons = AgentLinkFavicon(fetch: { _ in
+            XCTFail("Git host marks must use bundled artwork")
+            throw URLError(.badURL)
+        })
+        for (host, icon) in AgentLinkFavicon.hostMarks {
+            XCTAssertEqual(AgentLinkFavicon.brand(for: host), icon.rawValue, host)
+            XCTAssertNotNil(icon.signatureHue, host)
+            let url = try XCTUnwrap(URL(string: "https://" + host))
+            XCTAssertFalse(try XCTUnwrap(favicons.image(for: url, color: .magenta)).isTemplate, host)
+        }
+    }
+}

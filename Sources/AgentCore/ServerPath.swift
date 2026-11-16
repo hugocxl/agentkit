@@ -21,7 +21,8 @@ public struct ServerPath: RawRepresentable, Hashable, Comparable, Codable, Senda
 
     public var isAbsolute: Bool { rawValue.hasPrefix("/") }
     public var byteCount: Int { rawValue.utf8.count }
-    var containsNul: Bool { rawValue.utf8.contains(0) }
+    /// Whether the path contains a byte that cannot appear in a filesystem name.
+    public var containsNul: Bool { rawValue.utf8.contains(0) }
 
     /// The last non-empty component, or the whole path when it has none.
     public var lastComponent: String {

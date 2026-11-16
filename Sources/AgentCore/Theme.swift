@@ -283,6 +283,7 @@ public struct ChromePalette: Equatable, Sendable {
 public struct ThemeEntry: Equatable, Sendable {
     public let name: String
     public let scheme: ColorScheme
+    public init(name: String, scheme: ColorScheme) { self.name = name; self.scheme = scheme }
 }
 
 /// The bundled Ghostty themes plus the custom ones in the profile's

@@ -157,6 +157,15 @@ public final class AgentTheme: ObservableObject {
         setCatalog(catalog)
     }
 
+    /// Applies colors already resolved by the host, including custom themes.
+    public func setResolvedScheme(_ scheme: ColorScheme, interface: Appearance) {
+        if self.interface != interface { self.interface = interface }
+        if self.scheme != scheme { self.scheme = scheme }
+        let palette = ChromePalette(scheme: scheme)
+        if self.palette != palette { self.palette = palette }
+        refreshAccessibility()
+    }
+
     public func setCatalog(_ catalog: ThemeCatalog) {
         self.catalog = catalog
         apply()

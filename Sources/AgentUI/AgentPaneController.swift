@@ -17,7 +17,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     }
     /// The provider's logo, as a terminal running the same agent shows it.
     var icon: NSImage? {
-        AgentLogo.image(for: selection.provider == .claude ? .claude : .codex, lightBackground: AgentTheme.shared.palette.isLight)
+        AgentLogo.image(for: selection.provider == .claude ? .claude : .codex, lightBackground: surface.theme.palette.isLight)
     }
     /// Keeps the pane's saved title in step with the conversation, for the
     /// tab title, sidebar filter and palette.
@@ -38,13 +38,16 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
                                effort: reasoningEffort, access: access ?? snapshot?.accessMode))
     }
     var confirmClose: (() async -> Bool)?
-    var onNewConversation: (() -> Void)?
+    var onNewConversation: (() -> Void)? { didSet { updateForkAvailability() } }
     /// Conversations Claude Code and Codex saved for this folder outside Tab.
     var loadHistory: (() async throws -> AgentHistoryReply)?
     /// Continues one of them as the conversation with the given ID.
     var importHistory: ((AgentHistoryEntry, SessionId) async throws -> AgentChatSnapshot)?
     /// Shows a conversation this pane doesn't hold, beside it.
     var showConversation: ((AgentChatSnapshot) -> Void)? { didSet { updateForkAvailability() } }
+    private var exportTask: Task<Void, Never>?
+    private var helpPicker: AgentSearchPicker?
+    private var discoveredCommands: [AgentCore.AgentChatProvider: [AgentCommandDescriptor]] = [:]
     private var historyTask: Task<Void, Never>?
     private var historyPicker: AgentSearchPicker?
     private var queueEditor: AgentTextEditorSheet?
@@ -78,6 +81,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     private(set) var subagentWindows: [String: AgentSubagentStepsWindow] = [:]
     private var refreshTask: Task<Void, Never>?
     private var commandTask: Task<Void, Never>?
+    private var helpTask: Task<Void, Never>?
     private var approvalToken: UUID?
     private var approvalInFlight: Bool { approvalToken != nil }
     private var stopTask: Task<Void, Never>?
@@ -108,6 +112,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     private var needsAuthoritativeSnapshot = false
     private(set) var snapshot: AgentChatSnapshot?
     private var authoritativeProject: ProjectId?
+    private var updateHostContext: (() -> Void)?
     /// A failed request or lost connection; the next accepted snapshot clears it, and Refresh retries.
     private(set) var errorMessage: String?
     /// A composer message, such as a validation hint or `/status`, that snapshots leave alone.
@@ -262,6 +267,8 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         }
         surface.attachmentStrip.onPreview = { [weak self] in self?.previewAttachment($0) }
         composerCoordinator.onAction = { [weak self] in self?.performComposerAction($0) }
+        composerCoordinator.onCommand = { [weak self] in self?.executeLocalCommand($0) }
+        composerCoordinator.onSubmit = { [weak self] in self?.send() }
         composerCoordinator.onContext = { [weak self] name, content in
             self?.addAttachments([AgentDraftAttachment(name: name, mimeType: "text/plain", data: Data(content.utf8))])
         }
@@ -419,10 +426,10 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         return snapshot.items.compactMap { item -> String? in
             switch item.kind {
             case .user where item.isProviderTurn: return "_\(item.text)_"
-            case .user: return "**You**\n\n" + item.text
+            case .user: return "**You**\n\n" + item.text + (item.attachments ?? []).map { "\n\nAttachment: " + $0.name }.joined()
             case .assistant: return "**\(agent)**\n\n" + item.text
             case .tool:
-                guard let tool = item.tool else { return nil }
+                guard let tool = item.tool else { return "> " + item.text + (item.detail.map { "\n\n" + $0 } ?? "") }
                 let operation = tool.summary.trimmingCharacters(in: .whitespacesAndNewlines)
                 return "> " + (tool.name ?? item.text) + (operation.isEmpty ? "" : " · `\(operation.replacingOccurrences(of: "`", with: "'"))`")
             case .notice: return "> " + item.text
@@ -431,11 +438,56 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         }.joined(separator: "\n\n") + "\n"
     }
 
-    func copyConversation() {
-        guard let snapshot, !snapshot.items.isEmpty else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(Self.markdown(snapshot), forType: .string)
-        showNotice("Copied the conversation as Markdown.", kind: .info)
+    func copyConversation() { exportConversation(saveFile: false) }
+
+    private func exportConversation(saveFile: Bool, onSuccess: (() -> Void)? = nil) {
+        guard exportTask == nil, let source = snapshot, !source.items.isEmpty else {
+            showNotice("There are no messages to export.", kind: .info); return
+        }
+        exportTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.exportTask = nil }
+            do {
+                var earlier: [AgentChatItem] = []
+                if (source.omittedItems ?? 0) > 0 {
+                    guard let request = self.conversationRequest else { throw ModelError("Update the server to export earlier messages.") }
+                    var before: Int?
+                    repeat {
+                        try Task.checkCancellation()
+                        guard case .earlier(let page) = try await request(.earlier(session: self.session, before: before, limit: AgentEarlierItems.maxItems)) else {
+                            throw ModelError("The server sent an unexpected archive reply.")
+                        }
+                        if let before, page.start >= before { throw ModelError("The history archive did not advance.") }
+                        earlier = page.items + earlier
+                        before = page.start
+                    } while before != 0
+                }
+                guard !self.disposed, self.snapshot?.resetID == source.resetID else { return }
+                var complete = source
+                let retained = Set(source.items.map(\.id))
+                complete.items = earlier.filter { !retained.contains($0.id) } + source.items
+                var markdown = Self.markdown(complete)
+                let missing = max(0, (source.omittedItems ?? 0) - earlier.count)
+                if missing > 0 { markdown = "> \(missing) older messages were not retained by the server and cannot be exported.\n\n" + markdown }
+                if saveFile {
+                    guard let window = self.surface.window else { throw ModelError("Open this conversation in a window to save it.") }
+                    let panel = NSSavePanel()
+                    panel.nameFieldStringValue = "Conversation.md"
+                    let accepted = await withCheckedContinuation { continuation in
+                        panel.beginSheetModal(for: window) { continuation.resume(returning: $0 == .OK) }
+                    }
+                    guard accepted, let url = panel.url else { return }
+                    let data = Data(markdown.utf8)
+                    try await Task.detached { try data.write(to: url, options: .atomic) }.value
+                } else {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(markdown, forType: .string)
+                }
+                onSuccess?()
+                self.showNotice(missing > 0 ? "Exported retained messages; the export identifies unavailable older history."
+                    : saveFile ? "Saved the conversation as Markdown." : "Copied the complete conversation as Markdown.", kind: .info)
+            } catch is CancellationError {} catch { self.showComposerError(error.localizedDescription) }
+        }
     }
 
     /// The snapshot with any loaded earlier items above its own.
@@ -508,6 +560,10 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
 
     /// Opens a new conversation beside this one with what came before `item`.
     private func updateForkAvailability() {
+        if showConversation == nil { composerCoordinator.disabledActions.insert("fork") }
+        else { composerCoordinator.disabledActions.remove("fork") }
+        if onNewConversation == nil { composerCoordinator.disabledActions.insert("new") }
+        else { composerCoordinator.disabledActions.remove("new") }
         if showConversation != nil, conversationRequest != nil {
             surface.onForkPrompt = { [weak self] item in self?.fork(before: item) }
         } else { surface.onForkPrompt = nil }
@@ -557,10 +613,14 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         guard !disposed, let toolUseID = agent.toolUseID, let request = conversationRequest else { return }
         if let existing = subagentWindows[toolUseID] { existing.update(agent); existing.showWindow(nil); return }
         let session = session
-        let window = AgentSubagentStepsWindow(subagent: agent, toolUseID: toolUseID, theme: surface.theme) { id in
+        let window = AgentSubagentStepsWindow(subagent: agent, toolUseID: toolUseID, theme: surface.theme) { [weak self] id in
             do {
                 guard case .subagentSteps(let steps) = try await request(.subagentSteps(session: session, toolUseID: id)) else {
                     throw ModelError("The server sent an unexpected reply.")
+                }
+                // A server that can't read a shell's output still has its tool row.
+                if steps.items.isEmpty, agent.agentType == "Shell", let item = self?.snapshot?.items.last(where: { $0.id == id }) {
+                    return AgentSubagentSteps(toolUseID: id, items: [item])
                 }
                 return steps
             } catch where agentErrorCode(error) == .unsupported {
@@ -611,6 +671,9 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     func dispose() {
         voice.stop()
         historyPicker?.close()
+        helpPicker?.close()
+        helpTask?.cancel()
+        exportTask?.cancel()
         queueEditor?.close()
         surface.closeOutline()
         saveDraft(immediate: true)
@@ -649,6 +712,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     func connectionChanged() {
         guard !disposed else { return }
         connectionGeneration &+= 1
+        (surface.actions.project as? AgentHostActions)?.connectionChanged()
         checkedServerVersion = false
         readSinceUnsupported = false
         approvalToken = nil
@@ -657,6 +721,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         modelCatalogLoadedAt = .distantPast
         modelCatalogs = [:]
         unavailableModelCatalogs = []
+        discoveredCommands = [:]
         menuState = nil
         composerCoordinator.invalidate()
         needsAuthoritativeSnapshot = true
@@ -742,24 +807,26 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     }
 
     func send() {
-        guard !approvalInFlight else { return }
         if composerCoordinator.performTypedAction() { return }
+        guard !approvalInFlight else { return }
         let sentDraft = NSAttributedString(attributedString: surface.composer.attributedString())
         let text = AgentComposerCitation.prompt(from: sentDraft)
         guard !disposed, commandTask == nil, created, canSend,
               preparingAttachments == 0,
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !draftAttachments.isEmpty else { return }
-        let commandText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let command = AgentComposerCoordinator.commandName(in: commandText)
-        // A lone `/name` is meant as a command; `/tmp is full` or a path is an ordinary prompt.
-        if selection.provider == .codex, let command, commandText == "/" + command, !command.hasPrefix("skill:"),
-           !composerCoordinator.providerCommands.contains(command) {
-            showComposerError("This Codex command is not supported in agent panes. Use / to choose an available command.")
-            return
-        }
-        if snapshot?.status == .working, let command, composerCoordinator.providerCommands.contains(command) {
-            showComposerError("Run provider commands after the current response finishes.")
-            return
+        if let command = AgentSlashCommand(text: text), !command.isPath {
+            guard capabilities.contains(.providerCommands) else {
+                showComposerError("Provider commands are unavailable in this conversation."); return
+            }
+            let provider = selection.provider == .claude ? AgentCore.AgentChatProvider.claude : .codex
+            let names = composerCoordinator.providerCommands + composerCoordinator.providerDescriptors.flatMap(\.names)
+            if let error = command.validationError(provider: provider, commands: names,
+                                                    hasAttachments: !draftAttachments.isEmpty, descriptors: composerCoordinator.providerDescriptors) {
+                showComposerError(error); return
+            }
+            if snapshot?.status == .working || snapshot?.status == .waiting || hasActiveQueue {
+                showComposerError("Run commands after active and queued work finishes."); return
+            }
         }
         let attachments = draftAttachments.map { AgentChatAttachment(id: $0.id, name: $0.name, mimeType: $0.mimeType, data: $0.data) }
         let sentIDs = Set(attachments.map(\.id))
@@ -779,6 +846,9 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
             self?.saveDraft()
             self?.selectionEdited = false
             self?.savePreferences?(nil)
+            if ["reload-skills", "reload-plugins"].contains(AgentSlashCommand(text: text)?.name ?? "") {
+                self?.composerCoordinator.invalidate()
+            }
             self?.draftAttachments.removeAll { sentIDs.contains($0.id) }
             self?.updateAttachments()
             // Don't lose edits typed while the request was in flight, or a failed send.
@@ -1057,21 +1127,125 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         updateControls()
     }
 
+    private func executeLocalCommand(_ command: AgentSlashCommand) {
+        guard !disposed else { return }
+        let name = command.name, arguments = command.arguments
+        let offlineActions: Set<String> = ["help", "status", "copy", "export", "outline", "previous-prompt", "next-prompt", "attach", "clear-draft"]
+        guard offlineActions.contains(name) || (!needsAuthoritativeSnapshot && created) else {
+            showComposerError("Wait for the conversation to connect before running commands."); return
+        }
+        if name == "effort", !surface.effort.isEnabled { showComposerError("Reasoning effort is unavailable for this model."); return }
+        if name == "model", !surface.model.isEnabled { showComposerError("Model selection is unavailable right now."); return }
+        let idleOnly: Set<String> = ["clear", "plan", "fork"]
+        if idleOnly.contains(name), approvalInFlight || commandTask != nil || snapshot?.status == .working || snapshot?.status == .waiting || hasActiveQueue {
+            showComposerError("Stop active work and remove queued prompts before running /" + name + "."); return
+        }
+        if !arguments.isEmpty, !["model", "effort", "plan", "skills", "attach"].contains(name) {
+            showComposerError("/" + name + " does not accept arguments."); return
+        }
+        let draft = surface.composer.string
+        let consume: () -> Void = { [weak self] in
+            guard let self, self.surface.composer.string == draft else { return }
+            self.surface.composer.string = ""; self.surface.refreshComposer(); self.saveDraft(); self.updateControls()
+        }
+        switch name {
+        case "clear":
+            guard let snapshot, runningSubagents == 0 else { showComposerError("Stop background agents before clearing."); return }
+            run(.clear(session: session, archive: SessionId(), expectedRevision: snapshot.revision)) { [weak self] in
+                consume()
+                self?.showNotice("Conversation cleared. The previous conversation is kept in history.", kind: .info)
+            }
+            return
+        case "help":
+            helpPicker?.close()
+            helpTask?.cancel()
+            let picker = AgentSearchPicker(title: "Agent commands", placeholder: "Search commands…", theme: surface.theme)
+            let note = "Return runs a command; Tab completes it. Commands with arguments show their syntax. Skills: /skills."
+            picker.update(composerCoordinator.helpEntries, note: "Loading provider commands…")
+            picker.onSelect = { [weak self] command in
+                self?.surface.composer.string = command + " "
+                self?.surface.refreshComposer(); self?.saveDraft()
+            }
+            helpPicker = picker; picker.present(in: surface.window)
+            helpTask = Task { [weak self, weak picker] in
+                guard let self, let picker else { return }
+                do {
+                    try await self.composerCoordinator.refreshCatalog()
+                    guard !self.disposed, self.helpPicker === picker else { return }
+                    picker.update(self.composerCoordinator.helpEntries, note: note)
+                } catch is CancellationError {} catch {
+                    picker.update(self.composerCoordinator.helpEntries, note: "Could not refresh provider commands. " + error.localizedDescription)
+                }
+            }
+        case "fork":
+            guard showConversation != nil else { showComposerError("Opening another conversation is unavailable."); return }
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let result = try await self.request(.fork(session: SessionId(), from: self.session, project: nil))
+                    guard !self.disposed else { return }
+                    consume(); self.showConversation?(result)
+                } catch { self.showComposerError(error.localizedDescription) }
+            }
+            return
+        case "copy", "export": exportConversation(saveFile: name == "export", onSuccess: consume); return
+        case "skills": composerCoordinator.browseSkills(); return
+        case "attach":
+            surface.composer.string = arguments
+            surface.refreshComposer(); saveDraft()
+            chooseAttachments(); return
+        case "plan":
+            guard arguments.isEmpty || ["on", "off"].contains(arguments) else { showComposerError("Use /plan, /plan on, or /plan off."); return }
+            run(.setPlan(session: session, enabled: arguments.isEmpty ? snapshot?.planMode != true : arguments == "on"), onSuccess: consume)
+            return
+        case "model" where !arguments.isEmpty:
+            guard !arguments.contains(where: \.isWhitespace) else { showComposerError("Use /model <model-name> or /model default."); return }
+            selectModel(provider: selection.provider, model: arguments == "default" ? nil : arguments)
+        case "effort" where !arguments.isEmpty:
+            guard surface.effort.isEnabled else { showComposerError("Reasoning effort is unavailable for this model."); return }
+            let effort = arguments == "auto" ? nil : AgentReasoningEffort(rawValue: arguments)
+            guard arguments == "auto" || effort.map({ supportedEfforts.contains($0) }) == true else {
+                showComposerError("Choose a supported effort: auto" + supportedEfforts.map { ", " + $0.rawValue }.joined()); return
+            }
+            selectEffort(effort)
+        case "stop":
+            guard snapshot?.status == .working || snapshot?.status == .waiting || hasActiveQueue || submitting else {
+                showNotice("No response is running.", kind: .info); consume(); return
+            }
+            stop()
+        default:
+            let id = name == "clear-draft" ? "clear" : name
+            performComposerAction(id)
+        }
+        consume()
+    }
+
     private func performComposerAction(_ action: String) {
         let control: NSControl?
         switch action {
         case "skills": composerCoordinator.browseSkills(); return
         case "status":
-            showNotice("\(selection.provider.name) · \(effectiveModel ?? "Provider default") · \(reasoningEffort?.title ?? "Auto") · \((snapshot?.accessMode ?? .standard).title)", kind: .info)
+            showNotice("\(selection.provider.name) · \(effectiveModel ?? "Provider default") · \(reasoningEffort?.title ?? "Auto") · \((snapshot?.accessMode ?? .standard).title) · Plan \(snapshot?.planMode == true ? "on" : "off") · \(snapshot?.status.rawValue ?? "connecting") · \(snapshot?.queuedPrompts?.count ?? 0) queued · \(snapshot?.contextUsage?.usedTokens.description ?? "Unknown") context tokens. Model and effort apply to the next message.", kind: .info)
             return
-        case "new", "clear-conversation": onNewConversation?(); return
+        case "new": onNewConversation?(); return
+        case "clear-conversation": if let command = AgentSlashCommand(text: "/clear") { executeLocalCommand(command) }; return
         case "resume": showHistory(); return
         case "outline": surface.showOutline(); return
         case "plan": togglePlanMode(); return
         case "copy": copyConversation(); return
-        case "previous-prompt": surface.navigatePrompt(previous: true); return
-        case "next-prompt": surface.navigatePrompt(previous: false); return
-        case "model", "effort": control = surface.modelPicker
+        case "previous-prompt", "next-prompt":
+            let previous = action == "previous-prompt"
+            if !surface.navigatePrompt(previous: previous) {
+                if previous, (surface.snapshot?.omittedItems ?? 0) > 0 {
+                    loadEarlier()
+                    showNotice("Loading earlier prompts. Run /previous-prompt again to continue.", kind: .info)
+                } else { showNotice(previous ? "You are at the first loaded prompt." : "You are at the last prompt.", kind: .info) }
+            }
+            return
+        case "effort":
+            guard surface.effort.isEnabled else { showComposerError("Reasoning effort is unavailable for this model or while reconnecting."); return }
+            surface.modelPicker.showSelectionMenu(effortOnly: true); return
+        case "model": control = surface.modelPicker
         case "attach": chooseAttachments(); return
         case "stop": stop(); return
         case "clear":
@@ -1229,7 +1403,9 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
                 self.accept(result, generation: generation)
             } catch {
                 guard !Task.isCancelled, !self.disposed, generation == self.connectionGeneration else { return }
-                self.showError(error)
+                if case .clear = command, agentErrorCode(error) == .unsupported {
+                    self.showComposerError("Update Tab on this server to clear a conversation in place. Your conversation is unchanged.")
+                } else { self.showError(error) }
             }
         }
         updateControls()
@@ -1263,6 +1439,17 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         } else {
             guard result.revision >= (snapshot?.revision ?? 0) else { return }
         }
+        if snapshot?.resetID != result.resetID {
+            earlierTask?.cancel(); earlierItems = []; earlierBasis = nil; earlierStart = 0
+            lastSubmission = nil; questionDrafts = [:]; reviewComments = []
+            surface.closeOutline(); attachmentCache.cancel()
+            composerCoordinator.invalidate()
+        }
+        if discoveredCommands[result.provider] == nil || snapshot?.commandDescriptors != result.commandDescriptors,
+           let commands = result.commandDescriptors {
+            discoveredCommands[result.provider] = commands
+        }
+        if authoritative { updateHostContext?() }
         snapshot = result
         // Home may remap during bootstrap. Bind the first authoritative session
         // owner, then reject foreign-project replies for this controller's life.
@@ -1334,9 +1521,14 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     }
 
     private func updateControls() {
-        composerCoordinator.providerCommands = selection.provider == .codex
-            ? ["compact", "review"] : (snapshot?.provider == .claude ? (snapshot?.commands ?? []) : [])
-        if !capabilities.contains(.providerCommands) { composerCoordinator.providerCommands = [] }
+        let descriptors = discoveredCommands[selection.provider] ?? (snapshot?.provider == selection.provider ? snapshot?.commandDescriptors ?? [] : [])
+        composerCoordinator.providerDescriptors = descriptors
+        let names = selection.provider == .codex ? ["compact", "review"]
+            : discoveredCommands[selection.provider]?.map(\.name)
+                ?? (snapshot?.provider == .claude ? snapshot?.commands : nil) ?? descriptors.map(\.name)
+        var seen = Set<String>()
+        composerCoordinator.providerCommands = (names + (selection.provider == .claude ? ["compact", "context", "usage", "cost"] : [])).filter { seen.insert($0).inserted }
+        if !capabilities.contains(.providerCommands) { composerCoordinator.providerCommands = []; composerCoordinator.providerDescriptors = [] }
         let interactionsEnabled = !disposed && !needsAuthoritativeSnapshot && commandTask == nil && !approvalInFlight
         surface.promptQueue.update(snapshot?.queuedPrompts ?? [], paused: snapshot?.queuePaused == true, enabled: interactionsEnabled)
         surface.subagents.update(snapshot?.subagents ?? [])
@@ -1824,12 +2016,19 @@ extension AgentPaneController {
         if connection.history == nil { disabled.insert("resume") }
         if connection.composerContext == nil { disabled.insert("skills") }
         composerCoordinator.disabledActions = disabled
+        updateForkAvailability()
         surface.theme = theme
         surface.themeDidChange()
-        surface.workspaceRoot = host.directory()
-        localProjectRoot = host.isLocal() ? host.directory() : nil
+        updateHostContext = { [weak self] in
+            guard let self else { return }
+            let directory = host.directory()
+            if self.surface.workspaceRoot != directory { self.surface.workspaceRoot = directory }
+            self.localProjectRoot = host.isLocal() ? directory : nil
+        }
+        updateHostContext?()
         surface.workspaceDescription = host.workspaceDescription
         surface.mediaLoader.remotePolicy = host.remoteImages
+        AgentLinkFavicon.shared.policy = host.remoteImages
         surface.actions.project = AgentHostActions(surface: surface, session: session, services: host)
         surface.onOpenFile = { [weak self] path, line in
             do {
@@ -1839,10 +2038,24 @@ extension AgentPaneController {
         }
         surface.onRunShellCommand = host.runCommand
         composerCoordinator.loadFiles = host.loadFiles
+        if let loadThreads = host.loadThreads {
+            composerCoordinator.loadThreads = { [weak self] in
+                let threads = try await loadThreads()
+                for thread in threads { self?.surface.linkServices.threadTitles[thread.id] = thread.title }
+                return threads
+            }
+        }
         if let context = connection.composerContext {
             composerCoordinator.loadSkills = { [weak self] in
                 guard let self else { throw AgentPaneError.offline }
-                return try await context(self.selection.provider).skills
+                let provider = self.selection.provider
+                let generation = self.connectionGeneration
+                let catalog = try await context(provider)
+                guard self.selection.provider == provider, self.connectionGeneration == generation, !self.disposed else { throw CancellationError() }
+                if let commands = catalog.commands { self.discoveredCommands[provider] = commands; self.updateControls() }
+                if catalog.truncated { self.showNotice("Some skills were omitted because of discovery or size limits. Provider commands remain available in /help.", kind: .warning) }
+                else if let notice = catalog.discoveryNotice { self.showNotice(notice, kind: .warning) }
+                return catalog.skills
             }
         }
         loadModelCatalog = connection.models

@@ -13,11 +13,7 @@ public final class AgentWorkspace: @unchecked Sendable {
     private let lifecycle = NSLock()
     private var didShutdown = false
     private struct Identity: Codable, Equatable { var project: ProjectId; var directory: String }
-    private let sessions: AgentSessions
-    private let catalogs: AgentModelCatalogService
-    private let historyStore: AgentHistory
-    private let composer: AgentComposerContextService
-    private let observations = AgentChangeBroadcaster()
+    private let runtime: AgentRuntimeService
 
     /// Creates an independent workspace. `storageDirectory` must be dedicated to
     /// this workspace; reuse it and `project` to restore saved conversations.
@@ -53,61 +49,34 @@ public final class AgentWorkspace: @unchecked Sendable {
             guard id == project else { throw ServiceError(.unknownProject, "This conversation belongs to another workspace.") }
             return directory.path
         }
-        let observations = self.observations
-        sessions = try AgentSessions(root: storageDirectory.appendingPathComponent("conversations"),
-                                     projectDirectory: resolve,
-                                     changed: { observations.publish(.init(session: $0, revision: $1)) },
-                                     factory: { provider, directory, resume, callback in
-            AgentRuntime(provider: provider, directory: directory, resumeSession: resume,
-                         executable: executables[provider], tools: tools, onEvent: callback)
-        })
-        sessions.capturesCheckpoints = !applicationToolsOnly
-        sessions.defaultAccess = applicationToolsOnly ? .ask : .fullAccess
-        sessions.launchContext = { _, _ in AgentLaunch(environment: environment, instructions: instructions) }
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        catalogs = AgentModelCatalogService(home: home, executables: executables,
-                                           environment: AgentProcess.environment().merging(environment) { _, value in value }, cacheDirectory: storageDirectory.appendingPathComponent("models"),
-                                           projectDirectory: { URL(fileURLWithPath: try resolve($0)) })
-        historyStore = AgentHistory(home: home)
-        composer = AgentComposerContextService(home: home, projectDirectory: { URL(fileURLWithPath: try resolve($0)) })
+        runtime = try AgentRuntimeService(storageDirectory: storageDirectory.appendingPathComponent("conversations"),
+            modelCacheDirectory: storageDirectory.appendingPathComponent("models"), executables: executables,
+            environment: environment, tools: tools, projectDirectory: { URL(fileURLWithPath: try resolve($0)) },
+            launchContext: { _, _ in .init(instructions: instructions) })
     }
 
     /// Creates a connection without starting a CLI. Sending the first prompt starts it.
     /// Reuse a session ID to reopen a saved conversation.
     public func connect(provider: AgentChatProvider, session: SessionId = SessionId()) -> AgentConnection {
         var connection = AgentConnection(session: session, project: project, provider: provider,
-                                         request: { [self] request in
-            if applicationToolsOnly {
-                if case .setAccess = request { throw ModelError("Application tool access is controlled by the host.") }
-                if case .setPlan = request { throw ModelError("Plan mode is unavailable for application tools.") }
-            }
-            return try await sessions.handle(request)
-        },
-                                         observe: { [observations] in observations.stream(session: session) })
+                                         request: { [runtime] in try await runtime.handle($0) },
+                                         observe: { [runtime] in runtime.observe(session: session) })
         connection.workingDirectory = workingDirectory
         connection.draftURL = storageDirectory.appendingPathComponent("drafts/\(session).json")
-        connection.conversation = { [self] request in
-            if applicationToolsOnly, case .revert = request { throw ModelError("Use the application's undo tools to revert an edit.") }
-            return try await sessions.conversation(request)
-        }
-        connection.attachment = { [self] in try await sessions.attachment($0) }
-        if !applicationToolsOnly { connection.checkpoint = { [self] in try await sessions.checkpoint($0) } }
+        connection.conversation = { [runtime] in try await runtime.conversation($0) }
+        connection.attachment = { [runtime] in try await runtime.attachment($0) }
+        if !applicationToolsOnly { connection.checkpoint = { [runtime] in try await runtime.checkpoint($0) } }
         connection.files = { [files] in try await files.handle($0) }
-        connection.models = { [self] provider, refresh in
-            try await catalogs.handle(.init(project: project, provider: provider, forceRefresh: refresh)).models
+        connection.models = { [runtime, project] provider, refresh in
+            try await runtime.modelCatalog(.init(project: project, provider: provider, forceRefresh: refresh)).models
         }
-        connection.history = { [self] in
-            let excluding = sessions.openProviderSessions()
-            return await Task.detached { [self] in historyStore.list(directory: workingDirectory.path, excluding: excluding) }.value
+        connection.history = { [runtime, project] in try await runtime.history(.init(project: project)) }
+        connection.importHistory = { [runtime, project] entry, session in
+            try await runtime.importHistory(.init(session: session, project: project, provider: entry.provider,
+                                                 providerSession: entry.providerSession))
         }
-        connection.importHistory = { [self] entry, session in
-            try await sessions.importHistory(.init(session: session, project: project, provider: entry.provider,
-                                                   providerSession: entry.providerSession)) { [historyStore] directory in
-                try historyStore.transcript(provider: entry.provider, session: entry.providerSession, directory: directory)
-            }
-        }
-        connection.composerContext = { [self] provider in
-            try await Task.detached { [self] in try await composer.handle(.init(project: project, provider: provider)) }.value
+        connection.composerContext = { [runtime, project] provider in
+            try await runtime.composerContext(.init(project: project, provider: provider, forceRefresh: true))
         }
         if applicationToolsOnly {
             connection.capabilities = [.modelSelection, .attachments, .promptQueue]
@@ -124,8 +93,7 @@ public final class AgentWorkspace: @unchecked Sendable {
         defer { lifecycle.unlock() }
         guard !didShutdown else { return }
         didShutdown = true
-        sessions.shutdown()
-        observations.finish()
+        runtime.shutdown()
         ownership.unlock()
     }
 

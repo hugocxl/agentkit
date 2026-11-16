@@ -22,7 +22,7 @@ AgentKit does not bundle a model or manage provider accounts.
 Add `https://github.com/hugocxl/agentkit.git` in Xcode's package dependencies, or add:
 
 ```swift
-.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.0.0")
+.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.1.0")
 ```
 
 Select the products your target needs:
@@ -219,3 +219,34 @@ rendering, application-tool registration, retry deduplication, and cancellation.
 
 [MIT license](LICENSE). Adapted code and artwork are credited in
 [third-party notices](THIRD_PARTY_NOTICES.md).
+
+## Serve multiple projects
+
+`AgentRuntimeService` owns a shared conversation store for hosts with multiple
+projects or a socket/SSH transport. Supply a project-to-directory resolver and
+optional `AgentLaunchContext` for application instructions and environment values.
+Route agent requests through `handle`, `conversation`, `attachment`, `checkpoint`,
+`modelCatalog`, `composerContext`, `history`, and `importHistory`. Forward revision
+notifications from `changed` to remote clients, or use independent `observe` streams.
+`AgentWorkspace` uses this same runtime with a single project resolver.
+
+The service accepts an existing conversation directory directly. It preserves
+snapshot, transcript, attachment, checkpoint, and queue formats; clearing archives
+prior resources before resetting the original session. Call `refuseNewRequests`
+before host shutdown, then `shutdown` off the main thread to flush and release the
+store. `tryRefuseIfIdle` reserves shutdown atomically only when no conversation is live.
+
+For an application-owned transport, build an `AgentConnection` and provide host
+navigation through `AgentHostServices`. Implement `AgentCodedError` on transport
+errors so the UI can distinguish unsupported services and missing conversations.
+Tab uses all three products this way: AgentCore on its wire, AgentRuntime in its
+server, and AgentUI in its desktop pane adapter.
+
+## Conversation commands
+
+Use `/help` for the supported commands and `/skills` to refresh installed skills.
+`/clear` resets the current conversation and archives its history; `/new` opens a
+conversation through the host. `/compact` uses provider compaction, `/fork` requires
+a host that can open another conversation, and `/copy` and `/export` include retained
+paginated history. Return executes commands; Tab completes them. Commands unavailable
+in the host preserve the draft and explain the limitation.

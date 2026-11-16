@@ -425,7 +425,9 @@ internal final class ClaudeAgentRuntime {
         guard let summary, !summary.isEmpty, let toolUseID = backgroundTasks.removeValue(forKey: id),
               var item = backgroundTools.removeValue(forKey: toolUseID) else { return }
         var activity = item.tool ?? agentToolActivity(name: item.text, input: nil)
-        activity.output = summary
+        // A shell's result names its output file, which its row reads after it ends.
+        let outputFile = activity.presentsCommand ? activity.output.flatMap { AgentBackgroundShell.outputFile(in: $0, task: id) } : nil
+        activity.output = outputFile.map { summary + "\n\nOutput was written to: " + $0.path } ?? summary
         activity.outputIsJSON = false
         activity.status = status == .completed ? .completed : status == .failed ? .failed : .interrupted
         activity.completedAt = Date()
@@ -577,6 +579,12 @@ internal final class ClaudeAgentRuntime {
         if completed, let metadata = message["compact_metadata"] as? [String: Any] {
             item.workContext?.beforeTokenCount = agentTokenCount(metadata["pre_tokens"]).flatMap { $0 <= 9_007_199_254_740_991 ? $0 : nil }
             item.workContext?.afterTokenCount = agentCompactionAfterTokens(metadata["post_tokens"])
+            if let count = item.workContext?.afterTokenCount {
+                let usage = AgentContextUsage(usedTokens: count, contextWindow: contextUsage?.contextWindow)
+                contextUsage = usage
+                onEvent(.contextUsage(usage))
+                if let before = item.workContext?.beforeTokenCount { item.detail = "Context: \(before) → \(count) tokens" }
+            }
         }
         compaction = completed ? nil : item; onEvent(.item(item))
     }
