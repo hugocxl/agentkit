@@ -1,6 +1,7 @@
 import AgentCore
 import Foundation
 import OSLog
+import os
 
 internal enum AgentRuntimeEvent: Sendable {
     case item(AgentChatItem)
@@ -38,6 +39,11 @@ internal struct AgentTurnFinishedError: LocalizedError {
     var errorDescription: String? { "The response has finished. Send the message again to start a follow-up." }
 }
 
+/// A follow-up refused because the response it was for is being stopped: it never reached it.
+internal struct AgentFollowUpRefused: LocalizedError {
+    var errorDescription: String? { "The response was being stopped, so this message didn't reach it." }
+}
+
 internal struct AgentRuntimeError: LocalizedError {
     var message: String
     init(_ message: String) { self.message = message }
@@ -55,6 +61,8 @@ internal final class AgentRuntime: @unchecked Sendable {
     private let provider: AgentChatProvider
     private var suppliedExecutable: URL?
     private let directory: String
+    /// The physical folder the current provider process launched in.
+    private var launchDirectory: String?
     private var applicationTools: AgentToolConfiguration?
     private var applicationCalls: [String: ApplicationCall] = [:]
     private var applicationCallOrder: [String] = []
@@ -70,6 +78,16 @@ internal final class AgentRuntime: @unchecked Sendable {
     private let launchBuilder: (@Sendable ([String]) -> AgentProcess.Launch)?
     private let requestTimeout: TimeInterval
     private var process: AgentProcess?
+    /// Processes replaced by a restart, until they exit.
+    private(set) var replaced: [AgentProcess] = []
+    /// Its provider processes with the folders they run in, each as it was at its launch,
+    /// and launches reserved before their process starts; once refused, it launches none.
+    private struct Launches {
+        var running: [(process: AgentProcess, folder: AgentFolder)] = []
+        var reserved: [UUID: AgentFolder] = [:]
+        var refused = false
+    }
+    private let launches = OSAllocatedUnfairLock(initialState: Launches())
     private var closed = false
     private var failed = false
     private var busy = false
@@ -219,6 +237,10 @@ internal final class AgentRuntime: @unchecked Sendable {
     }
 
     func steer(text: String, attachments: [StagedAgentAttachment]) async throws {
+        try await steer(text: text, attachments: attachments, delivery: AgentDelivery())
+    }
+
+    func steer(text: String, attachments: [StagedAgentAttachment], delivery: AgentDelivery) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async {
                 do {
@@ -226,6 +248,11 @@ internal final class AgentRuntime: @unchecked Sendable {
                         throw AgentRuntimeError("Agent is closed or failed; open a new agent pane to resume.")
                     }
                     guard self.busy, self.ready else { throw AgentTurnFinishedError() }
+                    // In order with Stop on this queue: once a stop is asked for, nothing joins the turn.
+                    guard !self.interruptRequested else { throw AgentFollowUpRefused() }
+                    // Stop cancels the hand-over from the sessions queue: whichever comes first
+                    // decides, so a stopped follow-up never joins a later turn either.
+                    guard delivery.handOver() else { throw AgentFollowUpRefused() }
                     if self.provider == .claude {
                         let input = UUID().uuidString.lowercased()
                         try self.write(["type": "user", "message": ["role": "user",
@@ -258,8 +285,7 @@ internal final class AgentRuntime: @unchecked Sendable {
         processGeneration = UUID()
         cancelApplicationTools()
         applicationCalls.removeAll(); applicationCallOrder.removeAll()
-        process?.stop()
-        process = nil
+        discardProcess()
         let stopped = claude.endProcess()
         if stopped > 0 {
             onEvent(.item(AgentChatItem(kind: .notice, text: Self.stoppedAgents(stopped, because: "the model or reasoning effort changed, which restarts Claude"))))
@@ -309,7 +335,19 @@ internal final class AgentRuntime: @unchecked Sendable {
             executable: suppliedExecutable ?? AgentProcess.resolve(provider == .claude ? "claude" : "codex", environment: environment),
             arguments: arguments, environment: environment)
         let generation = processGeneration
-        process = try AgentProcess(launch: launch, directory: directory, onLine: { [weak self] line in
+        // One physical folder per launch: the identity recorded, the process's folder and the
+        // cwd Codex is given all name it, however a link on the way changes meanwhile.
+        let launchDirectory = URL(fileURLWithPath: directory).resolvingSymlinksInPath().path
+        // Reserved before the process exists, so a revert in its folder finds it, and refused
+        // once the runtime is retired, so none launches after a revert found nothing.
+        let folder = AgentFolder(launchDirectory), reservation = UUID()
+        guard launches.withLock({ launches -> Bool in
+            guard !launches.refused else { return false }
+            launches.reserved[reservation] = folder
+            return true
+        }) else { throw AgentRuntimeError("Agent stopped.") }
+        defer { launches.withLock { _ = $0.reserved.removeValue(forKey: reservation) } }
+        let started = try AgentProcess(launch: launch, directory: launchDirectory, onLine: { [weak self] line in
             self?.queue.async { [weak self] in
                 guard let self, self.processGeneration == generation else { return }
                 self.receive(line)
@@ -320,6 +358,12 @@ internal final class AgentRuntime: @unchecked Sendable {
                 self.fail("\(self.provider.name) exited (\(code)). \(stderr.isEmpty ? "Check CLI installation and authentication; update the CLI if stream-json/app-server is unsupported." : stderr)")
             }
         })
+        launches.withLock {
+            $0.running.removeAll { !$0.process.isRunning }
+            $0.running.append((started, folder))
+        }
+        process = started
+        self.launchDirectory = launchDirectory
         if provider == .claude {
             try request("initialize", params: applicationTools == nil ? ["hooks": [:]] : ["hooks": [:], "sdkMcpServers": ["agentkit"]], completion: { result in
                 if case .success(let response) = result {
@@ -334,7 +378,7 @@ internal final class AgentRuntime: @unchecked Sendable {
                 do {
                     _ = try result.get()
                     try self.write(["method": "initialized"])
-                    var params: [String: Any] = ["cwd": self.directory,
+                    var params: [String: Any] = ["cwd": self.launchDirectory ?? self.directory,
                         "approvalPolicy": self.accessMode == .fullAccess ? "never" : self.accessMode == .ask ? "untrusted" : "on-request",
                         "sandbox": self.accessMode == .fullAccess ? "danger-full-access" : self.accessMode == .ask ? "read-only" : "workspace-write"]
                     if self.applicationOnly { params["approvalPolicy"] = "never"; params["sandbox"] = "read-only" }
@@ -471,7 +515,7 @@ internal final class AgentRuntime: @unchecked Sendable {
         }
         // Codex turn/start overrides persist to subsequent turns. Omitting a
         // cleared selector would keep its old value. Read real provider defaults.
-        try request("config/read", params: ["includeLayers": false, "cwd": directory]) { result in
+        try request("config/read", params: ["includeLayers": false, "cwd": launchDirectory ?? directory]) { result in
             do {
                 let config = try result.get()["config"] as? [String: Any] ?? [:]
                 try self.codexModels { result in
@@ -631,8 +675,7 @@ internal final class AgentRuntime: @unchecked Sendable {
                 if !self.unconsumedClaudeInputs.isEmpty {
                     self.resumeSession = self.claude.sessionID ?? self.resumeSession
                     self.processGeneration = UUID()
-                    self.process?.stop()
-                    self.process = nil
+                    self.discardProcess()
                     let stopped = self.claude.endProcess()
                     if stopped > 0 {
                         self.onEvent(.item(AgentChatItem(kind: .notice, text: Self.stoppedAgents(stopped, because: "Claude was restarted to stop the response"))))
@@ -664,6 +707,43 @@ internal final class AgentRuntime: @unchecked Sendable {
     func stop() {
         if DispatchQueue.getSpecific(key: Self.queueKey) == ObjectIdentifier(self) { close() }
         else { queue.sync { self.close() } }
+    }
+
+    // Read without the runtime's queue, which may be held by a write to a provider that
+    // stopped reading.
+    func mayRun(in scope: AgentRevertScope) -> Bool {
+        launches.withLock { launches in
+            launches.reserved.values.contains { scope.holds($0) }
+                || launches.running.contains { scope.holds($0.folder, process: $0.process.processIdentifier) && $0.process.isRunning }
+        }
+    }
+
+    func isStopping(in scope: AgentRevertScope) -> Bool {
+        launches.withLock { $0.running.contains { scope.holds($0.folder, process: $0.process.processIdentifier) && $0.process.isStopping } }
+    }
+
+    func providerProcesses() -> [Int32] {
+        launches.withLock { $0.running.filter { $0.process.isRunning }.map { $0.process.processIdentifier } }
+    }
+
+    func refuseLaunches() { launches.withLock { $0.refused = true } }
+
+    /// Stops, then waits until the provider process, and any it replaced, has exited.
+    func terminate() {
+        stop()
+        let processes = DispatchQueue.getSpecific(key: Self.queueKey) == ObjectIdentifier(self)
+            ? [process].compactMap { $0 } + replaced : queue.sync { [process].compactMap { $0 } + replaced }
+        for process in processes { process.waitForExit() }
+    }
+
+    /// Stops the provider process this runtime is about to replace, keeping it until it
+    /// has exited so `terminate()` can wait for it. Runs on the runtime's queue.
+    private func discardProcess() {
+        guard let process else { return }
+        process.stop()
+        replaced.removeAll { !$0.isRunning }
+        replaced.append(process)
+        self.process = nil
     }
 
     private func close() {
@@ -751,7 +831,7 @@ internal final class AgentRuntime: @unchecked Sendable {
             }
             guard request["subtype"] as? String == "can_use_tool" else {
                 try write(["type": "control_response", "response": ["subtype": "error", "request_id": id,
-                            "error": "AgentKit supports tool approvals only; this interactive request is unsupported."]])
+                            "error": "This application supports tool approvals only; this interactive request is unsupported."]])
                 onEvent(.item(AgentChatItem(kind: .notice, text: "Unsupported Claude interaction: \(request["subtype"] as? String ?? "unknown")")))
                 return
             }

@@ -471,11 +471,18 @@ public enum BundledImage {
 
 /// Provider marks from Tab Icons, colored in the provider's theme hue.
 public enum AgentLogo {
-    /// The provider's mark on a 64-point square canvas, including a generic
-    /// agent mark for unknown providers.
+    /// The provider's mark on a 64-point square canvas in `theme`'s hue, including
+    /// a generic agent mark for unknown providers.
+    @MainActor
+    public static func image(for provider: AgentChatProvider, theme: AgentTheme) -> NSImage? {
+        mark(provider).image(size: 64, theme: theme)
+    }
+
+    /// The provider's mark in the shared theme's hue, whatever `lightBackground` says.
+    @available(*, deprecated, message: "Pass the conversation's theme with image(for:theme:).")
     @MainActor
     public static func image(for provider: AgentChatProvider, lightBackground: Bool) -> NSImage? {
-        mark(provider).image(size: 64, theme: AgentTheme.shared)
+        image(for: provider, theme: .shared)
     }
 
     static func mark(_ provider: AgentChatProvider) -> AppIcon {

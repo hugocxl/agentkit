@@ -1,4 +1,5 @@
 import AgentCore
+import Darwin
 import Foundation
 
 /// Worktree snapshots use an isolated index, as in the source renderer's GitVcsDriver. Never reset,
@@ -8,10 +9,28 @@ struct AgentCheckpointStore: Sendable {
         var tree: String
         var reference: String
         var directory: String
+        /// The Git folder that keeps the ref: the repository's own, which its linked
+        /// worktrees share. Snapshots taken before it was kept leave it out.
+        var repository: String?
+
+        init(tree: String, reference: String, directory: String, repository: String? = nil) {
+            self.tree = tree; self.reference = reference; self.directory = directory; self.repository = repository
+        }
     }
 
 
-    private let git = GitCommand()
+    private let git: GitCommand
+
+    /// A capture whose ref Git may or may not have made: neither a checkpoint nor nothing,
+    /// so its caller keeps `snapshot` until the ref is known to be gone.
+    struct UnsettledPin: Error, CustomStringConvertible {
+        let snapshot: Snapshot
+        let failure: Error
+        var description: String { "\(failure)" }
+    }
+
+    /// `git` runs every Git command; tests stand in another Git for it.
+    init(git: GitCommand = GitCommand()) { self.git = git }
     private let config = ["-c", "core.fsmonitor=false", "-c", "core.splitIndex=false",
                           "-c", "core.untrackedCache=false", "-c", "core.sparseCheckout=false"]
 
@@ -46,9 +65,25 @@ struct AgentCheckpointStore: Sendable {
             try? FileManager.default.moveItem(at: staged, to: cache)
             try? FileManager.default.removeItem(at: staged)
         }
+        // Known before the ref exists, so no snapshot pins a ref it can't find again.
+        let repository = try git.text(root, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
         let reference = "refs/tab/checkpoints/" + UUID().uuidString.lowercased()
-        try git.run(root, ["update-ref", reference, tree])
-        return Snapshot(tree: tree, reference: reference, directory: directory)
+        let snapshot = Snapshot(tree: tree, reference: reference, directory: directory, repository: repository)
+        do {
+            try git.run(root, ["update-ref", reference, tree])
+        } catch {
+            // Git may have made the ref before failing, as when its hook outlasts the time
+            // allowed. One it made counts; one that may be there is removed, and one that
+            // can't be told is handed back to be kept track of, not used.
+            switch try? isKept(reference, in: repository) {
+            case true?: return snapshot
+            case false?: throw error
+            case nil:
+                if (try? remove(snapshot)) != nil { throw error }
+                throw UnsettledPin(snapshot: snapshot, failure: error)
+            }
+        }
+        return snapshot
     }
 
     /// A short stable name for a folder, for its cached checkpoint index.
@@ -170,17 +205,136 @@ struct AgentCheckpointStore: Sendable {
         return url
     }
 
+    /// Unpins `snapshot`'s private ref. Returns once nothing is left to do: the ref is
+    /// removed, already gone, holds another tree (which stays), or its repository is gone.
+    /// Throws while Git can't reach or remove it, or the repository isn't this user's to
+    /// change, so the caller keeps the record and tries again later.
     func remove(_ snapshot: Snapshot) throws {
         let prefix = "refs/tab/checkpoints/"
         guard snapshot.reference.hasPrefix(prefix),
               UUID(uuidString: String(snapshot.reference.dropFirst(prefix.count))) != nil,
-              [40, 64].contains(snapshot.tree.count), snapshot.tree.allSatisfy(\.isHexDigit) else {
-            throw gitError("Invalid private checkpoint reference")
+              [40, 64].contains(snapshot.tree.count), snapshot.tree.allSatisfy(\.isHexDigit),
+              let repository = try Self.repository(of: snapshot, git: git) else { return }
+        // Git checks who owns a repository it finds, not one it is pointed at; this does.
+        var owner = stat()
+        guard stat(repository, &owner) == 0, owner.st_uid == geteuid() else {
+            throw gitError("\(repository) isn't this user's, so checkpoint ref \(snapshot.reference) stays")
         }
-        guard git.optionalText(snapshot.directory, ["rev-parse", "--verify", snapshot.reference]) != nil else { return }
-        // Expected-value deletion cannot remove a ref somebody replaced.
-        try git.run(snapshot.directory, ["update-ref", "-d", snapshot.reference, snapshot.tree])
+        // Explicitly that repository, with no working tree to enter, which may be gone.
+        let place = ["--git-dir=" + repository, "--work-tree=" + repository]
+        // Expected-value deletion of this ref alone: not a ref somebody replaced or one it links to.
+        // One Git didn't finish, as past its time limit, may still have gone: the lookup tells.
+        let deletion = git.outcome(repository, place + ["update-ref", "--no-deref", "-d", snapshot.reference, snapshot.tree])
+        if deletion?.succeeded == true { return }
+        guard try isKept(snapshot.reference, in: repository) else { return }
+        guard let value = git.outcome(repository, place + ["rev-parse", "--verify", "--quiet", snapshot.reference]) else {
+            throw gitError("Git couldn't look up checkpoint ref \(snapshot.reference)")
+        }
+        guard value.succeeded else { throw GitCommand.failure(value) }
+        // Somebody pointed it elsewhere: it stays, and no longer pins this checkpoint.
+        guard GitCommand.trimmed(value.stdout) == snapshot.tree else { return }
+        throw deletion.map(GitCommand.failure) ?? gitError("Git couldn't remove checkpoint ref \(snapshot.reference)")
     }
+
+    /// Whether `repository` still has `reference`, told apart from a lookup Git couldn't
+    /// make. Git before 2.43 has no `show-ref --exists` and keeps refs only as files, so
+    /// there the files themselves must show it is gone.
+    private func isKept(_ reference: String, in repository: String) throws -> Bool {
+        let place = ["--git-dir=" + repository, "--work-tree=" + repository]
+        guard let lookup = git.outcome(repository, place + ["show-ref", "--exists", reference]) else {
+            throw gitError("Git couldn't look up checkpoint ref \(reference)")
+        }
+        switch lookup.status {
+        case 0: return true
+        case 2: return false
+        case 129: return try Self.filesKeep(reference, in: repository)
+        default:
+            // A folder of other refs now named as this one: Git can't read it as a ref.
+            if try Self.isFolder((repository as NSString).appendingPathComponent(reference)),
+               try !Self.packedRefsHold(reference, in: repository) { return false }
+            throw GitCommand.failure(lookup)
+        }
+    }
+
+    /// Whether the files a Git before 2.43 keeps refs in hold `reference`: a loose ref, a
+    /// link one is kept as, or a packed one.
+    private static func filesKeep(_ reference: String, in repository: String) throws -> Bool {
+        let loose = (repository as NSString).appendingPathComponent(reference)
+        var status = stat()
+        if lstat(loose, &status) == 0 {
+            if status.st_mode & S_IFMT != S_IFDIR { return true }
+        } else if errno != ENOENT && errno != ENOTDIR {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return try packedRefsHold(reference, in: repository)
+    }
+
+    private static func isFolder(_ path: String) throws -> Bool {
+        var status = stat()
+        if lstat(path, &status) == 0 { return status.st_mode & S_IFMT == S_IFDIR }
+        if errno == ENOENT || errno == ENOTDIR { return false }
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+
+    private static func packedRefsHold(_ reference: String, in repository: String) throws -> Bool {
+        let packed = (repository as NSString).appendingPathComponent("packed-refs")
+        guard try exists(packed) else { return false }
+        let refs = try String(contentsOfFile: packed, encoding: .utf8)
+        return refs.split(separator: "\n").contains { $0.hasSuffix(" " + reference) }
+    }
+
+    /// The Git folder that keeps `snapshot`'s ref, or `nil` once it is gone. Snapshots from
+    /// before the repository was kept find it from their folder, or the nearest folder above
+    /// it that remains.
+    private static func repository(of snapshot: Snapshot, git: GitCommand) throws -> String? {
+        if let repository = snapshot.repository { return try exists(repository) ? repository : nil }
+        var folder = URL(fileURLWithPath: snapshot.directory).standardizedFileURL.path
+        while try !exists(folder) {
+            let parent = (folder as NSString).deletingLastPathComponent
+            if parent == folder || parent.isEmpty { return nil }
+            folder = parent
+        }
+        guard let lookup = git.outcome(folder, ["rev-parse", "--path-format=absolute", "--git-common-dir"]) else {
+            throw gitError("Git couldn't find the repository of \(snapshot.directory)")
+        }
+        if lookup.succeeded { return GitCommand.trimmed(lookup.stdout) }
+        // Git found no repository it could use. Only no `.git` up the tree, or a link to one
+        // that is gone, shows the refs went with it.
+        while true {
+            let marker = (folder as NSString).appendingPathComponent(".git")
+            if try exists(marker) { return try linkedRepository(marker, in: folder, failure: lookup) }
+            let parent = (folder as NSString).deletingLastPathComponent
+            if parent == folder || parent.isEmpty { return nil }
+            folder = parent
+        }
+    }
+
+    /// The repository a `.git` link file in `folder` leads to, when it is gone but the
+    /// repository it belonged to as a linked worktree remains; `nil` when that is gone too.
+    /// A folder, or a link Git couldn't follow to something there, throws `failure`.
+    private static func linkedRepository(_ marker: String, in folder: String, failure: ProcessOutput) throws -> String? {
+        guard let data = FileManager.default.contents(atPath: marker), let link = String(data: data, encoding: .utf8),
+              link.hasPrefix("gitdir: ") else { throw GitCommand.failure(failure) }
+        var target = String(link.dropFirst("gitdir: ".count))
+        while target.hasSuffix("\n") || target.hasSuffix("\r") { target.removeLast() }
+        let resolved = ((target as NSString).isAbsolutePath ? target : (folder as NSString).appendingPathComponent(target) as String)
+        guard try !exists(resolved) else { throw GitCommand.failure(failure) }
+        // A linked worktree's own folder is `<repository>/worktrees/<name>`.
+        let worktrees = (resolved as NSString).deletingLastPathComponent
+        guard (worktrees as NSString).lastPathComponent == "worktrees" else { return nil }
+        let common = (worktrees as NSString).deletingLastPathComponent
+        return try exists(common) ? common : nil
+    }
+
+    /// Whether `path` exists, following a symbolic link to what it names; throws when it
+    /// can't be told, as behind a folder this process may not search.
+    private static func exists(_ path: String) throws -> Bool {
+        var status = stat()
+        if stat(path, &status) == 0 { return true }
+        if errno == ENOENT || errno == ENOTDIR { return false }
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+
 }
 
 /// Detailed comparisons stay server-side; transcript summaries can be bounded

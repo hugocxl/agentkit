@@ -139,9 +139,9 @@ class AgentTextPopUp: NSPopUpButton {
     private var brandImage: NSImage?
 
     private func refreshLogos() {
-        brandImage = providerLogo.flatMap { AgentLogo.image(for: $0, lightBackground: chatTheme.palette.isLight) }
+        brandImage = providerLogo.flatMap { AgentLogo.image(for: $0, theme: chatTheme) }
         for (index, provider) in menuLogos {
-            let image = AgentLogo.image(for: provider, lightBackground: chatTheme.palette.isLight)
+            let image = AgentLogo.image(for: provider, theme: chatTheme)
             image?.size = NSSize(width: 16, height: 16)
             image?.isTemplate = false
             item(at: index)?.image = image

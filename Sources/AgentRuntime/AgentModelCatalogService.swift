@@ -11,7 +11,10 @@ actor AgentModelCatalogService {
     private let launch: AgentProcess.Launch?
     private let timeout: TimeInterval
     private let cacheDirectory: URL?
+    /// Closed when the runtime shuts down: a catalog read after that isn't saved.
+    nonisolated let cacheWrites = AgentStoreFence()
     private let now: @Sendable () -> Date
+    private let processes: AgentProcessTracker
     private struct Key: Hashable, Sendable {
         var project: ProjectId
         var provider: AgentChatProvider
@@ -26,9 +29,10 @@ actor AgentModelCatalogService {
 
     init(home: URL, executables: [AgentChatProvider: URL] = [:], environment: [String: String] = AgentProcess.environment(),
          launch: AgentProcess.Launch? = nil, timeout: TimeInterval = 4, cacheDirectory: URL? = nil,
-         now: @escaping @Sendable () -> Date = { Date() },
+         now: @escaping @Sendable () -> Date = { Date() }, processes: AgentProcessTracker = AgentProcessTracker(),
          projectDirectory: @escaping @Sendable (ProjectId) throws -> URL) {
         self.executables = executables
+        self.processes = processes
         self.home = home
         self.environment = environment
         self.launch = launch
@@ -71,6 +75,7 @@ actor AgentModelCatalogService {
         let override = launch
         let executable = executables[provider]
         let timeout = timeout
+        let processes = processes
         let task = Task.detached { () -> AgentModelCatalogReply in
             do {
                 let launch = try override ?? AgentProcess.Launch(
@@ -79,7 +84,7 @@ actor AgentModelCatalogService {
                         "--output-format", "stream-json", "--no-session-persistence", "--safe-mode",
                         "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--tools", ""], environment: launchEnvironment)
                 return await AgentModelCatalogDiscovery.discover(provider: provider, launch: launch,
-                    directory: directory.path, timeout: timeout)
+                    directory: directory.path, timeout: timeout, processes: processes)
             } catch { return .init(models: []) }
         }
         let refresh = Refresh(task: task)
@@ -104,8 +109,10 @@ actor AgentModelCatalogService {
     private func persist(_ reply: AgentModelCatalogReply, key: Key) {
         guard !reply.models.isEmpty, let cacheDirectory,
               let data = try? WireJSON.encode(reply), data.count <= Self.maxCacheBytes else { return }
-        try? FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
-        try? data.write(to: cacheDirectory.appendingPathComponent(key.filename), options: .atomic)
+        cacheWrites.write {
+            try? FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+            try? data.write(to: cacheDirectory.appendingPathComponent(key.filename), options: .atomic)
+        }
     }
 
     private func readPersisted(key: Key) -> AgentModelCatalogReply? {
@@ -227,7 +234,7 @@ private final class AgentModelCatalogDiscovery: @unchecked Sendable {
     private var provider: AgentChatProvider = .codex
 
     static func discover(provider: AgentChatProvider, launch: AgentProcess.Launch, directory: String,
-                         timeout: TimeInterval) async -> AgentModelCatalogReply {
+                         timeout: TimeInterval, processes: AgentProcessTracker) async -> AgentModelCatalogReply {
         let discovery = AgentModelCatalogDiscovery()
         discovery.provider = provider
         return await withCheckedContinuation { continuation in
@@ -235,7 +242,7 @@ private final class AgentModelCatalogDiscovery: @unchecked Sendable {
                 discovery.continuation = continuation
                 discovery.queue.asyncAfter(deadline: .now() + timeout) { discovery.finish(success: false) }
                 do {
-                    discovery.process = try AgentProcess(launch: launch, directory: directory, onLine: { data in
+                    discovery.process = try processes.launch(launch, directory: directory, onLine: { data in
                         discovery.queue.async { discovery.receive(data) }
                     }, onExit: { _, _ in
                         discovery.queue.async { discovery.finish(success: false) }

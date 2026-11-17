@@ -4,10 +4,12 @@ import AppKit
 /// Like the source renderer's ContextWindowMeter, measures the latest prompt, not lifetime billed tokens.
 @MainActor
 final class AgentContextIndicator: AgentComposerButton {
-    var chatTheme: AgentTheme = .shared { didSet { needsDisplay = true } }
+    var chatTheme: AgentTheme = .shared { didSet { needsDisplay = true; recolorDetails() } }
     private(set) var usedTokens: Int?
     private(set) var contextWindow: Int?
-    private var popover: NSPopover?
+    private(set) var popover: NSPopover?
+    /// The details popover's views, kept in the conversation's theme while it shows.
+    private(set) var details: (background: ThemedBackground, heading: NSTextField, detail: NSTextField)?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -109,7 +111,18 @@ final class AgentContextIndicator: AgentComposerButton {
         let panel = NSPopover()
         panel.behavior = .transient
         panel.contentViewController = controller
+        panel.appearance = chatTheme.nsAppearance
         popover = panel
+        details = (background, heading, detail)
         panel.show(relativeTo: bounds, of: self, preferredEdge: .minY)
+    }
+
+    /// Draws the details in the conversation's theme, a replaced one or one changed in place.
+    private func recolorDetails() {
+        guard let details else { return }
+        if details.background.theme !== chatTheme { details.background.theme = chatTheme }
+        details.heading.textColor = chatTheme.fg
+        details.detail.textColor = chatTheme.fgMuted
+        popover?.appearance = chatTheme.nsAppearance
     }
 }

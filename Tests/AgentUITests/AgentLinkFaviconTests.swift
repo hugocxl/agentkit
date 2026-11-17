@@ -65,6 +65,49 @@ final class AgentLinkFaviconTests: XCTestCase {
         XCTAssertEqual(image.size, NSSize(width: 14, height: 14))
     }
 
+    /// Link icons follow the image setting of the conversation they're in, not of the last
+    /// one opened: a conversation set never to load web images fetches none.
+    func testLinkIconsFollowTheirOwnConversationsImageSetting() async throws {
+        _ = NSApplication.shared
+        var fetched: [URL] = []
+        let favicons = AgentLinkFavicon(fetch: { fetched.append($0); throw URLError(.badURL) })
+        func draw(_ host: String, in scope: NSView?) throws {
+            let text = AgentRichTextView(frame: NSRect(x: 0, y: 0, width: 320, height: 40))
+            text.linkFavicons = favicons
+            text.setContent(AgentMarkdown.inline("[\(host)](https://\(host)/page)", theme: AgentTheme(systemIsDark: false)))
+            scope?.addSubview(text)
+            let bitmap = try XCTUnwrap(text.bitmapImageRepForCachingDisplay(in: text.bounds))
+            text.cacheDisplay(in: text.bounds, to: bitmap)
+        }
+        let never = AgentPaneView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        never.mediaLoader.remotePolicy = { .never }
+        let allowed = AgentPaneView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        allowed.mediaLoader.remotePolicy = { .clickToLoad }
+        try draw("never.example.com", in: never)
+        try draw("outside.example.com", in: nil)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(fetched, [], "None for a conversation that loads no web images, or outside one")
+
+        try draw("allowed.example.com", in: allowed)
+        for _ in 0..<100 where fetched.isEmpty { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(fetched, [try XCTUnwrap(AgentLinkFavicon.requestURL(host: "allowed.example.com"))])
+
+        let preview = AgentFilePreviewView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        preview.remoteImages = { .clickToLoad }
+        try draw("preview.example.com", in: preview)
+        for _ in 0..<100 where fetched.count < 2 { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(fetched.count, 2, "A conversation's file in its own window follows it too")
+
+        let steps = AgentSubagentStepsWindow(subagent: AgentSubagent(id: "agent", toolUseID: "task", description: "Explore"),
+                                             toolUseID: "task", theme: .shared, remoteImages: { .clickToLoad }) { _ in
+            AgentSubagentSteps(toolUseID: "task", items: [])
+        }
+        defer { steps.close() }
+        try draw("steps.example.com", in: steps.window?.contentView)
+        for _ in 0..<100 where fetched.count < 3 { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(fetched.count, 3, "So does an agent's steps window")
+    }
+
     // Captured from source e5909e53 hostClassification.ts and favicon.ts.
     private static let hosts = ########"""
     [

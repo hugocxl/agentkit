@@ -18,7 +18,7 @@ public final class AgentConversationViewController: NSViewController {
     public var conversationIcon: NSImage? { controller.icon }
     public var theme: AgentTheme {
         get { controller.surface.theme }
-        set { controller.surface.theme = newValue; controller.surface.themeDidChange() }
+        set { controller.surface.theme = newValue; controller.surface.themeDidChange(); controller.conversationThemeChanged() }
     }
     /// Whether the conversation paints its pane background. Disable this to use
     /// the embedding application's background; the composer keeps its styling.
@@ -95,6 +95,8 @@ public final class AgentConversationViewController: NSViewController {
 
     /// Refreshes authoritative state. No polling timer is used.
     public func refresh() { controller.refresh() }
+    /// Shows the host's current shortcuts in tooltips, after it changed what `shortcutDisplay` returns.
+    public func shortcutsChanged() { controller.shortcutsChanged() }
     public func connectionChanged() { controller.connectionChanged() }
     public func sessionChanged(session: SessionId, revision: UInt64) { controller.sessionChanged(session: session, revision: revision) }
     public func focusComposer() { controller.focusContent() }

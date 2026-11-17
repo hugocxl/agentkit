@@ -1,5 +1,6 @@
 import AgentCore
 import AppKit
+import Combine
 import UniformTypeIdentifiers
 
 /// A server-owned conversation. UI tasks never consume the connection's event stream.
@@ -17,7 +18,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     }
     /// The provider's logo, as a terminal running the same agent shows it.
     var icon: NSImage? {
-        AgentLogo.image(for: selection.provider == .claude ? .claude : .codex, lightBackground: surface.theme.palette.isLight)
+        AgentLogo.image(for: selection.provider == .claude ? .claude : .codex, theme: surface.theme)
     }
     /// Keeps the pane's saved title in step with the conversation, for the
     /// tab title, sidebar filter and palette.
@@ -49,15 +50,15 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     private var helpPicker: AgentSearchPicker?
     private var discoveredCommands: [AgentCore.AgentChatProvider: [AgentCommandDescriptor]] = [:]
     private var historyTask: Task<Void, Never>?
-    private var historyPicker: AgentSearchPicker?
+    private(set) var historyPicker: AgentSearchPicker?
     private var queueEditor: AgentTextEditorSheet?
     var titleDidChange: (() -> Void)?
 
     private let request: (AgentChatRequest) async throws -> AgentChatSnapshot
     private let attachmentCache = AgentAttachmentCache()
-    private var filePreview: AgentFilePreviewWindow?
-    private var mediaPreview: AgentMediaPreviewWindow?
-    private var toolDiffWindows: [String: (activity: AgentToolActivity, window: AgentCheckpointDiffWindow)] = [:]
+    private(set) var filePreview: AgentFilePreviewWindow?
+    private(set) var mediaPreview: AgentMediaPreviewWindow?
+    private(set) var toolDiffWindows: [String: (activity: AgentToolActivity, window: AgentCheckpointDiffWindow)] = [:]
     private(set) var checkpointWindows: [String: AgentCheckpointDiffWindow] = [:]
     var loadCheckpoint: AgentCheckpointDiffWindow.Fetch?
     /// Conversation requests that reply with something other than the snapshot.
@@ -115,6 +116,8 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     private var updateHostContext: (() -> Void)?
     /// A failed request or lost connection; the next accepted snapshot clears it, and Refresh retries.
     private(set) var errorMessage: String?
+    /// What to say when the backend predates a service; from the connection.
+    var backendAdvice = AgentBackendAdvice()
     /// A composer message, such as a validation hint or `/status`, that snapshots leave alone.
     private(set) var notice: AgentComposerNotice?
     private var noticeExpiry: Task<Void, Never>?
@@ -123,7 +126,9 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     private(set) var draftAttachments: [AgentDraftAttachment] = []
     private var attachmentTask: Task<Void, Never>?
     private var preparingAttachments = 0
-    private var attachmentPreview: NSPopover?
+    private(set) var attachmentPreview: NSPopover?
+    /// The draft attachment the preview shows.
+    private var previewedAttachment: String?
     private lazy var composerCoordinator = AgentComposerCoordinator(surface: surface)
     var loadModelCatalog: ((AgentChatProvider, Bool) async throws -> [AgentModelDescriptor])?
     private var modelCatalogs: [AgentChatProvider: [AgentModelDescriptor]] = [:]
@@ -330,6 +335,9 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     func retryLastTurn() {
         guard !disposed, retryTask == nil, commandTask == nil, created, canSend, let item = retryableTurnItem else { return }
         let descriptors = item.attachments ?? []
+        guard descriptors.isEmpty || capabilities.contains(.attachments) else {
+            showComposerError(Self.attachmentsUnavailable + " Its attachments can't be sent again."); return
+        }
         let fetch = surface.fetchAttachment
         retryTask = Task { [weak self] in
             var attachments: [AgentChatAttachment] = []
@@ -365,14 +373,42 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         if let confirmDestructive { return await confirmDestructive(title, message, action) }
         guard let window = surface.window else { return false }
         let alert = NSAlert()
-        alert.window.appearance = surface.theme.nsAppearance
         alert.messageText = title
         alert.informativeText = message
         alert.addButton(withTitle: action).hasDestructiveAction = true
         alert.addButton(withTitle: "Cancel")
+        return await present(alert, on: window) == .alertFirstButtonReturn
+    }
+
+    /// The sheets open over the conversation, kept in its theme and ended when it goes.
+    private(set) var sheets: [(alert: NSAlert, observation: AnyCancellable)] = []
+
+    /// Shows `alert` on `window` in the conversation's theme until it is answered, or until the
+    /// conversation goes, which answers it as cancelled.
+    private func present(_ alert: NSAlert, on window: NSWindow) async -> NSApplication.ModalResponse {
+        guard !disposed else { return .cancel }
+        alert.window.appearance = surface.theme.nsAppearance
+        sheets.append((alert, observeTheme(of: alert)))
+        defer { sheets.removeAll { $0.alert === alert } }
         return await withCheckedContinuation { continuation in
-            alert.beginSheetModal(for: window) { continuation.resume(returning: $0 == .alertFirstButtonReturn) }
+            alert.beginSheetModal(for: window) { continuation.resume(returning: $0) }
         }
+    }
+
+    /// Keeps `alert` in the conversation's theme as that theme changes in place.
+    private func observeTheme(of alert: NSAlert) -> AnyCancellable {
+        surface.theme.changes.sink { [weak self, weak alert] in
+            MainActor.assumeIsolated {
+                guard let self, let alert else { return }
+                alert.window.appearance = self.surface.theme.nsAppearance
+            }
+        }
+    }
+
+    private func endSheets() {
+        let open = sheets
+        sheets.removeAll()
+        for sheet in open { sheet.alert.window.sheetParent?.endSheet(sheet.alert.window, returnCode: .cancel) }
     }
 
     /// Puts a turn's files back as they were before it, all of them or `paths`, after the
@@ -385,20 +421,20 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         Task { [weak self] in
             guard let self, await self.confirm("Revert \(files)?",
                 "Puts \(count == 1 ? "it" : "them") back as \(count == 1 ? "it was" : "they were") before this turn. Nothing else in the project changes.",
-                "Revert") else { return }
+                "Revert"), !self.disposed else { return }
             do {
                 var reply = try await Self.revertReply(request, .revert(session: session, checkpoint: checkpoint.id, paths: paths, force: false))
                 if !reply.conflicts.isEmpty {
                     let list = reply.conflicts.prefix(8).joined(separator: "\n") + (reply.conflicts.count > 8 ? "\n…" : "")
                     guard !self.disposed, await self.confirm(
                         reply.conflicts.count == 1 ? "1 file changed after this turn" : "\(reply.conflicts.count) files changed after this turn",
-                        "\(list)\n\nReverting discards those later changes too.", "Revert Anyway") else { return }
+                        "\(list)\n\nReverting discards those later changes too.", "Revert Anyway"), !self.disposed else { return }
                     reply = try await Self.revertReply(request, .revert(session: session, checkpoint: checkpoint.id, paths: paths, force: true))
                 }
                 guard !self.disposed else { return }
                 self.showNotice(reply.reverted.count == 1 ? "Reverted 1 file." : "Reverted \(reply.reverted.count) files.", kind: .info)
             } catch where agentErrorCode(error) == .unsupported {
-                self.showNotice("This server can't revert a turn's changes. Update or restart the conversation backend.", kind: .warning)
+                self.showNotice(self.backendAdvice.cannot("revert a turn's changes"), kind: .warning)
             } catch {
                 guard !self.disposed else { return }
                 self.showNotice("Couldn't revert: " + error.localizedDescription, kind: .warning)
@@ -530,7 +566,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
                 if let current = self.snapshot { self.surface.render(self.displayed(current)) }
             } catch where agentErrorCode(error) == .unsupported {
                 self?.surface.onLoadEarlier = nil
-                self?.showNotice("This server can't show earlier messages. Update or restart the conversation backend.", kind: .warning)
+                self?.showUnsupported("show earlier messages")
             } catch is CancellationError {
             } catch { self?.showComposerError(error.localizedDescription) }
         }
@@ -539,7 +575,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     /// Opens a tool's whole output, which the server keeps beyond the transcript's part.
     func showFullOutput(_ item: String) {
         guard !disposed, let request = conversationRequest else { return }
-        let session = session
+        let session = session, advice = backendAdvice
         let name = (snapshot?.items.first { $0.id == item }?.tool).map { AgentToolPresentation.displayName($0) + " output.txt" } ?? "Output.txt"
         let bytes = snapshot?.items.first { $0.id == item }?.tool?.fullOutputBytes ?? 0
         let descriptor = AgentChatAttachmentDescriptor(id: "output", name: name, mimeType: "text/plain", byteCount: bytes)
@@ -551,9 +587,9 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
                 }
                 return Data(output.text.utf8)
             } catch where agentErrorCode(error) == .unsupported {
-                throw ModelError("This server can't show a tool's whole output. Update or restart the conversation backend.")
+                throw ModelError(advice.cannot("show a tool's whole output"))
             }
-        }, theme: surface.theme)
+        }, theme: surface.theme, remoteImages: surface.remoteImages)
         filePreview = preview
         preview.showWindow(nil)
     }
@@ -578,7 +614,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
                 guard let self, !self.disposed else { return }
                 self.showConversation?(snapshot)
             } catch where agentErrorCode(error) == .unsupported {
-                self?.showNotice("This server can't fork from an earlier message. Update or restart the conversation backend.", kind: .warning)
+                self?.showUnsupported("fork from an earlier message")
             } catch {
                 self?.showNotice("Couldn't fork: " + error.localizedDescription, kind: .warning)
             }
@@ -600,6 +636,11 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         focusContent()
     }
 
+    /// Says an older backend lacks `service`, in the host's words.
+    private func showUnsupported(_ service: String) {
+        showNotice(backendAdvice.cannot(service), kind: .warning)
+    }
+
     /// Says once per connection when the server runs an older Tab than this app: `tabd`
     /// outlives app updates, so newer agent features stay missing until it restarts.
     private func noteOlderServer() {
@@ -612,8 +653,9 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     func openSubagentSteps(_ agent: AgentSubagent) {
         guard !disposed, let toolUseID = agent.toolUseID, let request = conversationRequest else { return }
         if let existing = subagentWindows[toolUseID] { existing.update(agent); existing.showWindow(nil); return }
-        let session = session
-        let window = AgentSubagentStepsWindow(subagent: agent, toolUseID: toolUseID, theme: surface.theme) { [weak self] id in
+        let session = session, advice = backendAdvice
+        let window = AgentSubagentStepsWindow(subagent: agent, toolUseID: toolUseID, theme: surface.theme,
+                                              remoteImages: surface.remoteImages) { [weak self] id in
             do {
                 guard case .subagentSteps(let steps) = try await request(.subagentSteps(session: session, toolUseID: id)) else {
                     throw ModelError("The server sent an unexpected reply.")
@@ -624,7 +666,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
                 }
                 return steps
             } catch where agentErrorCode(error) == .unsupported {
-                throw ModelError("This server can't show an agent's steps. Update or restart the conversation backend.")
+                throw ModelError(advice.cannot("show an agent's steps"))
             }
         }
         window.onClose = { [weak self] in self?.subagentWindows.removeValue(forKey: toolUseID) }
@@ -682,6 +724,9 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         filePreview = nil
         mediaPreview?.close()
         mediaPreview = nil
+        surface.actions.closeWindows()
+        (surface.actions.project as? AgentHostActions)?.close()
+        endSheets()
         for controller in Array(checkpointWindows.values) { controller.close() }
         checkpointWindows.removeAll()
         for entry in Array(toolDiffWindows.values) { entry.window.close() }
@@ -814,6 +859,10 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         guard !disposed, commandTask == nil, created, canSend,
               preparingAttachments == 0,
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !draftAttachments.isEmpty else { return }
+        // A draft kept from a conversation that took them; it stays as written.
+        guard draftAttachments.isEmpty || capabilities.contains(.attachments) else {
+            showComposerError(Self.attachmentsUnavailable + " Remove them to send."); return
+        }
         if let command = AgentSlashCommand(text: text), !command.isPath {
             guard capabilities.contains(.providerCommands) else {
                 showComposerError("Provider commands are unavailable in this conversation."); return
@@ -886,7 +935,6 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         if let askDenialReason { return await askDenialReason(tool) }
         guard let window = surface.window else { return nil }
         let alert = NSAlert()
-        alert.window.appearance = surface.theme.nsAppearance
         alert.messageText = "Deny \(tool)?"
         alert.informativeText = "Tell the agent why, so it can try another way."
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
@@ -895,9 +943,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         alert.addButton(withTitle: "Deny")
         alert.addButton(withTitle: "Cancel")
         alert.window.initialFirstResponder = field
-        return await withCheckedContinuation { continuation in
-            alert.beginSheetModal(for: window) { continuation.resume(returning: $0 == .alertFirstButtonReturn ? field.stringValue : nil) }
-        }
+        return await present(alert, on: window) == .alertFirstButtonReturn ? field.stringValue : nil
     }
 
     /// The web action is acknowledged only after the server accepts it. Keeping
@@ -1017,8 +1063,11 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         }
     }
 
+    static let attachmentsUnavailable = "This conversation can't take attachments."
+
     private func attachImage(_ data: Data, mimeType: String) {
         guard !disposed else { return }
+        guard capabilities.contains(.attachments) else { showComposerError(Self.attachmentsUnavailable); return }
         prepareAttachments {
             try await Task.detached(priority: .userInitiated) {
                 [try AgentAttachmentImporter.fromImage(data: data, mimeType: mimeType)]
@@ -1027,6 +1076,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     }
 
     private func addAttachments(_ attachments: [AgentDraftAttachment]) {
+        guard capabilities.contains(.attachments) else { showComposerError(Self.attachmentsUnavailable); return }
         let additions = attachments.filter { candidate in
             !draftAttachments.contains { $0.name == candidate.name && $0.data == candidate.data }
         }
@@ -1049,6 +1099,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
 
     private func previewAttachment(_ id: String) {
         guard let attachment = draftAttachments.first(where: { $0.id == id }), view.window != nil else { return }
+        previewedAttachment = id
         let content = NSViewController()
         let background = ThemedBackground(color: { $0.floating })
         background.theme = surface.theme
@@ -1056,6 +1107,13 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         content.view = background
         let title = makeLabel(attachment.name, font: AppFont.small)
         title.textColor = surface.theme.fg
+        var source: NSTextView?
+        // Its plain controls follow the theme changing in place, as for the system appearance.
+        background.onColorsChange = { [weak background, weak title] in
+            guard let theme = background?.theme else { return }
+            title?.textColor = theme.fg
+            source?.textColor = theme.fg
+        }
         title.frame = NSRect(x: 16, y: 12, width: 448, height: 22)
         title.lineBreakMode = .byTruncatingMiddle
         background.addSubview(title)
@@ -1073,6 +1131,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
             scroll.drawsBackground = false
             scroll.hasVerticalScroller = true
             let text = NSTextView(frame: scroll.bounds)
+            source = text
             text.isEditable = false
             text.drawsBackground = false
             text.textColor = surface.theme.fg
@@ -1309,6 +1368,11 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         let unused = created && !submitting && commandTask == nil && snapshot.map {
             $0.items.isEmpty && $0.providerSession == nil && $0.status == .idle
         } == true
+        // Imported beside this one, it would be saved where nothing shows it.
+        guard unused || showConversation != nil else {
+            showComposerError("Opening another conversation is unavailable. Continue it from a new conversation.")
+            return
+        }
         let target = unused ? session : SessionId()
         let generation = connectionGeneration
         errorMessage = nil
@@ -1324,8 +1388,11 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
                 if result.session == self.session {
                     self.selectionEdited = false
                     self.accept(result, generation: generation, authoritative: true)
+                } else if let showConversation = self.showConversation {
+                    showConversation(result)
                 } else {
-                    self.showConversation?(result)
+                    // Another conversation continues it already, and nothing here can show it.
+                    self.showComposerError("That conversation is already continued in another one.")
                 }
             } catch is CancellationError {
             } catch {
@@ -1338,7 +1405,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
 
     private func showHistoryError(_ error: Error, doing action: String) {
         if agentErrorCode(error) == .unsupported {
-            showComposerError("This server can't \(action). Update the conversation backend first.")
+            showComposerError("This server can't \(action). \(backendAdvice.update)")
         } else {
             showComposerError("Couldn't \(action): \(error.localizedDescription)")
         }
@@ -1404,7 +1471,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
             } catch {
                 guard !Task.isCancelled, !self.disposed, generation == self.connectionGeneration else { return }
                 if case .clear = command, agentErrorCode(error) == .unsupported {
-                    self.showComposerError("Update Tab on this server to clear a conversation in place. Your conversation is unchanged.")
+                    self.showComposerError(self.backendAdvice.clear + " Your conversation is unchanged.")
                 } else { self.showError(error) }
             }
         }
@@ -1478,7 +1545,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     private func showError(_ error: Error) {
         // Refreshing can't fix an old server, and the next snapshot shouldn't hide that.
         if agentErrorCode(error) == .unsupported {
-            showNotice("This server does not support that action. Update the conversation backend, then reconnect. Your draft is retained.", kind: .warning)
+            showNotice("This server does not support that action. \(backendAdvice.reconnect) Your draft is retained.", kind: .warning)
             return
         }
         errorMessage = error.localizedDescription
@@ -1519,6 +1586,9 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         if !capabilities.contains(.promptQueue), snapshot.status == .working || snapshot.status == .waiting { return false }
         return !restoringDraft && (snapshot.status == .idle || snapshot.status == .failed || snapshot.status == .working || snapshot.status == .waiting)
     }
+
+    /// Tooltips name shortcuts; they change when the host rebinds them.
+    func shortcutsChanged() { updateControls() }
 
     private func updateControls() {
         let descriptors = discoveredCommands[selection.provider] ?? (snapshot?.provider == selection.provider ? snapshot?.commandDescriptors ?? [] : [])
@@ -1573,7 +1643,12 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         surface.dismissNotice.isHidden = errorMessage != nil || notice == nil
         let retryable = retryableTurnItem
         surface.retryTurn.isHidden = errorMessage != nil || notice != nil || retryable == nil
-        let blockedRetry = retryable.flatMap { item in unretryable?.item == item.id ? unretryable?.reason : nil }
+        let blockedRetry = retryable.flatMap { item in
+            if item.attachments?.isEmpty == false, !capabilities.contains(.attachments) {
+                return Self.attachmentsUnavailable + " Its attachments can't be sent again."
+            }
+            return unretryable?.item == item.id ? unretryable?.reason : nil
+        }
         surface.retryTurn.isEnabled = retryTask == nil && commandTask == nil && canSend && blockedRetry == nil
         surface.retryTurn.toolTip = blockedRetry ?? "Send that prompt again as a new message"
         surface.newConversation.isHidden = errorMessage != nil || notice != nil || snapshot?.status != .closed || onNewConversation == nil
@@ -1724,14 +1799,11 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     private func presentRestartConfirmation(_ running: Int) async -> Bool {
         guard let window = surface.window else { return true }
         let alert = NSAlert()
-        alert.window.appearance = surface.theme.nsAppearance
         alert.messageText = running == 1 ? "Stop the running agent?" : "Stop \(running) running agents?"
         alert.informativeText = "Claude restarts with the new model or reasoning effort on your next message, which stops the agents it is running in the background."
         alert.addButton(withTitle: "Change and Stop Agents")
         alert.addButton(withTitle: "Cancel")
-        return await withCheckedContinuation { continuation in
-            alert.beginSheetModal(for: window) { continuation.resume(returning: $0 == .alertFirstButtonReturn) }
-        }
+        return await present(alert, on: window) == .alertFirstButtonReturn
     }
 
     func selectModel(provider: AgentChatProvider, model: String?) {
@@ -2006,6 +2078,7 @@ extension AgentPaneController {
 extension AgentPaneController {
     func bind(_ connection: AgentConnection, host: AgentHostServices, theme: AgentTheme) {
         capabilities = connection.capabilities
+        backendAdvice = connection.backendAdvice
         surface.composer.setAccessibilityHelp(capabilities.contains(.planMode)
             ? "Ask anything. Return sends; Shift-Return adds a new line; Shift-Tab toggles plan mode."
             : "Ask anything. Return sends; Shift-Return adds a new line.")
@@ -2028,7 +2101,6 @@ extension AgentPaneController {
         updateHostContext?()
         surface.workspaceDescription = host.workspaceDescription
         surface.mediaLoader.remotePolicy = host.remoteImages
-        AgentLinkFavicon.shared.policy = host.remoteImages
         surface.actions.project = AgentHostActions(surface: surface, session: session, services: host)
         surface.onOpenFile = { [weak self] path, line in
             do {
@@ -2087,7 +2159,8 @@ extension AgentPaneController {
                 }
             } else {
                 self.mediaPreview?.close(); self.filePreview?.close()
-                let preview = AgentFilePreviewWindow(item: item, attachment: attachment, fetch: fetch, theme: self.surface.theme)
+                let preview = AgentFilePreviewWindow(item: item, attachment: attachment, fetch: fetch, theme: self.surface.theme,
+                                                     remoteImages: self.surface.remoteImages)
                 self.filePreview = preview; preview.showWindow(nil)
             }
         }
@@ -2099,5 +2172,22 @@ extension AgentPaneController {
             self.mediaPreview = preview
             preview.present(in: self.view.window)
         }
+    }
+
+    /// The conversation's theme was replaced: the previews it opened follow.
+    func conversationThemeChanged() {
+        sheets = sheets.map { ($0.alert, observeTheme(of: $0.alert)) }
+        for sheet in sheets { sheet.alert.window.appearance = surface.theme.nsAppearance }
+        mediaPreview?.follow(surface.theme)
+        filePreview?.follow(surface.theme)
+        surface.actions.expandedMedia?.follow(surface.theme)
+        for window in checkpointWindows.values { window.follow(surface.theme) }
+        for entry in toolDiffWindows.values { entry.window.follow(surface.theme) }
+        for window in subagentWindows.values { window.follow(surface.theme) }
+        helpPicker?.follow(surface.theme)
+        historyPicker?.follow(surface.theme)
+        queueEditor?.follow(surface.theme)
+        surface.outlinePicker?.follow(surface.theme)
+        if attachmentPreview?.isShown == true, let previewedAttachment { previewAttachment(previewedAttachment) }
     }
 }

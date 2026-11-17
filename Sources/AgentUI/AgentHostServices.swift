@@ -20,6 +20,9 @@ public struct AgentHostServices {
     public var loadThreads: (() async throws -> [AgentMentionThread])?
     public var loadFiles: (() async throws -> [String])?
     public var remoteImages: () -> RemoteImagePolicy = { AgentSettings().remoteImages }
+    /// Shows a short notice, such as an image copy's progress or failure, where the
+    /// host shows its own; without it AgentKit uses the notice stack in the window.
+    public var showNotice: ((String, Toast.Style) -> Void)?
 
     /// Creates host services. Omitted integrations report that the action is unavailable.
     public init(directory: @escaping () -> String? = { nil }, isLocal: @escaping () -> Bool = { false }) {
@@ -32,7 +35,9 @@ final class AgentHostActions: AgentConversationProjectActions {
     private weak var surface: AgentPaneView?
     private let services: AgentHostServices
     private let session: SessionId
-    private var preview: AgentConversationMediaWindow?
+    private(set) var preview: AgentConversationMediaWindow?
+    /// Set once the conversation goes: it opens no preview after.
+    private(set) var closed = false
     private var metadataTask: Task<Void, Never>?
     private var metadataLoaded = false
     private var metadataGeneration: UInt64 = 0
@@ -57,9 +62,13 @@ final class AgentHostActions: AgentConversationProjectActions {
         metadataGeneration &+= 1
         metadataTask?.cancel(); metadataTask = nil; metadataLoaded = false
     }
+    /// Reads the repository identity once per connection. A host's answer, including
+    /// an error such as a folder outside Git, holds until the connection changes;
+    /// only a failure without an error code, such as a dropped connection, retries.
     func refreshProjectMetadata() {
         guard !metadataLoaded, metadataTask == nil, let fetch = services.repositoryOrigin else { return }
         let generation = metadataGeneration
+        metadataLoaded = true
         metadataTask = Task { [weak self] in
             guard let self else { return }
             defer { if self.metadataGeneration == generation { self.metadataTask = nil } }
@@ -67,9 +76,17 @@ final class AgentHostActions: AgentConversationProjectActions {
                 let origin = try await fetch()
                 try Task.checkCancellation()
                 self.surface?.linkServices.pullRequestHosts = AgentPullRequestLink.hosts(origin: origin)
-                self.metadataLoaded = true
-            } catch { /* A disconnected host may retry on the next snapshot. */ }
+            } catch is CancellationError {
+            } catch {
+                if agentErrorCode(error) == nil, self.metadataGeneration == generation { self.metadataLoaded = false }
+            }
         }
+    }
+    /// False when the host shows no notices, so AgentKit shows its own.
+    func showNotice(_ message: String, style: Toast.Style) -> Bool {
+        guard let show = services.showNotice else { return false }
+        show(message, style)
+        return true
     }
     func searchProjectEntries(_ query: String, limit: Int) async throws -> AgentConversationFileActions.Entries {
         try await AgentConversationFileActions.searchProjectEntries(query, limit: limit, scope: scope(), read: reader())
@@ -125,8 +142,16 @@ final class AgentHostActions: AgentConversationProjectActions {
             mimeType: AgentConversationFileActions.mimeType(path: relative), scope: scope,
             ranged: services.supportsRangedReads(), read: read)
         try Task.checkCancellation()
+        guard !closed else { return }
         let next = try AgentConversationMediaWindow(resource: loaded.resource, name: (relative as NSString).lastPathComponent)
         preview?.close(); preview = next; next.showWindow(nil)
+    }
+
+    /// Closes the file preview it opened, as when the conversation goes, and opens none after.
+    func close() {
+        closed = true
+        preview?.close()
+        preview = nil
     }
     func openConversation(_ target: SessionId, project: ProjectId?, citation: AgentAssistantCitation?) async throws {
         guard let open = services.openConversation else { throw ModelError("Conversation navigation is unavailable in this application.") }

@@ -27,7 +27,8 @@ final class AgentCommandDiscovery: @unchecked Sendable {
         }
     }
 
-    static func discover(provider: AgentChatProvider, directory: String, environment: [String: String], executable: URL? = nil) async -> Result {
+    static func discover(provider: AgentChatProvider, directory: String, environment: [String: String], executable: URL? = nil,
+                         processes: AgentProcessTracker) async -> Result {
         let discovery = AgentCommandDiscovery()
         discovery.provider = provider; discovery.directory = directory
         return await withCheckedContinuation { continuation in
@@ -41,7 +42,7 @@ final class AgentCommandDiscovery: @unchecked Sendable {
                     let executable = try executable ?? AgentProcess.resolve(provider == .claude ? "claude" : "codex", environment: environment)
                     let arguments = provider == .codex ? ["app-server"] : ["--print", "--verbose", "--input-format", "stream-json",
                         "--output-format", "stream-json", "--no-session-persistence", "--tools", ""]
-                    discovery.process = try AgentProcess(launch: .init(executable: executable, arguments: arguments, environment: environment),
+                    discovery.process = try processes.launch(.init(executable: executable, arguments: arguments, environment: environment),
                         directory: directory, onLine: { data in discovery.queue.async { discovery.receive(data) } },
                         onExit: { _, _ in discovery.queue.async { discovery.finish(Result()) } })
                     if provider == .claude {

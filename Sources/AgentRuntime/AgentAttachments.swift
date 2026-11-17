@@ -26,14 +26,12 @@ internal enum AgentAttachments {
         }
     }
 
-    /// Writes and records `attachments` on a blocking worker, off the sessions queue.
-    static func stageOffQueue(_ attachments: [AgentChatAttachment], root: URL) async throws -> [StagedAgentAttachment] {
+    /// Writes `attachments` and their index; a blocking call for the sessions' writer.
+    static func stageRecorded(_ attachments: [AgentChatAttachment], root: URL) throws -> [StagedAgentAttachment] {
         guard !attachments.isEmpty else { return [] }
-        return try await runBlocking {
-            let staged = try write(attachments, root: root)
-            try record(staged, root: root)
-            return staged
-        }
+        let staged = try write(attachments, root: root)
+        try record(staged, root: root)
+        return staged
     }
 
     static func stageToolImages(_ attachments: [AgentChatAttachment], root: URL) throws -> [StagedAgentAttachment] {

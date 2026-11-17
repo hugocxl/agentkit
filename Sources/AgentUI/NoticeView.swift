@@ -368,7 +368,7 @@ final class MarqueeLabel: NSView {
         let room = bounds.width - Self.fade - Self.overhang
         let y = ((bounds.height - textSize.height) / 2).rounded()
         let overflows = textSize.width > room
-        let truncates = overflows && AgentTheme.shared.accessibility.reduceMotion
+        let truncates = overflows && AccessibilityOptions.current().reduceMotion
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }

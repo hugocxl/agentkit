@@ -319,6 +319,23 @@ final class AgentModelCatalogServiceTests: XCTestCase {
         XCTAssertEqual(savedSecond.models, secondResult.models)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: saved.path).count, 2)
     }
+
+    /// A catalog read after its saving was closed, as by shutdown, is returned but not saved.
+    func testACatalogReadAfterSavingClosedIsNotSaved() async throws {
+        let home = try root(), saved = home.appendingPathComponent("saved")
+        let fixture = try AgentRuntimeFixture("""
+        take
+        emit '{"type":"control_response","response":{"subtype":"success","request_id":"1","response":{"models":[{"value":"new-model","displayName":"New model","supportedEffortLevels":["future"]}]}}}'
+        hold
+        """)
+        defer { fixture.remove() }
+        let service = AgentModelCatalogService(home: home, environment: [:], launch: launch(fixture),
+            cacheDirectory: saved, projectDirectory: { _ in home })
+        service.cacheWrites.close()
+        let reply = try await service.handle(AgentModelCatalogRequest(project: ProjectId(), provider: .claude))
+        XCTAssertEqual(reply.models.map(\.id), ["new-model"], "Still read")
+        XCTAssertEqual((try? FileManager.default.contentsOfDirectory(atPath: saved.path)) ?? [], [], "Not saved")
+    }
 }
 
 private final class ModelCatalogTestClock: @unchecked Sendable {

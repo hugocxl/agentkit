@@ -1,6 +1,7 @@
 import AgentCore
 import Foundation
 import CryptoKit
+import os
 
 /// Injectable boundary: tests never need a provider executable.
 protocol AgentSessionRuntime: Sendable {
@@ -19,8 +20,48 @@ protocol AgentSessionRuntime: Sendable {
     func setAccess(_ mode: AgentAccessMode) async throws
     func interrupt() async throws
     func stop()
+    /// Stops, then waits until the provider process has exited, for a host about to exit.
+    func terminate()
     /// Called once, before the first message: what the provider process starts with.
     func prepare(_ launch: AgentLaunch)
+    /// Whether a provider process of it may change files `scope` restores: one launching or
+    /// running, stopping or not, in its folder, one inside it or one around it, as the
+    /// folders were at its launch, or one found working there now.
+    func mayRun(in scope: AgentRevertScope) -> Bool
+    /// Whether a provider process of it that may change files `scope` restores was asked to
+    /// stop and still runs.
+    func isStopping(in scope: AgentRevertScope) -> Bool
+    /// Its provider processes that may still run, for a revert to find where they work now.
+    func providerProcesses() -> [Int32]
+    /// Launches no provider process from now on: it is being retired.
+    func refuseLaunches()
+    /// Steers the turn with a follow-up, unless Stop cancels `delivery` before the provider
+    /// takes it.
+    func steer(text: String, attachments: [StagedAgentAttachment], delivery: AgentDelivery) async throws
+}
+
+/// A follow-up's hand-over to its provider, which Stop can cancel until the provider takes it.
+final class AgentDelivery: @unchecked Sendable {
+    private enum State { case pending, handedOver, cancelled }
+    private let lock = NSLock()
+    private var state = State.pending
+
+    /// Hands the follow-up over unless Stop came first: true when it is the provider's now.
+    func handOver() -> Bool {
+        lock.withLock {
+            if state == .pending { state = .handedOver }
+            return state == .handedOver
+        }
+    }
+
+    /// Stops the follow-up unless the provider took it already: true when it never will.
+    @discardableResult
+    func cancel() -> Bool {
+        lock.withLock {
+            if state == .pending { state = .cancelled }
+            return state == .cancelled
+        }
+    }
 }
 
 /// What a conversation's provider process starts with beyond its arguments.
@@ -58,6 +99,18 @@ extension AgentSessionRuntime {
 
     func prepare(_ launch: AgentLaunch) {}
 
+    func terminate() { stop() }
+
+    func mayRun(in scope: AgentRevertScope) -> Bool { false }
+    func isStopping(in scope: AgentRevertScope) -> Bool { false }
+    func providerProcesses() -> [Int32] { [] }
+    func refuseLaunches() {}
+
+    func steer(text: String, attachments: [StagedAgentAttachment], delivery: AgentDelivery) async throws {
+        guard delivery.handOver() else { throw AgentFollowUpRefused() }
+        try await steer(text: text, attachments: attachments)
+    }
+
     func approve(request: String, allow: Bool, always: Bool, reason: String?) async throws {
         guard !always, reason == nil else { throw AgentRuntimeError("This agent can only answer an approval once.") }
         try await approve(request: request, allow: allow)
@@ -94,8 +147,12 @@ final class AgentSessions: @unchecked Sendable {
         var checkpointing = false
         var hasSuccessfulTurn = false
         var accessTask: Task<Void, Error>?
-        var baselineTask: Task<AgentCheckpointStore.Snapshot?, Never>?
-        var checkpointTask: Task<Void, Never>?
+        /// The current turn's checkpoint baseline, once one is being taken.
+        var baseline: CheckpointBaseline?
+        /// Takes this conversation's checkpoints, and applies its reverts, in the order asked.
+        let checkpoints = DispatchQueue(label: "agent.checkpoints", qos: .utility)
+        /// Reverts admitted and not yet recorded: the conversation can't be cleared meanwhile.
+        var reverts = 0
         var stagingToolImages = false
         var deferredEvents: [AgentRuntimeEvent] = []
         var deferredEventBytes = 0
@@ -162,16 +219,32 @@ final class AgentSessions: @unchecked Sendable {
 
     private final class PendingReply: @unchecked Sendable {
         var finished = false // Confined to queue.
+        /// A follow-up the user stopped. Confined to queue.
+        var stopped = false
         let continuation: Reply
         var task: Task<Void, Never>?
+        /// A follow-up's hand-over to its provider; `nil` for other requests.
+        let delivery: AgentDelivery?
 
-        init(_ continuation: Reply) {
+        init(_ continuation: Reply, delivery: AgentDelivery? = nil) {
             self.continuation = continuation
+            self.delivery = delivery
         }
     }
 
     private let queue = DispatchQueue(label: "tab.agents.sessions", qos: .userInitiated)
-    private let writer = DispatchQueue(label: "tab.agents.persistence", qos: .utility)
+    /// Writes records and removes files, in the order asked.
+    private let writer: DispatchQueue
+    /// Closed once the store is released to its next owner: nothing is written after.
+    private let fence = AgentStoreFence()
+    /// Takes and removes checkpoints.
+    private let checkpointStore: AgentCheckpointStore
+    /// Checkpoints being taken and reverts being applied. Each changes refs, files and
+    /// records the store's next owner must find whole, so shutdown waits for them.
+    private let storeWork = DispatchGroup()
+    /// How long shutdown waits for them; `nil`, the default, waits until they end, which
+    /// Git's own time limits bound. With a limit, the store stays held until they end.
+    var checkpointDrain: TimeInterval?
     private var retainedCheckpointIDs: [SessionId: Set<String>] = [:] // writer queue only
     private let root: URL
     private let factory: Factory
@@ -192,6 +265,36 @@ final class AgentSessions: @unchecked Sendable {
         try AgentAttachments.record(staged, root: directory)
     }
     private var entries: [SessionId: Entry] = [:]
+    /// Conversations a history import is being made into.
+    private var importing: Set<SessionId> = []
+    /// One folder's identity however its path is spelled, as through a symbolic link, so
+    /// what is kept by folder meets; its resolved path when it can't be read.
+    static func folderKey(_ path: String) -> String {
+        var status = stat()
+        if stat(path, &status) == 0 { return "\(status.st_dev):\(status.st_ino)" }
+        return URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
+    }
+    /// Steps tests follow a clear through.
+    enum ClearStep: Sendable { case waiting, waited }
+    /// Tests follow a clear here: as it starts waiting for the conversation's checkpoints,
+    /// and once that wait is over.
+    var clearStep: (@Sendable (ClearStep) async -> Void)?
+    /// Whether providers started outside conversations, as for discovery, may change files a
+    /// revert restores; the host's service answers for its own.
+    var otherProvidersMayRun: @Sendable (AgentRevertScope) -> Bool = { _ in false }
+    /// The processes of providers started outside conversations that may still run.
+    var otherProviderProcesses: @Sendable () -> [Int32] = { [] }
+    /// Tests hold a revert here, on the sessions queue, once admitted and before it is queued.
+    var revertAdmitted: (@Sendable () -> Void)?
+    /// Tests learn here, on the sessions queue, that a follow-up was admitted.
+    var followUpAdmitted: (@Sendable () -> Void)?
+    /// Whether the caller runs on the sessions queue, for tests checking where work runs.
+    var onSessionsQueue: Bool { DispatchQueue.getSpecific(key: Self.queueKey) == ObjectIdentifier(self) }
+    private static let queueKey = DispatchSpecificKey<ObjectIdentifier>()
+    /// The host's callbacks run here, in order and off the sessions queue, so one may call
+    /// back into the conversations, even to shut them down.
+    private let callbacks = DispatchQueue(label: "agentkit.sessions.callbacks")
+    private static let callbackKey = DispatchSpecificKey<ObjectIdentifier>()
     var composerCatalog: (@Sendable (AgentComposerContextRequest) async throws -> AgentComposerContextReply)?
     private var stopping = false
 
@@ -200,19 +303,28 @@ final class AgentSessions: @unchecked Sendable {
          submissionTimeout: TimeInterval = 120,
          interruptTimeout: TimeInterval = 15,
          closedRetention: TimeInterval = AgentSessions.closedRetention,
+         writer: DispatchQueue = DispatchQueue(label: "tab.agents.persistence", qos: .utility),
+         checkpoints: AgentCheckpointStore = AgentCheckpointStore(),
          factory: @escaping Factory = { provider, directory, resume, callback in
              AgentRuntime(provider: provider, directory: directory, resumeSession: resume, onEvent: callback)
          }) throws {
         self.root = root
+        self.writer = writer
+        self.checkpointStore = checkpoints
         self.factory = factory
         self.projectDirectory = projectDirectory
         self.submissionTimeout = submissionTimeout
         self.interruptTimeout = interruptTimeout
         self.changed = changed
+        queue.setSpecific(key: Self.queueKey, value: ObjectIdentifier(self))
+        callbacks.setSpecific(key: Self.callbackKey, value: ObjectIdentifier(self))
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        // Listed before anything is queued, so a store that can't be read leaves no work
+        // running after this fails.
+        let files = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey])
+        resumeRemovals()
         let now = Date()
-        for file in try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey])
-            where file.pathExtension == "json" {
+        for file in files where file.pathExtension == "json" {
             do {
                 guard (try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) <= AgentLimits.maxFrame else {
                     continue
@@ -259,7 +371,8 @@ final class AgentSessions: @unchecked Sendable {
                 // Snapshots saved before tool bodies were stored once still carry both copies.
                 for index in entry.snapshot.items.indices { Self.dropDuplicateDetail(&entry.snapshot.items[index]) }
                 bound(entry)
-                let archivedCheckpointIDs = recoverClearedCheckpoints(entry.snapshot)
+                let cleared = recoverClearedCheckpoints(entry.snapshot)
+                let archivedCheckpointIDs = cleared.archived.union(cleared.unknown)
                 let checkpointDirectory = root.appendingPathComponent("checkpoints", isDirectory: true)
                     .appendingPathComponent(entry.snapshot.session.description, isDirectory: true)
                 let existing = (try? FileManager.default.contentsOfDirectory(at: checkpointDirectory, includingPropertiesForKeys: nil)) ?? []
@@ -282,10 +395,36 @@ final class AgentSessions: @unchecked Sendable {
                 AgentLog.error("agent snapshot unavailable: \(file.lastPathComponent): \(error)")
             }
         }
+        writer.async {
+            self.reclaimAbandonedCopies()
+            self.settleUnsettledPins()
+            self.recordRepositories()
+        }
     }
 
+    /// Reports every conversation's activity again, before it returns.
     func publishActivity() {
-        queue.sync { for entry in entries.values { activityChanged(entry.snapshot, entry.directory) } }
+        queue.sync { for entry in entries.values { notifyActivity(entry.snapshot, entry.directory) } }
+        drainCallbacks()
+    }
+
+    private func notifyChanged(_ session: SessionId, _ revision: UInt64) {
+        let changed = changed
+        callbacks.async { changed(session, revision) }
+    }
+
+    private func notifyActivity(_ snapshot: AgentChatSnapshot, _ directory: String) {
+        let activityChanged = activityChanged
+        callbacks.async { activityChanged(snapshot, directory) }
+    }
+
+    /// Whether the caller is one of the host's callbacks.
+    var onCallbackQueue: Bool { DispatchQueue.getSpecific(key: Self.callbackKey) == ObjectIdentifier(self) }
+
+    /// Waits for the callbacks already queued, unless called from one.
+    func drainCallbacks() {
+        guard !onCallbackQueue else { return }
+        callbacks.sync {}
     }
 
     var hasSessions: Bool {
@@ -302,9 +441,13 @@ final class AgentSessions: @unchecked Sendable {
             }
             return (id, entries[id]?.snapshot.resetID)
         }
-        if case .clear(let session, _, _) = request {
-            let checkpoint = queue.sync { entries[session]?.checkpointTask }
-            await checkpoint?.value
+        if case .clear(let session, _, _) = request, let checkpoints = queue.sync(execute: { entries[session]?.checkpoints }) {
+            let drained = DispatchGroup()
+            drained.enter()
+            checkpoints.async { drained.leave() }
+            await clearStep?(.waiting)
+            await withCheckedContinuation { finished in drained.notify(queue: .global(qos: .userInitiated)) { finished.resume() } }
+            await clearStep?(.waited)
         }
         let request = try await resolvingSkill(request)
         try request.validate()
@@ -406,14 +549,21 @@ final class AgentSessions: @unchecked Sendable {
         case .revert(let session, let checkpoint, let paths, let force):
             return .revert(try await revert(session: session, checkpoint: checkpoint, paths: paths, force: force))
         case .toolOutput(let session, let item):
-            let known = queue.sync { entries[session]?.snapshot.items.contains { $0.id == item && $0.tool?.fullOutputBytes != nil } }
-            guard let known else { throw ServiceError.unknownSession(session) }
-            guard known else { throw ServiceError(.badRequest, "This tool's whole output isn't kept.") }
-            let file = outputFile(session: session, item: item)
+            let lookup: (known: Bool, tool: AgentToolActivity?) = queue.sync {
+                guard let entry = entries[session] else { return (false, nil) }
+                return (true, entry.snapshot.items.first { $0.id == item }?.tool)
+            }
+            guard lookup.known else { throw ServiceError.unknownSession(session) }
+            guard let tool = lookup.tool, let total = tool.fullOutputBytes else {
+                throw ServiceError(.badRequest, "This tool's whole output isn't kept.")
+            }
+            let file = outputFile(session: session, item: item), command = tool.presentsCommand == true
             return .toolOutput(try await runBlocking {
                 let data = try Data(contentsOf: file)
-                return AgentToolOutput(item: item, text: String(decoding: data, as: UTF8.self),
-                                       truncated: data.count >= AgentToolOutput.maximumBytes)
+                // Bound it again: earlier versions kept outputs cut inside a character, and larger.
+                let kept = AgentReplyBounds.bounded(AgentReplyBounds.wholeCharacters(data), maximumBytes: AgentToolOutput.maximumBytes,
+                                                    maximumEncodedBytes: AgentToolOutput.maximumEncodedBytes, keepingEnd: command)
+                return AgentToolOutput(item: item, text: kept.text, truncated: kept.cut || data.count < total)
             })
         case .fork(let session, let from, let project, let at):
             return .forked(try queue.sync { try fork(session, from: from, into: project, at: at) })
@@ -428,41 +578,80 @@ final class AgentSessions: @unchecked Sendable {
         }
     }
 
-    /// Restores files a turn changed to their state before it, on a blocking worker so
-    /// the sessions queue keeps serving. Refuses, changing nothing, when a target file was
-    /// changed since the turn, unless `force`.
+    /// Restores files a turn changed to their state before it, on the conversation's
+    /// checkpoint queue so the sessions queue keeps serving: after checkpoints already
+    /// being taken, and before a turn sent later starts. Refuses, changing nothing, when
+    /// a target file was changed since the turn, unless `force`, and while the agent works.
     private func revert(session: SessionId, checkpoint: String, paths: [String]?, force: Bool) async throws -> AgentRevertReply {
-        let known = queue.sync { entries[session]?.snapshot.turns?.contains { $0.checkpoint?.id == checkpoint } ?? false }
-        guard known else { throw ServiceError(.badRequest, "Checkpoint not found in this conversation") }
         let file = root.appendingPathComponent("checkpoints", isDirectory: true)
             .appendingPathComponent(session.description, isDirectory: true)
             .appendingPathComponent(checkpoint + ".json")
-        let reply = try await runBlocking { () throws -> AgentRevertReply in
-            let record = try JSONDecoder().decode(AgentCheckpointRecord.self, from: Data(contentsOf: file))
-            let changed = Set(record.files.map(\.path))
-            let targets = paths ?? record.files.map(\.path)
-            guard !targets.isEmpty, targets.allSatisfy(changed.contains) else {
-                throw ServiceError(.badRequest, "Only files this turn changed can be reverted")
-            }
-            let store = AgentCheckpointStore()
-            if !force {
-                let conflicts = try store.changedSince(record.after, paths: targets)
-                if !conflicts.isEmpty { return AgentRevertReply(conflicts: conflicts) }
-            }
-            try store.restore(record.before, paths: targets)
-            return AgentRevertReply(reverted: targets)
-        }
-        if !reply.reverted.isEmpty {
+        let store = checkpointStore
+        // The folder, and where each provider that may still run works now, read off the
+        // sessions queue: either may be on a slow volume.
+        let (directory, runtimes) = queue.sync { (entries[session]?.directory, entries.values.compactMap(\.runtime)) }
+        let candidates = (runtimes + retiring.withLock { Array($0.values) }).flatMap { $0.providerProcesses() } + otherProviderProcesses()
+        let scope: AgentRevertScope? = try await runBlocking { directory.map { AgentRevertScope(directory: $0, candidates: candidates) } }
+        return try await withCheckedThrowingContinuation { continuation in
+            // Admitted and queued in one step, so a turn sent after it starts after it. Never
+            // while stopping, as shutdown then waits for it to be applied and recorded, nor
+            // during a clear, which waits for it instead.
             queue.async { [self] in
-                guard let entry = entries[session], entry.snapshot.status != .closed else { return }
-                let count = reply.reverted.count
-                entry.snapshot.items.append(observedItem(AgentChatItem(kind: .notice,
-                    text: "Reverted \(count == 1 ? "1 file" : "\(count) files") to before a turn."), entry: entry))
-                touch(entry)
-                persist(entry)
+                do {
+                    guard !stopping else { throw ServiceError(.badRequest, "The server is stopping") }
+                    guard let entry = entries[session], entry.snapshot.turns?.contains(where: { $0.checkpoint?.id == checkpoint }) == true else {
+                        throw ServiceError(.badRequest, "Checkpoint not found in this conversation")
+                    }
+                    guard !entry.resetting else { throw AgentRuntimeError("The conversation is being cleared. Try again shortly.") }
+                    // An agent at work, in the foreground or the background, may be changing the same files.
+                    guard !entry.submitting, entry.deliveryID == nil, entry.snapshot.status != .working, entry.snapshot.status != .waiting,
+                          entry.snapshot.subagents?.contains(where: { $0.status == .running }) != true else {
+                        throw ServiceError(.badRequest, "Stop active work before reverting.")
+                    }
+                    // A provider stopping in the same folder, or in one inside or around it,
+                    // whichever conversation's, may still change its files.
+                    if let scope {
+                        let stopping = retiring.withLock { $0.values.contains { $0.mayRun(in: scope) } }
+                            || entries.values.contains { $0.runtime?.isStopping(in: scope) == true }
+                            || otherProvidersMayRun(scope)
+                        guard !stopping else { throw AgentRuntimeError("The agent is still stopping. Try again shortly.") }
+                    }
+                    entry.reverts += 1
+                    storeWork.enter()
+                    revertAdmitted?()
+                    // Applied and recorded on Dispatch, so shutdown, which may block every
+                    // Swift task worker, never waits on one.
+                    entry.checkpoints.async { [self] in
+                        defer { storeWork.leave() }
+                        let result = Result { () throws -> AgentRevertReply in
+                            let record = try JSONDecoder().decode(AgentCheckpointRecord.self, from: Data(contentsOf: file))
+                            let changed = Set(record.files.map(\.path))
+                            let targets = paths ?? record.files.map(\.path)
+                            guard !targets.isEmpty, targets.allSatisfy(changed.contains) else {
+                                throw ServiceError(.badRequest, "Only files this turn changed can be reverted")
+                            }
+                            if !force {
+                                let conflicts = try store.changedSince(record.after, paths: targets)
+                                if !conflicts.isEmpty { return AgentRevertReply(conflicts: conflicts) }
+                            }
+                            try store.restore(record.before, paths: targets)
+                            return AgentRevertReply(reverted: targets)
+                        }
+                        queue.sync {
+                            entry.reverts -= 1
+                            guard case .success(let reply) = result, !reply.reverted.isEmpty,
+                                  entries[session] === entry, entry.snapshot.status != .closed else { return }
+                            let count = reply.reverted.count
+                            entry.snapshot.items.append(observedItem(AgentChatItem(kind: .notice,
+                                text: "Reverted \(count == 1 ? "1 file" : "\(count) files") to before a turn."), entry: entry))
+                            touch(entry)
+                            persist(entry)
+                        }
+                        continuation.resume(with: result)
+                    }
+                } catch { continuation.resume(throwing: error) }
             }
         }
-        return reply
     }
 
     func checkpoint(_ request: AgentCheckpointRequest) async throws -> AgentCheckpointReply {
@@ -474,6 +663,7 @@ final class AgentSessions: @unchecked Sendable {
         let file = root.appendingPathComponent("checkpoints", isDirectory: true)
             .appendingPathComponent(request.session.description, isDirectory: true)
             .appendingPathComponent(request.checkpoint + ".json")
+        let store = checkpointStore
         return try await runBlocking {
             let record = try JSONDecoder().decode(AgentCheckpointRecord.self, from: Data(contentsOf: file))
             guard request.offset <= record.files.count else { throw ServiceError(.badRequest, "Invalid checkpoint page") }
@@ -484,7 +674,7 @@ final class AgentSessions: @unchecked Sendable {
                 guard let file = record.files.first(where: { $0.path == path }) else {
                     throw ServiceError(.badRequest, "File is not part of this checkpoint")
                 }
-                var content = try AgentCheckpointStore().diff(from: record.before, to: record.after, path: path)
+                var content = try store.diff(from: record.before, to: record.after, path: path)
                 content.additions = file.additions ?? 0
                 content.deletions = file.deletions ?? 0
                 content.binary = file.additions == nil || file.deletions == nil
@@ -544,7 +734,8 @@ final class AgentSessions: @unchecked Sendable {
             return
         }
         if case .close = request {
-            close(entry)
+            // Shutdown already saves every conversation as it stands.
+            if !stopping { close(entry) }
             continuation.resume(returning: entry.snapshot)
             return
         }
@@ -583,6 +774,10 @@ final class AgentSessions: @unchecked Sendable {
         }
         if case .interrupt = request {
             entry.deliveryCancelled = true
+            if entry.steering, let pending = entry.pendingSubmission {
+                pending.stopped = true
+                pending.delivery?.cancel()
+            }
             try mutateInbox(entry) { $0.paused = true }
             if !entry.submitting, entry.snapshot.status != .working, entry.snapshot.status != .waiting {
                 // Nothing is running, as when Stop races a turn that just finished:
@@ -622,9 +817,10 @@ final class AgentSessions: @unchecked Sendable {
             continuation.resume(returning: entry.snapshot)
             return
         }
-        // Attachment bytes are checked here and written by the turn's task, so up to 8 MiB
-        // of disk writes never hold the sessions queue.
-        var turnAttachmentFiles: (attachments: [AgentChatAttachment], root: URL)?
+        // Attachment bytes are checked here and written on the writer, queued now so a clear
+        // or cleanup asked for later finds them whole; up to 8 MiB of disk writes never
+        // hold the sessions queue.
+        var turnAttachmentFiles: (attachments: [AgentChatAttachment], staging: AgentStaging?)?
         if case .send(_, let text, let model, let effort, let requestedProvider, let attachments) = request {
             guard entry.deliveryID == nil || entry.deliveryID == deliveryID else {
                 throw ServiceError(.badRequest, "A queued prompt is being delivered.")
@@ -640,12 +836,13 @@ final class AgentSessions: @unchecked Sendable {
                 let attachmentRoot = root.appendingPathComponent("attachments", isDirectory: true)
                     .appendingPathComponent(id.description).appendingPathComponent(userID)
                 try AgentAttachments.validateForStaging(attachments ?? [])
-                let followUpAttachments = attachments ?? []
+                let staging = stage(attachments ?? [], root: attachmentRoot)
                 let generation = entry.generation
                 entry.submitting = true
                 entry.steering = true
-                let pending = PendingReply(continuation)
+                let pending = PendingReply(continuation, delivery: AgentDelivery())
                 entry.pendingSubmission = pending
+                followUpAdmitted?()
                 queue.asyncAfter(deadline: .now() + submissionTimeout) { [self] in
                     guard !pending.finished else { return }
                     pending.task?.cancel()
@@ -654,8 +851,10 @@ final class AgentSessions: @unchecked Sendable {
                 }
                 pending.task = Task {
                     do {
-                        let staged = try await AgentAttachments.stageOffQueue(followUpAttachments, root: attachmentRoot)
-                        try await runtime.steer(text: text, attachments: staged)
+                        let staged = try await staging?.value() ?? []
+                        // Handed over only if Stop hasn't cancelled it, however late this runs.
+                        guard let delivery = pending.delivery else { throw AgentDeliveryNotStarted() }
+                        try await runtime.steer(text: text, attachments: staged, delivery: delivery)
                         self.queue.async {
                             guard !pending.finished else { return }
                             pending.finished = true
@@ -678,15 +877,17 @@ final class AgentSessions: @unchecked Sendable {
                             pending.finished = true
                             if entry.pendingSubmission === pending { entry.pendingSubmission = nil }
                             if entry.generation == generation { entry.submitting = false; entry.steering = false }
-                            try? FileManager.default.removeItem(at: attachmentRoot)
-                            if error is AgentTurnFinishedError, deliveryID != nil, entry.deliveryCancelled {
-                                // The user stopped the turn this follow-up was meant for.
+                            self.write { try? FileManager.default.removeItem(at: attachmentRoot) }
+                            // Never handed over: refused for the stop, or the stopped turn had ended.
+                            let stopped = pending.stopped || (deliveryID != nil && entry.deliveryCancelled)
+                            if error is AgentDeliveryNotStarted || error is AgentFollowUpRefused || (stopped && error is AgentTurnFinishedError) {
                                 continuation.resume(throwing: AgentDeliveryNotStarted())
                                 return
                             }
                             // The turn ended while the follow-up was on its way; its idle
-                            // status is already applied, so the message starts a new turn.
-                            guard error is AgentTurnFinishedError, entry.generation == generation,
+                            // status is already applied, so the message starts a new turn,
+                            // unless the user stopped it: then it may have reached the agent.
+                            guard !pending.stopped, error is AgentTurnFinishedError, entry.generation == generation,
                                   entry.snapshot.status != .working else {
                                 continuation.resume(throwing: error)
                                 return
@@ -729,7 +930,7 @@ final class AgentSessions: @unchecked Sendable {
                 .appendingPathComponent(userID, isDirectory: true)
             do {
                 try AgentAttachments.validateForStaging(attachments ?? [])
-                turnAttachmentFiles = (attachments ?? [], attachmentRoot)
+                turnAttachmentFiles = (attachments ?? [], stage(attachments ?? [], root: attachmentRoot))
             } catch {
                 throw ServiceError(.badRequest, error.localizedDescription)
             }
@@ -749,26 +950,34 @@ final class AgentSessions: @unchecked Sendable {
             if let session = entry.snapshot.providerSession, let message = entry.lastProviderMessage {
                 entry.turnForkPoints[user.id] = ForkPoint(session: session, message: message)
             }
-            let priorCheckpoint = entry.checkpointTask
             let captureDirectory = entry.directory
             let pendingDirectory = root.appendingPathComponent("checkpoints", isDirectory: true)
                 .appendingPathComponent(id.description, isDirectory: true)
-            entry.baselineTask = capturesCheckpoints ? Task {
-                await priorCheckpoint?.value
-                return try? await runBlocking {
-                    let store = AgentCheckpointStore()
-                    let before = try store.capture(directory: captureDirectory)
+            entry.baseline = nil
+            if capturesCheckpoints {
+                let baseline = CheckpointBaseline(), store = checkpointStore
+                let checkpointsRoot = root.appendingPathComponent("checkpoints", isDirectory: true)
+                entry.baseline = baseline
+                storeWork.enter()
+                // Queued after the last turn's checkpoint, so it starts where that one ended.
+                entry.checkpoints.async { [storeWork] in
+                    defer { storeWork.leave() }
+                    let before: AgentCheckpointStore.Snapshot
+                    do { before = try store.capture(directory: captureDirectory) } catch {
+                        Self.keepUnsettled(error, in: checkpointsRoot)
+                        return baseline.resolve(nil)
+                    }
                     do {
                         try FileManager.default.createDirectory(at: pendingDirectory, withIntermediateDirectories: true)
                         try JSONEncoder().encode(AgentCheckpointPending(turnID: user.id, before: before))
                             .write(to: pendingDirectory.appendingPathComponent("pending-" + user.id + ".json"), options: .atomic)
-                        return before
+                        baseline.resolve(before)
                     } catch {
-                        try? store.remove(before)
-                        throw error
+                        Self.discard(before, store: store, in: checkpointsRoot)
+                        baseline.resolve(nil)
                     }
                 }
-            } : nil
+            }
             entry.snapshot.model = model
             entry.snapshot.reasoningEffort = effort
             entry.snapshot.status = .working
@@ -839,7 +1048,7 @@ final class AgentSessions: @unchecked Sendable {
         let model = entry.snapshot.model
         let effort = entry.snapshot.reasoningEffort
         let accessTask = entry.accessTask
-        let baselineTask = entry.baselineTask
+        let baseline = entry.baseline
         if case .approve(_, let request, _, _, _) = request { entry.approving.insert(request) }
         if case .interrupt = request {
             guard entry.interrupting == nil else { throw ServiceError(.badRequest, "An interrupt is already pending") }
@@ -867,16 +1076,14 @@ final class AgentSessions: @unchecked Sendable {
                 switch request {
                 case .send(_, let text, _, _, _, _):
                     try await accessTask?.value
-                    _ = await baselineTask?.value
+                    _ = await baseline?.value()
                     try Task.checkCancellation()
                     try await runtime.setPlan(planMode)
                     var staged: [StagedAgentAttachment] = []
                     let invocation = AgentSlashCommand(text: text)
                     let skillRequest = invocation?.name.hasPrefix("skill:") == true
                     let nativeSkill = skillRequest ? turnAttachments?.attachments.first(where: { $0.id == "native-skill" }) : nil
-                    if let files = turnAttachments {
-                        staged = try await AgentAttachments.stageOffQueue(files.attachments, root: files.root)
-                    }
+                    if let staging = turnAttachments?.staging { staged = try await staging.value() }
                     let delivered: String
                     if let nativeSkill {
                         delivered = "/" + String(decoding: nativeSkill.data, as: UTF8.self) + " " + (invocation?.arguments ?? "")
@@ -946,8 +1153,8 @@ final class AgentSessions: @unchecked Sendable {
                         }
                         touch(entry)
                     }
+                    persist(entry)
                 }
-                persist(entry)
                 continuation.resume(returning: entry.snapshot)
                 self.drainInbox(entry)
             }
@@ -967,8 +1174,7 @@ final class AgentSessions: @unchecked Sendable {
                 entry.deferredEventOverflow = true
                 entry.deferredEvents = [.failure("Agent output exceeded the pending media limit. Send a message to resume.")]
                 entry.deferredEventBytes = 0
-                let runtime = entry.runtime
-                Task { runtime?.stop() }
+                retire(entry.runtime, of: entry)
                 return
             }
             entry.deferredEvents.append(event)
@@ -983,10 +1189,11 @@ final class AgentSessions: @unchecked Sendable {
                 .appendingPathComponent(session.description, isDirectory: true)
                 .appendingPathComponent(AgentToolImages.directoryName(item: item.id), isDirectory: true)
             entry.stagingToolImages = true
-            let stage = stageToolImages
-            Task { [weak self] in
+            let stage = stageToolImages, fence = fence
+            // On the writer, in order with clears and cleanups of the conversation's files.
+            writer.async { [weak self] in
                 var stored = item
-                do { try await runBlocking { try stage(images, directory) } }
+                do { guard try fence.write({ try stage(images, directory) }) else { return } }
                 catch { stored.detail = (stored.detail ?? "") + "\nImage storage failed: " + error.localizedDescription }
                 let completed = stored
                 self?.queue.async { [weak self] in
@@ -1253,7 +1460,15 @@ final class AgentSessions: @unchecked Sendable {
     func importHistory(_ request: AgentHistoryImport,
                        transcript: @escaping @Sendable (String) throws -> AgentHistoryTranscript) async throws -> AgentChatSnapshot {
         try request.validate()
-        if let existing = try queue.sync(execute: { try importTarget(request) }) { return existing }
+        // One import into a conversation at a time: each stages its images in the same folders.
+        if let existing = try queue.sync(execute: { () throws -> AgentChatSnapshot? in
+            if let existing = try importTarget(request) { return existing }
+            guard importing.insert(request.session).inserted else {
+                throw ServiceError(.badRequest, "This conversation is already being continued")
+            }
+            return nil
+        }) { return existing }
+        defer { queue.sync { _ = importing.remove(request.session) } }
         let directory = try queue.sync { () throws -> String in
             let directory = try projectDirectory(request.project)
             try checkDirectory(directory)
@@ -1261,42 +1476,63 @@ final class AgentSessions: @unchecked Sendable {
         }
         let attachments = root.appendingPathComponent("attachments", isDirectory: true)
             .appendingPathComponent(request.session.description, isDirectory: true)
-        let saved = try await runBlocking { () throws -> AgentHistoryTranscript in
-            var saved = try transcript(directory)
-            // The person's images are stored as their messages' attachments, as if sent here.
-            for (index, item) in saved.items.enumerated() {
-                guard let images = saved.images[item.id], item.id.utf8.count <= 1024,
-                      let staged = try? AgentAttachments.stageToolImages(images,
-                          root: attachments.appendingPathComponent(AgentToolImages.directoryName(item: item.id), isDirectory: true)) else { continue }
-                try? AgentAttachments.record(staged, root: attachments.appendingPathComponent(AgentToolImages.directoryName(item: item.id), isDirectory: true))
-                saved.items[index].attachments = staged.map(\.attachment.descriptor)
+        var saved = try await runBlocking { try transcript(directory) }
+        let items = Set(saved.items.map(\.id))
+        let images = saved.images.filter { items.contains($0.key) }
+        saved.images = [:]
+        // The person's images are stored as their messages' attachments, as if sent here.
+        let descriptors = try await written { () -> [String: [AgentChatAttachmentDescriptor]] in
+            var descriptors: [String: [AgentChatAttachmentDescriptor]] = [:]
+            for (item, images) in images where item.utf8.count <= 1024 {
+                let folder = attachments.appendingPathComponent(AgentToolImages.directoryName(item: item), isDirectory: true)
+                guard let staged = try? AgentAttachments.stageToolImages(images, root: folder) else { continue }
+                try? AgentAttachments.record(staged, root: folder)
+                descriptors[item] = staged.map(\.attachment.descriptor)
             }
-            saved.images = [:]
-            return saved
+            return descriptors
         }
-        return try queue.sync {
-            if let existing = try importTarget(request) { return existing }
-            var snapshot = entries[request.session]?.snapshot
-                ?? AgentChatSnapshot(session: request.session, project: request.project, provider: request.provider)
-            snapshot.provider = request.provider
-            snapshot.providerSession = request.providerSession
-            snapshot.model = nil
-            snapshot.reasoningEffort = nil
-            snapshot.resolvedModel = saved.resolvedModel
-            snapshot.contextUsage = nil
-            snapshot.turns = AgentHistoryTranscript.turns(saved.items)
-            snapshot.status = .idle
-            snapshot.items = saved.items
-            Self.finishItems(&snapshot.items)
-            snapshot.items.append(AgentChatItem(kind: .notice,
-                text: "Continued from \(request.provider.name). New messages carry on this conversation."))
-            let entry = Entry(snapshot, directory: directory)
-            entry.hasSuccessfulTurn = true
-            entries[request.session] = entry
-            touch(entry)
-            persist(entry)
-            return entry.snapshot
+        for index in saved.items.indices {
+            if let attached = descriptors[saved.items[index].id] { saved.items[index].attachments = attached }
         }
+        // Images staged for a conversation that isn't made go with it.
+        let staged = descriptors.keys.map { attachments.appendingPathComponent(AgentToolImages.directoryName(item: $0), isDirectory: true) }
+        let discardStaged = { [self] in write { for folder in staged { _ = Self.removeIfPresent(folder) } } }
+        do {
+            return try queue.sync { () throws -> AgentChatSnapshot in
+                if let existing = try importTarget(request) {
+                    discardStaged()
+                    return existing
+                }
+                return commitImport(request, saved: saved, directory: directory)
+            }
+        } catch {
+            discardStaged()
+            throw error
+        }
+    }
+
+    /// Makes the conversation an import continues, from what it read and staged.
+    private func commitImport(_ request: AgentHistoryImport, saved: AgentHistoryTranscript, directory: String) -> AgentChatSnapshot {
+        var snapshot = entries[request.session]?.snapshot
+            ?? AgentChatSnapshot(session: request.session, project: request.project, provider: request.provider)
+        snapshot.provider = request.provider
+        snapshot.providerSession = request.providerSession
+        snapshot.model = nil
+        snapshot.reasoningEffort = nil
+        snapshot.resolvedModel = saved.resolvedModel
+        snapshot.contextUsage = nil
+        snapshot.turns = AgentHistoryTranscript.turns(saved.items)
+        snapshot.status = .idle
+        snapshot.items = saved.items
+        Self.finishItems(&snapshot.items)
+        snapshot.items.append(AgentChatItem(kind: .notice,
+            text: "Continued from \(request.provider.name). New messages carry on this conversation."))
+        let entry = Entry(snapshot, directory: directory)
+        entry.hasSuccessfulTurn = true
+        entries[request.session] = entry
+        touch(entry)
+        persist(entry)
+        return entry.snapshot
     }
 
     /// The conversation that already continues `request`'s, or `nil` when
@@ -1307,9 +1543,11 @@ final class AgentSessions: @unchecked Sendable {
             $0.snapshot.status != .closed && $0.snapshot.provider == request.provider
                 && $0.snapshot.providerSession == request.providerSession
         }) {
+            guard !existing.resetting else { throw AgentRuntimeError("The conversation is being cleared. Try again shortly.") }
             return existing.snapshot
         }
         guard let entry = entries[request.session] else { return nil }
+        guard !entry.resetting else { throw AgentRuntimeError("The conversation is being cleared. Try again shortly.") }
         guard entry.snapshot.project == request.project, entry.snapshot.items.isEmpty, entry.snapshot.providerSession == nil,
               entry.snapshot.status == .idle, entry.runtime == nil, !entry.submitting, !entry.hasSuccessfulTurn else {
             throw ServiceError(.badRequest, "This agent session ID is already in use")
@@ -1362,6 +1600,14 @@ final class AgentSessions: @unchecked Sendable {
     /// Save the archive and reset atomically before publishing the new context.
     private func clear(_ entry: Entry, archive id: SessionId, revision: UInt64, reply: Reply) throws {
         if entry.snapshot.resetID == id { reply.resume(returning: entry.snapshot); return }
+        // Its copies of another conversation's checkpoints are known by its own name only.
+        guard !entry.archived else { throw AgentRuntimeError("An archived conversation can't be cleared.") }
+        // Whatever else changed, a revert admitted behind the clear's wait must finish first,
+        // and an import into the conversation must be made or given up.
+        guard entry.reverts == 0 else { throw AgentRuntimeError("A revert is being applied. Try again shortly.") }
+        guard !importing.contains(entry.snapshot.session) else {
+            throw AgentRuntimeError("A past conversation is being continued here. Try again shortly.")
+        }
         guard !stopping, entry.snapshot.revision == revision, entries[id] == nil else {
             throw AgentRuntimeError("The conversation changed. Review it before clearing.")
         }
@@ -1388,20 +1634,21 @@ final class AgentSessions: @unchecked Sendable {
         retireRuntime(entry)
         let next = fresh
         let previous = archived
+        let current = entry.snapshot
         writer.async { [self] in
             do {
+                // An earlier clear's leftover copies are its archive's: they must go before this
+                // archive copies the folder and the conversation forgets the earlier one.
+                guard recoverClearedCheckpoints(current).settled else {
+                    throw AgentRuntimeError("This conversation's earlier archive can't be read yet, so it wasn't cleared. Try again later.")
+                }
                 // Copy before committing: a failed archive leaves the original readable.
                 for folder in ["attachments", "outputs", "checkpoints"] {
                     let source = root.appendingPathComponent(folder + "/" + session.description)
                     let target = root.appendingPathComponent(folder + "/" + id.description)
-                    if FileManager.default.fileExists(atPath: source.path), !FileManager.default.fileExists(atPath: target.path) {
-                        try FileManager.default.copyItem(at: source, to: target)
-                    }
+                    try Self.copyAnew(source, to: target)
                 }
-                let archivedEarlier = root.appendingPathComponent("earlier/" + id.description + ".jsonl")
-                if FileManager.default.fileExists(atPath: oldEarlier.path), !FileManager.default.fileExists(atPath: archivedEarlier.path) {
-                    try FileManager.default.copyItem(at: oldEarlier, to: archivedEarlier)
-                }
+                try Self.copyAnew(oldEarlier, to: root.appendingPathComponent("earlier/" + id.description + ".jsonl"))
                 try JSONEncoder().encode(saved).write(to: root.appendingPathComponent(id.description + ".json"), options: .atomic)
                 try JSONEncoder().encode(replacement).write(to: root.appendingPathComponent(session.description + ".json"), options: .atomic)
                 retainedCheckpointIDs[id] = retainedCheckpointIDs[session]
@@ -1424,8 +1671,8 @@ final class AgentSessions: @unchecked Sendable {
                     archive.lastProviderMessage = entry.lastProviderMessage
                     entries[id] = archive
                     entries[session] = replacement
-                    changed(session, next.revision)
-                    activityChanged(next, entry.directory)
+                    notifyChanged(session, next.revision)
+                    notifyActivity(next, entry.directory)
                     reply.resume(returning: next)
                 }
             } catch {
@@ -1449,9 +1696,10 @@ final class AgentSessions: @unchecked Sendable {
         let command = item.tool?.presentsCommand == true
         item.tool?.fullOutputBytes = output.utf8.count
         let file = outputFile(session: entry.snapshot.session, item: item.id)
-        writer.async {
+        write {
             // A command's end matters most; any other tool's start.
-            let bytes = command ? Data(output.utf8.suffix(AgentToolOutput.maximumBytes)) : Data(output.utf8.prefix(AgentToolOutput.maximumBytes))
+            let bytes = Data(AgentReplyBounds.bounded(output, maximumBytes: AgentToolOutput.maximumBytes,
+                maximumEncodedBytes: AgentToolOutput.maximumEncodedBytes, keepingEnd: command).text.utf8)
             do {
                 try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try bytes.write(to: file, options: .atomic)
@@ -1477,7 +1725,7 @@ final class AgentSessions: @unchecked Sendable {
         }
         guard !lines.isEmpty else { return }
         let file = earlierFile(session: session)
-        writer.async {
+        write {
             do {
                 try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
                 if !FileManager.default.fileExists(atPath: file.path) { FileManager.default.createFile(atPath: file.path, contents: nil) }
@@ -1500,12 +1748,16 @@ final class AgentSessions: @unchecked Sendable {
             let lines = data.split(separator: 0x0A, omittingEmptySubsequences: true)
             let end = min(before ?? lines.count, lines.count)
             var items: [AgentChatItem] = []
-            var bytes = 0
+            var bytes = 0, encoded = 0
             var start = end
             while start > 0, items.count < limit {
-                guard let item = try? JSONDecoder().decode(AgentChatItem.self, from: Data(lines[start - 1])) else { start -= 1; continue }
-                guard bytes + item.transcriptByteCount <= AgentEarlierItems.maxBytes else { break }
+                let line = lines[start - 1]
+                guard let item = try? JSONDecoder().decode(AgentChatItem.self, from: Data(line)) else { start -= 1; continue }
+                // Each line is its item as JSON, so it measures the reply's size too.
+                guard bytes + item.transcriptByteCount <= AgentEarlierItems.maxBytes,
+                      encoded + line.count <= AgentEarlierItems.maxEncodedBytes else { break }
                 bytes += item.transcriptByteCount
+                encoded += line.count
                 items.insert(item, at: 0)
                 start -= 1
             }
@@ -1539,8 +1791,27 @@ final class AgentSessions: @unchecked Sendable {
         // Its agents stop with its provider process.
         entry.snapshot.subagents = nil
         clearDeferredEvents(entry)
-        Task { runtime?.stop() }
+        retire(runtime, of: entry)
     }
+
+    /// Stops a provider on a dispatch worker: stopping waits for the runtime's queue,
+    /// which may be finishing a write to a provider that stopped reading, and must
+    /// not hold one of Swift's cooperative threads meanwhile. It stays tracked until
+    /// the provider has exited, so shutdown waits for it.
+    private func retire(_ runtime: (any AgentSessionRuntime)?, of entry: Entry) {
+        guard let runtime else { return }
+        // Before a revert can look: from here it may finish a launch begun, but begins none.
+        runtime.refuseLaunches()
+        let token = UUID()
+        retiring.withLock { $0[token] = runtime }
+        DispatchQueue.global(qos: .utility).async { [retiring] in
+            runtime.terminate()
+            retiring.withLock { _ = $0.removeValue(forKey: token) }
+        }
+    }
+
+    /// Runtimes stopping on a dispatch worker, until they have.
+    private let retiring = OSAllocatedUnfairLock<[UUID: any AgentSessionRuntime]>(initialState: [:])
 
     private static let maximumDeferredEventBytes = 8 * AgentChatAttachment.maxPayloadBytes + 512 * 1024
 
@@ -1591,7 +1862,10 @@ final class AgentSessions: @unchecked Sendable {
         entry.pendingSubmission = nil
         guard !pending.finished else { return }
         pending.finished = true
-        pending.continuation.resume(returning: entry.snapshot)
+        guard let delivery = pending.delivery else { return pending.continuation.resume(returning: entry.snapshot) }
+        // A follow-up whose turn ended: never sent, or sent with no word back.
+        if delivery.cancel() { return pending.continuation.resume(throwing: AgentDeliveryNotStarted()) }
+        pending.continuation.resume(throwing: AgentRuntimeError("The response ended while this message was being handed over. Review the conversation before sending it again."))
     }
 
     /// Ends every item with its turn. A tool still running then never reported a
@@ -1683,35 +1957,44 @@ final class AgentSessions: @unchecked Sendable {
         }
         entry.snapshot.turns = turns
         if let pending {
-            entry.baselineTask = Task { pending.before }
+            entry.baseline = CheckpointBaseline(pending.before)
             // Already-terminal turns do not pass through updateTurn on startup.
             if turns.last?.completedAt != nil { captureCompletedTurn(entry, turnID: pending.turnID) }
         }
     }
 
     private func captureCompletedTurn(_ entry: Entry, turnID: String) {
-        guard let baseline = entry.baselineTask else { return }
-        entry.baselineTask = nil
+        guard let baseline = entry.baseline else { return }
+        entry.baseline = nil
         let directory = entry.directory
         let destination = root.appendingPathComponent("checkpoints", isDirectory: true)
             .appendingPathComponent(entry.snapshot.session.description, isDirectory: true)
-        entry.checkpointTask = Task { [weak self] in
-            guard let before = await baseline.value else { return }
+        storeWork.enter()
+        let store = checkpointStore
+        let checkpointsRoot = root.appendingPathComponent("checkpoints", isDirectory: true)
+        // After this turn's baseline on the same queue, which has taken it by then.
+        entry.checkpoints.async { [weak self, storeWork] in
+            defer { storeWork.leave() }
+            guard let before = baseline.taken else { return }
             do {
-                let summary = try await runBlocking {
-                    let store = AgentCheckpointStore()
-                    let after = try store.capture(directory: directory)
-                    do {
-                        let files = try store.files(from: before, to: after)
-                        let id = turnID
-                        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
-                        let record = AgentCheckpointRecord(before: before, after: after, files: files)
-                        try JSONEncoder().encode(record).write(to: destination.appendingPathComponent(id + ".json"), options: .atomic)
-                        return record.summary(id: id)
-                    } catch {
-                        try? store.remove(after)
-                        throw error
-                    }
+                let after: AgentCheckpointStore.Snapshot
+                do { after = try store.capture(directory: directory) } catch {
+                    Self.keepUnsettled(error, in: checkpointsRoot)
+                    throw error
+                }
+                let summary: AgentTurnCheckpoint
+                do {
+                    let files = try store.files(from: before, to: after)
+                    try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+                    // A baseline recovered from an older record finds its repository through this one.
+                    var before = before
+                    if before.repository == nil, before.directory == after.directory { before.repository = after.repository }
+                    let record = AgentCheckpointRecord(before: before, after: after, files: files)
+                    try JSONEncoder().encode(record).write(to: destination.appendingPathComponent(turnID + ".json"), options: .atomic)
+                    summary = record.summary(id: turnID)
+                } catch {
+                    Self.discard(after, store: store, in: checkpointsRoot)
+                    throw error
                 }
                 self?.queue.async { [weak self] in
                     guard let self, !self.stopping, !entry.resetting, self.entries[entry.snapshot.session] === entry,
@@ -1730,6 +2013,7 @@ final class AgentSessions: @unchecked Sendable {
     /// Called before removing a project/worktree, including conversations never attached to a client.
     func close(project: ProjectId, directory: String? = nil) {
         queue.sync {
+            guard !stopping else { return }
             for entry in entries.values {
                 let inside = directory.map { AgentPaths.isInside(entry.directory, $0) } ?? false
                 if entry.snapshot.project == project || inside { close(entry) }
@@ -1759,11 +2043,39 @@ final class AgentSessions: @unchecked Sendable {
             }
             return runtimes
         }
-        for runtime in runtimes { runtime.stop() }
+        // Each waits for its own provider to exit, so stop them together, with the
+        // ones still retiring: the host may exit as soon as this returns.
+        let stopping = runtimes + retiring.withLock { Array($0.values) }
+        DispatchQueue.concurrentPerform(iterations: stopping.count) { stopping[$0].terminate() }
+        if let checkpointDrain, storeWork.wait(timeout: .now() + checkpointDrain) == .timedOut {
+            AgentLog.error("checkpoints were still being taken when shutdown returned")
+            writer.sync {}
+            drainCallbacks()
+            return
+        }
+        storeWork.wait()
         writer.sync {}
+        fence.close()
+        drainCallbacks()
     }
 
     func refuseNewRequests() { queue.sync { stopping = true } }
+
+    /// Once no checkpoint is being taken or revert applied, and what they saved is written,
+    /// writes nothing more and runs `body`, which hands the store to its next owner: at
+    /// once if none is.
+    func releaseStore(then body: @escaping @Sendable () -> Void) {
+        if storeWork.wait(timeout: .now()) == .success {
+            writer.sync {}
+            fence.close()
+            return body()
+        }
+        storeWork.notify(queue: .global(qos: .utility)) { [self] in
+            writer.sync {}
+            fence.close()
+            body()
+        }
+    }
 
     /// Atomically checks ownership and reserves the store for an idle shutdown.
     /// A create either wins first and makes this fail, or observes the refusal.
@@ -1780,7 +2092,7 @@ final class AgentSessions: @unchecked Sendable {
 
     private func touch(_ entry: Entry) {
         guard !entry.resetting, entries[entry.snapshot.session] === entry else { return }
-        activityChanged(entry.snapshot, entry.directory)
+        notifyActivity(entry.snapshot, entry.directory)
         bound(entry)
         entry.snapshot.revision &+= 1
         recordItemRevisions(entry)
@@ -1789,7 +2101,7 @@ final class AgentSessions: @unchecked Sendable {
             queue.asyncAfter(deadline: .now() + 0.05) { [self] in
                 entry.notifying = false
                 guard !stopping, !entry.resetting, entries[entry.snapshot.session] === entry else { return }
-                changed(entry.snapshot.session, entry.snapshot.revision)
+                notifyChanged(entry.snapshot.session, entry.snapshot.revision)
             }
         }
         if !entry.checkpointing {
@@ -2097,60 +2409,287 @@ final class AgentSessions: @unchecked Sendable {
     /// How long a closed conversation is kept after it last changed.
     static let closedRetention: TimeInterval = 30 * 24 * 60 * 60
 
+    /// Records of conversations being deleted. A record moves here before anything kept
+    /// for it goes, so it never loads beside missing files, and stays until all of it is
+    /// gone, so a deletion cut short finishes at the next start.
+    private var removing: URL { root.appendingPathComponent("removing", isDirectory: true) }
+
     /// Deletes a conversation's file and everything kept beside it: checkpoints and their
     /// refs, tool outputs, attachments, archived items and its prompt inbox.
     private func removeConversation(_ saved: Saved, file: URL) {
-        let session = saved.snapshot.session.description
+        let record = removing.appendingPathComponent(file.lastPathComponent)
+        do {
+            try FileManager.default.createDirectory(at: removing, withIntermediateDirectories: true)
+            guard rename(file.path, record.path) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        } catch {
+            AgentLog.error("expired conversation kept: \(file.lastPathComponent): \(error)")
+            return
+        }
+        finishRemoving(saved.snapshot, record: record)
+    }
+
+    /// Removes what was kept for a conversation whose record is in `removing`, then the
+    /// record, which stays while anything remains so the next start tries again. Records
+    /// an interrupted clear left beside the archive's copies are the archive's, refs too.
+    private func finishRemoving(_ snapshot: AgentChatSnapshot, record: URL) {
+        let session = snapshot.session.description
+        let cleared = recoverClearedCheckpoints(snapshot)
         let checkpoints = root.appendingPathComponent("checkpoints", isDirectory: true).appendingPathComponent(session, isDirectory: true)
-        let store = AgentCheckpointStore()
-        for record in (try? FileManager.default.contentsOfDirectory(at: checkpoints, includingPropertiesForKeys: nil)) ?? []
-            where record.pathExtension == "json" {
-            guard let data = try? Data(contentsOf: record) else { continue }
-            if let pending = try? JSONDecoder().decode(AgentCheckpointPending.self, from: data) {
-                try? store.remove(pending.before)
-            } else if let finished = try? JSONDecoder().decode(AgentCheckpointRecord.self, from: data) {
-                try? store.remove(finished.before)
-                try? store.remove(finished.after)
+        let store = checkpointStore
+        // Records whose owner can't be told yet keep their refs, and the deletion waits.
+        var pinned = cleared.unknown.count + (cleared.unreadable ? 1 : 0)
+        for checkpoint in (try? FileManager.default.contentsOfDirectory(at: checkpoints, includingPropertiesForKeys: nil)) ?? []
+            where checkpoint.pathExtension == "json" {
+            let name = checkpoint.deletingPathExtension().lastPathComponent
+            guard !cleared.claims(name) else { continue }
+            guard let data = try? Data(contentsOf: checkpoint),
+                  let refs = try? JSONDecoder().decode(CheckpointPins.self, from: data).refs else {
+                pinned += 1
+                AgentLog.error("checkpoint of a deleted conversation kept: \(checkpoint.lastPathComponent) can't be read")
+                continue
+            }
+            // Each ref on its own, so one Git can't remove yet doesn't keep the other.
+            let failures = refs.compactMap { ref -> Error? in
+                do { try store.remove(ref); return nil } catch { return error }
+            }
+            if let failure = failures.first {
+                pinned += 1
+                AgentLog.error("checkpoint of a deleted conversation kept for later: \(checkpoint.lastPathComponent): \(failure)")
+            } else {
+                _ = Self.removeIfPresent(checkpoint)
             }
         }
-        for path in [checkpoints,
-                     root.appendingPathComponent("outputs", isDirectory: true).appendingPathComponent(session, isDirectory: true),
-                     root.appendingPathComponent("attachments", isDirectory: true).appendingPathComponent(session, isDirectory: true),
-                     root.appendingPathComponent("earlier/" + saved.snapshot.session.description + (saved.snapshot.resetID.map { "-" + $0.description } ?? "") + ".jsonl"),
-                     root.appendingPathComponent("inbox/" + session + ".json"),
-                     file] {
-            try? FileManager.default.removeItem(at: path)
+        let others = [root.appendingPathComponent("outputs", isDirectory: true).appendingPathComponent(session, isDirectory: true),
+                      root.appendingPathComponent("attachments", isDirectory: true).appendingPathComponent(session, isDirectory: true),
+                      root.appendingPathComponent("earlier/" + session + (snapshot.resetID.map { "-" + $0.description } ?? "") + ".jsonl"),
+                      root.appendingPathComponent("inbox/" + session + ".json")]
+        // A checkpoint whose ref remains keeps its record, and so its folder.
+        let remaining = (pinned > 0 ? others : [checkpoints] + others).filter { !Self.removeIfPresent($0) }.count + (pinned > 0 ? 1 : 0)
+        guard remaining == 0 else {
+            AgentLog.error("deleting conversation \(session) continues at the next start: \(remaining) of its files remain")
+            return
+        }
+        _ = Self.removeIfPresent(record)
+    }
+
+    /// Removes `url`; true once it is gone for certain, not merely out of sight, as behind
+    /// a folder this process can't search.
+    private static func removeIfPresent(_ url: URL) -> Bool {
+        do {
+            try FileManager.default.removeItem(at: url)
+            return true
+        } catch {
+            var status = stat()
+            return lstat(url.path, &status) != 0 && (errno == ENOENT || errno == ENOTDIR)
         }
     }
 
-    /// Recover ownership if clear committed before removing duplicate checkpoint files.
-    private func recoverClearedCheckpoints(_ snapshot: AgentChatSnapshot) -> Set<String> {
-        guard let archive = snapshot.resetID else { return [] }
+    /// Finishes deletions a previous run started. Called before this run expires anything,
+    /// so the writer settles each of them before it deletes again; whether its conversation
+    /// came back is decided there too, as the store is then.
+    private func resumeRemovals() {
+        for record in (try? FileManager.default.contentsOfDirectory(at: removing, includingPropertiesForKeys: [.fileSizeKey])) ?? []
+            where record.pathExtension == "json" {
+            let size = (try? record.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            guard size <= AgentLimits.maxFrame,
+                  let data = try? Data(contentsOf: record), let saved = try? JSONDecoder().decode(Saved.self, from: data),
+                  record.deletingPathExtension().lastPathComponent == saved.snapshot.session.description else {
+                AgentLog.error("unreadable record of a deleted conversation kept: \(record.lastPathComponent)")
+                continue
+            }
+            let restored = root.appendingPathComponent(record.lastPathComponent)
+            writer.async {
+                // A conversation whose record came back keeps its files; deleting it again
+                // starts over from that record.
+                if FileManager.default.fileExists(atPath: restored.path) { _ = Self.removeIfPresent(record) }
+                else { self.finishRemoving(saved.snapshot, record: record) }
+            }
+        }
+    }
+
+    /// The refs a checkpoint record or pending baseline pins, read apart from the rest of it.
+    private struct CheckpointPins: Decodable {
+        var before: AgentCheckpointStore.Snapshot
+        var after: AgentCheckpointStore.Snapshot?
+        var refs: [AgentCheckpointStore.Snapshot] { [before] + (after.map { [$0] } ?? []) }
+        func same(as other: CheckpointPins) -> Bool { refs.map(\.reference) == other.refs.map(\.reference) }
+    }
+
+    /// Whose the records in a cleared conversation's checkpoints folder are, after a clear
+    /// that stopped before it retired the copies its archive took.
+    private struct ClearedCheckpoints {
+        /// Checkpoints whose records pin a ref the archive's records pin: theirs.
+        var archived: Set<String> = []
+        /// Checkpoints whose owner can't be told yet, as while the archive can't be read:
+        /// nothing may unpin their refs.
+        var unknown: Set<String> = []
+        /// Archived checkpoints whose copies couldn't be taken out of the folder.
+        var leftover: Set<String> = []
+        /// The folder couldn't be listed, so nothing in it can be told apart.
+        var unreadable = false
+        var settled: Bool { unknown.isEmpty && leftover.isEmpty && !unreadable }
+
+        /// Whether the record named `name` isn't the conversation's own to unpin.
+        func claims(_ name: String) -> Bool {
+            let id = AgentSessions.checkpointID(name)
+            return archived.contains(id) || unknown.contains(id)
+        }
+    }
+
+    /// The turn a checkpoint record or pending baseline file belongs to.
+    static func checkpointID(_ name: String) -> String { name.hasPrefix("pending-") ? String(name.dropFirst(8)) : name }
+
+    /// Recover ownership if clear committed before removing duplicate checkpoint files: a
+    /// record pinning any ref the archive's records pin is the archive's copy, in whatever
+    /// form the archive has kept it since, and is taken out.
+    private func recoverClearedCheckpoints(_ snapshot: AgentChatSnapshot) -> ClearedCheckpoints {
+        var result = ClearedCheckpoints()
+        guard let archive = snapshot.resetID else { return result }
         let archived = root.appendingPathComponent("checkpoints/" + archive.description)
         let current = root.appendingPathComponent("checkpoints/" + snapshot.session.description)
-        var transferred = Set<String>()
-        // A crash can land after the new snapshot commits but before old files
-        // are retired. Those duplicate records belong to the archive, including
-        // when removing a duplicate fails; their Git refs must remain pinned.
-        for file in (try? FileManager.default.contentsOfDirectory(at: archived, includingPropertiesForKeys: nil)) ?? []
-            where file.pathExtension == "json" {
-            let duplicate = current.appendingPathComponent(file.lastPathComponent)
-            guard let archivedData = try? Data(contentsOf: file), let duplicateData = try? Data(contentsOf: duplicate) else { continue }
-            let decoder = JSONDecoder()
-            let matches: Bool
-            if let archived = try? decoder.decode(AgentCheckpointRecord.self, from: archivedData),
-               let original = try? decoder.decode(AgentCheckpointRecord.self, from: duplicateData) {
-                matches = archived.before == original.before && archived.after == original.after && archived.files == original.files
-            } else if let archived = try? decoder.decode(AgentCheckpointPending.self, from: archivedData),
-                      let original = try? decoder.decode(AgentCheckpointPending.self, from: duplicateData) {
-                matches = archived.turnID == original.turnID && archived.before == original.before
-            } else { matches = false }
-            guard matches else { continue }
-            let name = file.deletingPathExtension().lastPathComponent
-            transferred.insert(name.hasPrefix("pending-") ? String(name.dropFirst(8)) : name)
-            try? FileManager.default.removeItem(at: duplicate)
+        let decoder = JSONDecoder()
+        let records: [URL]
+        do { records = try FileManager.default.contentsOfDirectory(at: current, includingPropertiesForKeys: nil).filter { $0.pathExtension == "json" } }
+        catch { result.unreadable = (try? Self.isPresent(current)) != false; return result }
+        var pinned = Set<String>(), complete = true
+        do {
+            for file in try FileManager.default.contentsOfDirectory(at: archived, includingPropertiesForKeys: nil) where file.pathExtension == "json" {
+                guard let data = try? Data(contentsOf: file), let pins = try? decoder.decode(CheckpointPins.self, from: data) else {
+                    complete = false
+                    continue
+                }
+                pinned.formUnion(pins.refs.map(\.reference))
+            }
+        } catch {
+            complete = (try? Self.isPresent(archived)) == false
         }
-        return transferred
+        for file in records {
+            let id = Self.checkpointID(file.deletingPathExtension().lastPathComponent)
+            guard let data = try? Data(contentsOf: file), let pins = try? decoder.decode(CheckpointPins.self, from: data) else {
+                result.unknown.insert(id)
+                continue
+            }
+            if pins.refs.contains(where: { pinned.contains($0.reference) }) {
+                result.archived.insert(id)
+                if !Self.removeIfPresent(file) { result.leftover.insert(id) }
+            } else if !complete {
+                result.unknown.insert(id)
+            }
+        }
+        return result
+    }
+
+    /// Refs a capture made, or may have, that no checkpoint uses: kept here until they are
+    /// known to be gone.
+    private static func unsettledFolder(_ checkpoints: URL) -> URL { checkpoints.appendingPathComponent(".unsettled", isDirectory: true) }
+
+    /// Keeps `snapshot`'s ref, which no checkpoint uses, for removal when the store next opens.
+    private static func removeLater(_ snapshot: AgentCheckpointStore.Snapshot, in checkpoints: URL) {
+        let folder = unsettledFolder(checkpoints)
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try JSONEncoder().encode(snapshot).write(to: folder.appendingPathComponent(UUID().uuidString + ".json"), options: .atomic)
+        } catch { AgentLog.error("checkpoint ref \(snapshot.reference) may stay pinned: \(error)") }
+    }
+
+    /// Keeps the ref a failed capture may have made, for removal when the store next opens.
+    static func keepUnsettled(_ error: Error, in checkpoints: URL) {
+        guard let unsettled = error as? AgentCheckpointStore.UnsettledPin else { return }
+        removeLater(unsettled.snapshot, in: checkpoints)
+    }
+
+    /// Removes the ref of a snapshot no checkpoint uses, or keeps it for the next start.
+    static func discard(_ snapshot: AgentCheckpointStore.Snapshot, store: AgentCheckpointStore, in checkpoints: URL) {
+        do { try store.remove(snapshot) } catch { removeLater(snapshot, in: checkpoints) }
+    }
+
+    /// Removes the refs captures left unsettled, keeping any Git still can't account for.
+    private func settleUnsettledPins() {
+        let folder = Self.unsettledFolder(root.appendingPathComponent("checkpoints", isDirectory: true))
+        for file in (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+            where file.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: file),
+                  let snapshot = try? JSONDecoder().decode(AgentCheckpointStore.Snapshot.self, from: data) else { continue }
+            do {
+                try checkpointStore.remove(snapshot)
+                _ = Self.removeIfPresent(file)
+            } catch { AgentLog.error("checkpoint ref \(snapshot.reference) kept for later: \(error)") }
+        }
+    }
+
+    /// Copies a clear stopped while making: the archive they were for never committed.
+    private func reclaimAbandonedCopies() {
+        for folder in ["attachments", "outputs", "checkpoints", "earlier"] {
+            let parent = root.appendingPathComponent(folder, isDirectory: true)
+            for entry in (try? FileManager.default.contentsOfDirectory(at: parent, includingPropertiesForKeys: nil)) ?? []
+                where entry.lastPathComponent.hasPrefix(".copying-") {
+                _ = Self.removeIfPresent(entry)
+            }
+        }
+    }
+
+    /// Copies `source`, when there is one, to `target` whole: an earlier attempt's copy is
+    /// replaced, since the clear it was for never committed, and a copy cut short never
+    /// takes the target's name.
+    private static func copyAnew(_ source: URL, to target: URL) throws {
+        if try isPresent(target) { try FileManager.default.removeItem(at: target) }
+        guard try isPresent(source) else { return }
+        let staging = target.deletingLastPathComponent().appendingPathComponent(".copying-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: staging) }
+        try FileManager.default.copyItem(at: source, to: staging)
+        try FileManager.default.moveItem(at: staging, to: target)
+    }
+
+    /// Whether `url` is there; throws when that can't be told, as behind a folder this
+    /// process can't search.
+    static func isPresent(_ url: URL) throws -> Bool {
+        var status = stat()
+        if lstat(url.path, &status) == 0 { return true }
+        if errno == ENOENT || errno == ENOTDIR { return false }
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+
+    private static let repositoryKey = Data("\"repository\"".utf8)
+
+    private static func occurrences(of needle: Data, in data: Data) -> Int {
+        var count = 0, start = data.startIndex
+        while let found = data.range(of: needle, in: start..<data.endIndex) { count += 1; start = found.upperBound }
+        return count
+    }
+
+    /// Records from before snapshots kept their repository get it while their folder still
+    /// leads there, so their refs are found after the folder is gone, as a removed worktree.
+    private func recordRepositories() {
+        let checkpoints = root.appendingPathComponent("checkpoints", isDirectory: true)
+        let git = GitCommand()
+        var repositories: [String: String?] = [:]
+        for folder in (try? FileManager.default.contentsOfDirectory(at: checkpoints, includingPropertiesForKeys: nil)) ?? []
+            where !folder.lastPathComponent.hasPrefix(".") {
+            for file in (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+                where file.pathExtension == "json" {
+                // Upgraded records name a repository for each snapshot: a pending baseline one, a record two.
+                let snapshots = file.lastPathComponent.hasPrefix("pending-") ? 1 : 2
+                guard let data = try? Data(contentsOf: file), !data.isEmpty,
+                      Self.occurrences(of: Self.repositoryKey, in: data) < snapshots,
+                      var record = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
+                var changed = false
+                for key in ["before", "after"] {
+                    guard var snapshot = record[key] as? [String: Any], snapshot["repository"] == nil,
+                          let directory = snapshot["directory"] as? String else { continue }
+                    if repositories[directory] == nil {
+                        repositories[directory] = FileManager.default.fileExists(atPath: directory)
+                            ? git.optionalText(directory, ["rev-parse", "--path-format=absolute", "--git-common-dir"]) : nil
+                    }
+                    guard let repository = repositories[directory] ?? nil else { continue }
+                    snapshot["repository"] = repository
+                    record[key] = snapshot
+                    changed = true
+                }
+                guard changed, let updated = try? JSONSerialization.data(withJSONObject: record) else { continue }
+                do { try updated.write(to: file, options: .atomic) }
+                catch { AgentLog.error("checkpoint record kept as it was: \(file.lastPathComponent): \(error)") }
+            }
+        }
     }
 
     /// Only this session's own checkpoint refs are retired, after its bounded
@@ -2165,7 +2704,7 @@ final class AgentSessions: @unchecked Sendable {
         let previous = retainedCheckpointIDs[saved.snapshot.session] ?? retained
         let retired = previous.subtracting(retained)
         retainedCheckpointIDs[saved.snapshot.session] = retained
-        let store = AgentCheckpointStore()
+        let store = checkpointStore
         for file in files where file.pathExtension == "json" {
             let name = file.deletingPathExtension().lastPathComponent
             do {
@@ -2185,6 +2724,44 @@ final class AgentSessions: @unchecked Sendable {
         }
     }
 
+    /// Runs `body` on the writer unless the store has been released.
+    private func write(_ body: @escaping () -> Void) {
+        writer.async { [fence] in fence.write(body) }
+    }
+
+    /// `body`'s result, written on the writer, in order with every other change to the
+    /// store's files, without holding the sessions queue. Refused once the store is released.
+    private func written<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            writer.async { [fence] in
+                do {
+                    var value: T?
+                    guard try fence.write({ value = try body() }), let value else {
+                        return continuation.resume(throwing: ServiceError(.badRequest, "The server is stopping"))
+                    }
+                    continuation.resume(returning: value)
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+
+    /// Writes `attachments` under `root` on the writer, queued now so they come before any
+    /// clear or cleanup of the conversation's files asked for later; `nil` when there are none.
+    private func stage(_ attachments: [AgentChatAttachment], root: URL) -> AgentStaging? {
+        guard !attachments.isEmpty else { return nil }
+        let staging = AgentStaging()
+        writer.async { [fence] in
+            do {
+                var staged: [StagedAgentAttachment]?
+                guard try fence.write({ staged = try AgentAttachments.stageRecorded(attachments, root: root) }), let staged else {
+                    return staging.resolve(.failure(ServiceError(.badRequest, "The server is stopping")))
+                }
+                staging.resolve(.success(staged))
+            } catch { staging.resolve(.failure(error)) }
+        }
+        return staging
+    }
+
     private func persist(_ entry: Entry) {
         guard !entry.resetting, entries[entry.snapshot.session] === entry else { return }
         let retained = Set(entry.snapshot.items.lazy.filter { $0.kind == .user }.map(\.id))
@@ -2194,12 +2771,78 @@ final class AgentSessions: @unchecked Sendable {
                           forkSource: entry.forkSource, forkPoint: entry.forkPoint,
                           lastProviderMessage: entry.lastProviderMessage, archived: entry.archived ? true : nil)
         let file = root.appendingPathComponent(entry.snapshot.session.description + ".json")
-        writer.async {
+        write {
             do {
                 try JSONEncoder().encode(saved).write(to: file, options: .atomic)
                 self.cleanupCheckpoints(saved)
                 self.cleanupOutputs(saved)
             } catch { AgentLog.error("agent checkpoint failed: \(error)") }
+        }
+    }
+}
+
+/// Files a message sends, written on the sessions' writer once it is admitted; its turn
+/// awaits them without holding a thread.
+final class AgentStaging: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<[StagedAgentAttachment], Error>?
+    private var waiting: [CheckedContinuation<[StagedAgentAttachment], Error>] = []
+
+    func resolve(_ result: Result<[StagedAgentAttachment], Error>) {
+        let waiting = lock.withLock { () -> [CheckedContinuation<[StagedAgentAttachment], Error>] in
+            guard self.result == nil else { return [] }
+            self.result = result
+            defer { self.waiting = [] }
+            return self.waiting
+        }
+        for continuation in waiting { continuation.resume(with: result) }
+    }
+
+    func value() async throws -> [StagedAgentAttachment] {
+        try await withCheckedThrowingContinuation { continuation in
+            let settled = lock.withLock { () -> Result<[StagedAgentAttachment], Error>? in
+                if let result { return result }
+                waiting.append(continuation)
+                return nil
+            }
+            if let settled { continuation.resume(with: settled) }
+        }
+    }
+}
+
+/// A checkpoint's baseline, taken on its conversation's checkpoint queue. Work queued after
+/// it there reads it at once; a turn waiting to start awaits it without holding a thread.
+final class CheckpointBaseline: @unchecked Sendable {
+    private let lock = NSLock()
+    private var settled = false
+    private var snapshot: AgentCheckpointStore.Snapshot?
+    private var waiting: [CheckedContinuation<AgentCheckpointStore.Snapshot?, Never>] = []
+
+    init() {}
+    init(_ snapshot: AgentCheckpointStore.Snapshot) { settled = true; self.snapshot = snapshot }
+
+    /// The baseline, or `nil` if it couldn't be taken or isn't yet.
+    var taken: AgentCheckpointStore.Snapshot? { lock.withLock { snapshot } }
+
+    func resolve(_ snapshot: AgentCheckpointStore.Snapshot?) {
+        let waiters = lock.withLock { () -> [CheckedContinuation<AgentCheckpointStore.Snapshot?, Never>] in
+            guard !settled else { return [] }
+            settled = true
+            self.snapshot = snapshot
+            defer { waiting = [] }
+            return waiting
+        }
+        for waiter in waiters { waiter.resume(returning: snapshot) }
+    }
+
+    func value() async -> AgentCheckpointStore.Snapshot? {
+        await withCheckedContinuation { waiter in
+            let ready = lock.withLock { () -> Bool in
+                if settled { return true }
+                waiting.append(waiter)
+                return false
+            }
+            if ready { waiter.resume(returning: taken) }
         }
     }
 }
@@ -2221,7 +2864,7 @@ extension AgentSessions {
         persist(entry)
         let file = root.appendingPathComponent("inbox/" + entry.snapshot.session.description + ".json")
         let savedInbox = next
-        writer.async { [self] in
+        write { [self] in
             do { try savedInbox.save(file) }
             catch {
                 let message = "Queue could not be saved: " + error.localizedDescription

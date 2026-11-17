@@ -14,6 +14,10 @@ final class AgentMediaPreviewWindow: NSWindowController, NSWindowDelegate {
     private weak var returnFocus: NSResponder?
     private var observers: [NSObjectProtocol] = []
     let imageActions = AgentImageActions(name: "image")
+    /// Copy and save feedback, shown over the viewer that covers the conversation.
+    let notices = NoticeStack(frame: .zero)
+    /// Runs once the viewer closed, so whatever opened it lets go of it.
+    var onClose: (() -> Void)?
 
     init(item: String, attachments: [AgentChatAttachmentDescriptor], index: Int, fetch: @escaping AgentAttachmentCache.Fetch, theme: AgentTheme) {
         self.item = item; self.attachments = attachments; self.fetch = fetch
@@ -26,6 +30,10 @@ final class AgentMediaPreviewWindow: NSWindowController, NSWindowDelegate {
         content.theme = theme
         content.themeDidChange()
         window.contentView = content
+        notices.theme = theme
+        notices.frame = content.bounds
+        notices.autoresizingMask = [.width, .height]
+        content.addSubview(notices)
         imageActions.view = content
         content.image.imageActions = imageActions
         window.delegate = self
@@ -45,6 +53,14 @@ final class AgentMediaPreviewWindow: NSWindowController, NSWindowDelegate {
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
     deinit { task?.cancel(); observers.forEach { NotificationCenter.default.removeObserver($0) } }
+
+    /// Draws with `theme` from now on, as the conversation that opened it does.
+    func follow(_ theme: AgentTheme) {
+        guard content.theme !== theme else { return }
+        content.theme = theme
+        content.themeDidChange()
+        notices.theme = theme
+    }
     func present(in parent: NSWindow?) {
         guard let parent, let window else { showWindow(nil); return }
         presentingWindow = parent; returnFocus = parent.firstResponder
@@ -74,6 +90,8 @@ final class AgentMediaPreviewWindow: NSWindowController, NSWindowDelegate {
             if let view = returnFocus as? NSView, view.window === parent { parent.makeFirstResponder(view) }
         }
         presentingWindow = nil; returnFocus = nil
+        onClose?()
+        onClose = nil
     }
     func select(_ index: Int) {
         guard !attachments.isEmpty else { return }

@@ -53,6 +53,7 @@ final class AgentResponseTable: AgentResponseSection {
         self.rows = rows
         self.alignments = alignments
         tableTheme = theme
+        text.linkIconTheme = theme
         copy.contentTintColor = AgentMarkdownPalette(theme: theme).muted
         copy.image = copyIcon.image(size: 12, scale: AppIcon.inlineScale, color: AgentMarkdownPalette(theme: theme).muted)
         measuredWidth = nil

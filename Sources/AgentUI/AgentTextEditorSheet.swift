@@ -1,5 +1,6 @@
 import AgentCore
 import AppKit
+import Combine
 
 /// A nonblocking multiline editor. Cancelling never mutates the underlying draft.
 @MainActor
@@ -7,6 +8,7 @@ final class AgentTextEditorSheet {
     let alert = NSAlert()
     let editor = NSTextView()
     let settings = NSButton(checkboxWithTitle: "Use current model, reasoning effort and plan mode", target: nil, action: nil)
+    private var themeObservation: AnyCancellable?
 
     init(title: String, detail: String, text: String, theme: AgentTheme, showsSettings: Bool = false, allowsDelete: Bool = false) {
         alert.messageText = title
@@ -38,6 +40,27 @@ final class AgentTextEditorSheet {
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
         if allowsDelete { alert.addButton(withTitle: "Delete") }
+        observe(theme)
+    }
+
+    /// Shows the editor in `theme` from now on, keeping what was typed.
+    func follow(_ theme: AgentTheme) {
+        apply(theme)
+        observe(theme)
+    }
+
+    private func apply(_ theme: AgentTheme) {
+        alert.window.appearance = theme.nsAppearance
+        editor.textColor = theme.fg
+        editor.backgroundColor = theme.card
+    }
+
+    /// Follows `theme` as it changes in place too, as for the system appearance.
+    private func observe(_ theme: AgentTheme) {
+        themeObservation = theme.changes.sink { [weak self, weak theme] in
+            guard let self, let theme else { return }
+            MainActor.assumeIsolated { self.apply(theme) }
+        }
     }
 
     func present(in window: NSWindow, completion: @escaping (NSApplication.ModalResponse, String, Bool) -> Void) {

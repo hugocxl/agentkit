@@ -11,6 +11,14 @@ public final class IconButton: NSButton {
     /// Tints the glyph with the accent, for toggles that are on.
     public var isActive = false { didSet { updateTint() } }
     public let side: CGFloat
+    /// The theme the glyph is tinted in; it follows that theme's changes.
+    public var theme: AgentTheme = .shared {
+        didSet {
+            guard theme !== oldValue else { return }
+            palette.observe(self, theme: theme) { [weak self] in self?.updateTint() }
+            updateTint()
+        }
+    }
     private let palette = PaletteObserver()
 
     public init(_ icon: AppIcon, label: String, side: CGFloat = 24, action: (() -> Void)? = nil) {
@@ -44,13 +52,12 @@ public final class IconButton: NSButton {
 
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        palette.observe(self) { [weak self] in self?.updateTint() }
+        palette.observe(self, theme: theme) { [weak self] in self?.updateTint() }
     }
 
     /// Draws the glyph pre-tinted in the theme's colors: AppKit would wash
     /// out a template image in an inactive window, unlike the theme's chrome.
     private func updateTint() {
-        let theme = AgentTheme.shared
         image = icon.image(size: Metrics.glyph, theme: theme, tint: isActive ? theme.accent : theme.fgMuted)
     }
 

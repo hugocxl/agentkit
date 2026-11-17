@@ -63,6 +63,17 @@ final class AgentPaneView: ThemedView {
     private(set) var snapshot: AgentChatSnapshot?
     /// The typed services the conversation body and its controls call.
     let actions = AgentConversationActions()
+    private var noticeStack: NoticeStack?
+    /// The conversation's own notices, for a host and window that show none; made on first use.
+    func ownNotices() -> NoticeStack {
+        if let noticeStack { return noticeStack }
+        let stack = NoticeStack(frame: bounds)
+        stack.theme = theme
+        stack.autoresizingMask = [.width, .height]
+        addSubview(stack)
+        noticeStack = stack
+        return stack
+    }
     /// Pull-request previews, file metadata and template actions of assistant links.
     let linkServices = AgentConversationLinkServices()
     /// Images, video and audio of assistant Markdown, cached for this conversation.
@@ -768,6 +779,7 @@ final class AgentPaneView: ThemedView {
         newConversation.setTitleColor(theme.fg)
         dismissNotice.chatTheme = theme
         notice.theme = theme
+        noticeStack?.theme = theme
         activity.theme = theme
         promptQueue.theme = theme
         subagents.theme = theme
@@ -802,4 +814,12 @@ final class AgentPaneView: ThemedView {
 @MainActor
 private final class AgentPanelDocument: NSView {
     override var isFlipped: Bool { true }
+}
+
+extension AgentPaneView: AgentRemoteImageScope {
+    var remoteImagePolicy: RemoteImagePolicy { mediaLoader.remotePolicy() }
+
+    /// This conversation's remote-image setting as it is whenever asked, for windows
+    /// showing its content.
+    var remoteImages: () -> RemoteImagePolicy { { [weak mediaLoader] in mediaLoader?.remotePolicy() ?? .never } }
 }

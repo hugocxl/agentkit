@@ -150,6 +150,18 @@ final class AgentDiagramCache {
     }
 }
 
+/// A view that owns the images and diagrams expanded from what it shows: they follow its
+/// theme and close with it.
+@MainActor
+protocol AgentMediaExpanding: AnyObject {
+    var theme: AgentTheme { get }
+    func expand(_ preview: AgentMediaPreviewWindow)
+}
+
+extension AgentPaneView: AgentMediaExpanding {
+    func expand(_ preview: AgentMediaPreviewWindow) { actions.expand(preview) }
+}
+
 /// A Mermaid diagram: a header bar like a code block's (kind, Diagram/Source, Copy, Expand) above
 /// the native drawing. Invalid sources show the Mermaid as code with the parse error below it.
 @MainActor
@@ -182,7 +194,8 @@ final class AgentResponseDiagram: AgentResponseSection {
     private var sourceHeight: CGFloat = 0
     private var copyReset: Task<Void, Never>?
     private var toggleBackground: NSColor = .clear
-    private static var preview: AgentMediaPreviewWindow?
+    /// The preview of a diagram outside any conversation.
+    private(set) static var preview: AgentMediaPreviewWindow?
 
     /// The parse failure shown, if the source can't be drawn.
     var error: AgentDiagramError? {
@@ -430,15 +443,32 @@ final class AgentResponseDiagram: AgentResponseSection {
 
     /// Opens the diagram in the zoomable media viewer; Escape closes it.
     func expandDiagram() {
+        let owner = sequence(first: self as NSView, next: { $0.superview }).lazy.compactMap({ $0 as? AgentMediaExpanding }).first
+        // Drawn in what its owner draws with now, which a render kept for the same colors misses.
+        if let owner, owner.theme !== theme {
+            theme = owner.theme
+            style = Self.style(theme: theme)
+            layout = nil
+            layoutWidth = nil
+            needsDisplay = true
+        }
         guard let image = renderedImage(),
               let representation = image.representations.first as? NSBitmapImageRep,
               let data = representation.representation(using: .png, properties: [:]) else { return }
         let name = (titleLabel.stringValue.isEmpty ? "Diagram" : titleLabel.stringValue) + ".png"
         let attachment = AgentChatAttachmentDescriptor(id: "diagram", name: name, mimeType: "image/png", byteCount: data.count)
-        Self.preview?.close()
         let preview = AgentMediaPreviewWindow(item: "diagram", attachments: [attachment], index: 0,
                                               fetch: { _, _ in data }, theme: theme)
+        // Whatever shows the diagram owns its preview: it keeps it in its theme and closes it.
+        if let owner {
+            owner.expand(preview)
+            return
+        }
+        Self.preview?.close()
         Self.preview = preview
+        preview.onClose = { [weak preview] in
+            if Self.preview === preview { Self.preview = nil }
+        }
         preview.present(in: window)
     }
 

@@ -48,13 +48,16 @@ public struct AgentEarlierItems: Codable, Hashable, Sendable {
     public static let maxItems = 100
     /// A page stops before this many bytes of items, whatever `limit` asked for.
     public static let maxBytes = 4 * 1024 * 1024
+    /// A page also stops before its items take this many bytes as JSON, half a frame,
+    /// since escaping can multiply text several times over.
+    public static let maxEncodedBytes = AgentLimits.maxFrame / 2
 }
 
 /// A tool's whole output, up to `maximumBytes`.
 public struct AgentToolOutput: Codable, Hashable, Sendable {
     public var item: String
     public var text: String
-    /// Even the stored output was cut at `maximumBytes`.
+    /// The output was longer than the part kept.
     public var truncated: Bool
 
     public init(item: String, text: String, truncated: Bool = false) {
@@ -62,6 +65,8 @@ public struct AgentToolOutput: Codable, Hashable, Sendable {
     }
 
     public static let maximumBytes = 4 * 1024 * 1024
+    /// The most `text` takes as JSON, half a frame, since escaping can multiply it.
+    public static let maximumEncodedBytes = AgentLimits.maxFrame / 2
 }
 
 /// A conversation read relative to a revision the client holds: every header field as

@@ -22,6 +22,11 @@ final class NoticeStack: NSView {
         didSet { if position != oldValue { arrange(animated: true) } }
     }
 
+    /// The theme its notices draw with, such as the conversation's they report on.
+    var theme: AgentTheme = .shared {
+        didSet { for entry in entries { entry.view.theme = theme } }
+    }
+
     /// Kept beyond this, the oldest timed notice goes first.
     static let capacity = 5
     /// How many notices peek out of a collapsed stack.
@@ -46,7 +51,7 @@ final class NoticeStack: NSView {
         return hit === self ? nil : hit
     }
 
-    private var reduceMotion: Bool { AgentTheme.shared.accessibility.reduceMotion }
+    private var reduceMotion: Bool { AccessibilityOptions.current().reduceMotion }
 
     // MARK: Showing
 
@@ -74,6 +79,7 @@ final class NoticeStack: NSView {
             return id
         }
         let view = NoticeView()
+        view.theme = theme
         view.notice = notice
         wire(view, id: id, action: action, dismiss: dismiss)
         addSubview(view)

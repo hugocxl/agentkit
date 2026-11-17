@@ -12,6 +12,40 @@ private final class FakeAgentRuntime: AgentSessionRuntime, @unchecked Sendable {
     var onInterrupt: (@Sendable () async throws -> Void)?
     var onStop: (@Sendable () -> Void)?
     var onAccess: (@Sendable (AgentAccessMode) async throws -> Void)?
+    private var exitingProcesses = false
+    /// Whether a process it replaced still exits.
+    var exiting: Bool {
+        get { lock.withLock { exitingProcesses } }
+        set { lock.withLock { exitingProcesses = newValue } }
+    }
+    private var launchedIn: AgentFolder?
+    private var launchedProcesses: [Int32] = []
+    private var refusedLaunches = false
+    /// The folder its provider runs in, as a launched provider reports it.
+    var folder: AgentFolder? {
+        get { lock.withLock { launchedIn } }
+        set { lock.withLock { launchedIn = newValue } }
+    }
+    /// Its provider's processes, as a launched provider reports them.
+    var processes: [Int32] {
+        get { lock.withLock { launchedProcesses } }
+        set { lock.withLock { launchedProcesses = newValue } }
+    }
+    /// Whether it was told to launch nothing more.
+    var launchesRefused: Bool { lock.withLock { refusedLaunches } }
+    func mayRun(in scope: AgentRevertScope) -> Bool {
+        folder.map { scope.holds($0) } == true || processes.contains(where: scope.processes.contains)
+    }
+    func isStopping(in scope: AgentRevertScope) -> Bool { exiting && mayRun(in: scope) }
+    func providerProcesses() -> [Int32] { processes }
+    func refuseLaunches() { lock.withLock { refusedLaunches = true } }
+    /// Runs as a follow-up is about to be handed over, before Stop can no longer prevent it.
+    var onSteerEntered: (@Sendable () async -> Void)?
+    func steer(text: String, attachments: [StagedAgentAttachment], delivery: AgentDelivery) async throws {
+        await onSteerEntered?()
+        guard delivery.handOver() else { throw AgentFollowUpRefused() }
+        try await steer(text: text, attachments: attachments)
+    }
     private var stopCount = 0
     private var submittedModels: [String?] = []
     private var submittedEfforts: [AgentReasoningEffort?] = []
@@ -735,6 +769,8 @@ final class AgentSessionsTests: XCTestCase {
         try await Task.sleep(nanoseconds: 150_000_000)
         let read = try await sessions.handle(.read(session: session))
         XCTAssertEqual(read, failed, "Late callbacks must not revive a timed-out runtime")
+        // The provider stops off the sessions queue, soon after.
+        for _ in 0..<500 where box.runtime?.stops != 1 { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertEqual(box.runtime?.stops, 1)
     }
 
@@ -841,6 +877,8 @@ final class AgentSessionsTests: XCTestCase {
         XCTAssertEqual(stopped.status, .idle, "A stop the provider ignores still ends as a stop, not a failure")
         XCTAssertEqual(stopped.turns?.last?.outcome, .interrupted)
         XCTAssertTrue(stopped.items.contains { $0.kind == .notice && $0.text == "Agent interrupted." })
+        // The provider stops off the sessions queue, soon after.
+        for _ in 0..<500 where box.runtime?.stops != 1 { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertEqual(box.runtime?.stops, 1)
         let resumed = try await sessions.handle(.send(session: session, text: "carry on", model: nil))
         XCTAssertEqual(resumed.status, .working)
@@ -900,6 +938,8 @@ final class AgentSessionsTests: XCTestCase {
         XCTAssertEqual(stopped.status, .idle)
         XCTAssertEqual(stopped.turns?.last?.outcome, .interrupted)
         XCTAssertTrue(stopped.items.contains { $0.text.contains("didn't take the stop") })
+        // The provider stops off the sessions queue, soon after.
+        for _ in 0..<500 where box.runtime?.stops != 1 { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertEqual(box.runtime?.stops, 1)
         XCTAssertEqual(stopped.queuePaused, true, "Stop still holds the queue")
     }
@@ -1370,6 +1410,36 @@ final class AgentSessionsTests: XCTestCase {
         try snapshot.validate()
         let frame = try WireJSON.encode(snapshot)
         XCTAssertLessThan(frame.count, AgentLimits.maxFrame)
+    }
+
+    /// Earlier items of control characters take six times their size once sent. Pages of
+    /// them stop where the reply still fits a frame, and together return every item once.
+    func testEarlierPagesOfEscapedTextFitAFrame() async throws {
+        let root = try root()
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: { _, _, _, callback in FakeAgentRuntime(callback) })
+        defer { sessions.shutdown() }
+        let session = SessionId()
+        _ = try await sessions.handle(.create(session: session, project: ProjectId(), provider: .claude))
+        let text = String(repeating: "\u{1}", count: 300_000)
+        let lines = try (0..<10).map { try JSONEncoder().encode(AgentChatItem(id: "early-\($0)", kind: .assistant, text: text)) + Data([0x0A]) }
+        let earlier = root.appendingPathComponent("earlier/\(session).jsonl")
+        try FileManager.default.createDirectory(at: earlier.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try lines.reduce(Data(), +).write(to: earlier)
+
+        var returned: [String] = [], before: Int?, pages = 0
+        repeat {
+            guard case .earlier(let page) = try await sessions.conversation(.earlier(session: session, before: before, limit: 20)) else {
+                return XCTFail("Expected earlier items")
+            }
+            pages += 1
+            XCTAssertFalse(page.items.isEmpty)
+            XCTAssertNoThrow(try AgentConversationReply.earlier(page).validate())
+            XCTAssertLessThan(try WireJSON.encode(AgentConversationReply.earlier(page)).count, AgentLimits.maxFrame)
+            returned = page.items.map(\.id) + returned
+            before = page.start
+        } while (before ?? 0) > 0 && pages < 10
+        XCTAssertGreaterThan(pages, 1, "Ten such items take more than a frame")
+        XCTAssertEqual(returned, (0..<10).map { "early-\($0)" })
     }
 
     /// A tool result used to arrive twice, as `detail` and `tool.output`, halving how many
@@ -1974,6 +2044,1852 @@ extension AgentSessionsTests {
         XCTAssertFalse(FileManager.default.fileExists(atPath: outputs.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(open.description + ".json").path),
                       "An open conversation stays however old")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("removing/" + closed.description + ".json").path),
+                       "A finished deletion leaves no record")
+    }
+
+    /// A closed conversation saved by a run that stopped long ago, with a tool output kept.
+    private func expiredConversation(in root: URL) async throws -> (session: SessionId, record: URL, outputs: URL) {
+        let session = SessionId()
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: { _, _, _, callback in FakeAgentRuntime(callback) })
+        _ = try await sessions.handle(.create(session: session, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.close(session: session))
+        sessions.shutdown()
+        let record = root.appendingPathComponent(session.description + ".json")
+        let old = Date().addingTimeInterval(-AgentSessions.closedRetention - 86_400)
+        try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: record.path)
+        let outputs = root.appendingPathComponent("outputs/" + session.description, isDirectory: true)
+        try FileManager.default.createDirectory(at: outputs, withIntermediateDirectories: true)
+        try Data("kept".utf8).write(to: outputs.appendingPathComponent("tool.txt"))
+        return (session, record, outputs)
+    }
+
+    private func restart(_ root: URL) throws {
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: { _, _, _, callback in FakeAgentRuntime(callback) })
+        sessions.shutdown()
+    }
+
+    /// Permissions are what these tests deny; root ignores them.
+    private func skipAsRoot() throws {
+        try XCTSkipIf(geteuid() == 0, "Root ignores file permissions")
+    }
+
+    /// Takes away `mode` from `folder` for the rest of the test, or until given back.
+    private func restrict(_ folder: URL, to mode: Int) throws {
+        try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: folder.path)
+        addTeardownBlock { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path) }
+    }
+
+    /// Marks the expired conversation saved at `record` as one a clear left, its earlier
+    /// messages in `archive`.
+    private func markCleared(_ record: URL, into archive: SessionId) throws {
+        var saved = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: record)) as? [String: Any])
+        var snapshot = try XCTUnwrap(saved["snapshot"] as? [String: Any])
+        snapshot["resetID"] = archive.description
+        saved["snapshot"] = snapshot
+        try JSONSerialization.data(withJSONObject: saved).write(to: record)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-AgentSessions.closedRetention - 86_400)],
+                                              ofItemAtPath: record.path)
+    }
+
+    private func exists(_ url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) }
+
+    /// A finished turn's checkpoint in `repo`, and the refs it pins.
+    private func checkpoint(in repo: GitTestRepo) throws -> AgentCheckpointRecord {
+        let store = AgentCheckpointStore()
+        try repo.write("file.txt", "before \(UUID())\n")
+        let before = try store.capture(directory: repo.path)
+        try repo.write("file.txt", "after \(UUID())\n")
+        return AgentCheckpointRecord(before: before, after: try store.capture(directory: repo.path), files: [])
+    }
+
+    private func pins(_ snapshot: AgentCheckpointStore.Snapshot, in repo: GitTestRepo) -> Bool {
+        (try? repo.run("rev-parse", "--verify", "--quiet", snapshot.reference)) != nil
+    }
+
+    private func save(_ record: AgentCheckpointRecord, as name: String, for session: SessionId, in root: URL) throws -> URL {
+        let folder = root.appendingPathComponent("checkpoints/\(session)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appendingPathComponent(name + ".json")
+        try JSONEncoder().encode(record).write(to: file)
+        return file
+    }
+
+    /// A deletion cut short, as by a crash after the record moved out, finishes at the next start.
+    func testADeletionCutShortFinishesAtTheNextStart() async throws {
+        let root = try root(), expired = try await expiredConversation(in: root)
+        let attachments = root.appendingPathComponent("attachments/" + expired.session.description, isDirectory: true)
+        try FileManager.default.createDirectory(at: attachments, withIntermediateDirectories: true)
+        let record = root.appendingPathComponent("removing/" + expired.session.description + ".json")
+        try FileManager.default.createDirectory(at: record.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.moveItem(at: expired.record, to: record)
+
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: { _, _, _, callback in FakeAgentRuntime(callback) })
+        do {
+            _ = try await sessions.handle(.read(session: expired.session))
+            XCTFail("A deleted conversation stays deleted")
+        } catch {}
+        sessions.shutdown()
+        for path in [expired.outputs, attachments, record] {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: path.path), path.path)
+        }
+    }
+
+    /// Files that can't go yet keep the deleted conversation's record for another try,
+    /// while the conversation itself no longer loads.
+    func testADeletionThatCannotFinishKeepsItsRecordForTheNextStart() async throws {
+        try skipAsRoot()
+        let root = try root(), expired = try await expiredConversation(in: root)
+        let outputs = expired.outputs.deletingLastPathComponent()
+        try restrict(outputs, to: 0o500)
+
+        try restart(root)
+        let record = root.appendingPathComponent("removing/" + expired.session.description + ".json")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: expired.record.path), "The record moved out of the conversations")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: record.path), "It waits for the files that remain")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: expired.outputs.path))
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: outputs.path)
+        try restart(root)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: expired.outputs.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: record.path))
+    }
+
+    /// A record that can't move out, as in a store this run can't change, keeps everything.
+    func testAnExpiredConversationWhoseRecordCannotMoveKeepsItsFiles() async throws {
+        try skipAsRoot()
+        let root = try root(), expired = try await expiredConversation(in: root)
+        // The folder for deletions exists, so it is the move itself that fails.
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("removing"), withIntermediateDirectories: true)
+        try restrict(root, to: 0o500)
+
+        try restart(root)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: expired.record.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: expired.outputs.appendingPathComponent("tool.txt").path))
+    }
+
+    /// A file behind a folder this run can't search is still there, not deleted.
+    func testFilesThatCannotBeSeenAreNotTakenAsDeleted() async throws {
+        try skipAsRoot()
+        let root = try root(), expired = try await expiredConversation(in: root)
+        let outputs = expired.outputs.deletingLastPathComponent()
+        try restrict(outputs, to: 0o600)
+
+        try restart(root)
+        let record = root.appendingPathComponent("removing/\(expired.session).json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: record.path), "The deletion waits for the outputs it can't reach")
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: outputs.path)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: expired.outputs.appendingPathComponent("tool.txt").path))
+        try restart(root)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: expired.outputs.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: record.path))
+    }
+
+    /// An expired record restored beside its own unfinished deletion is deleted again; the
+    /// earlier deletion's record must not take the new one with it. The writer waits until
+    /// startup has queued everything, so the outcome can't depend on which runs first.
+    func testAnExpiredRecordRestoredBesideItsDeletionIsDeletedAgain() async throws {
+        try skipAsRoot()
+        let root = try root(), expired = try await expiredConversation(in: root)
+        let record = root.appendingPathComponent("removing/\(expired.session).json")
+        try FileManager.default.createDirectory(at: record.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: expired.record, to: record)
+        try restrict(expired.outputs.deletingLastPathComponent(), to: 0o500)
+
+        let writer = DispatchQueue(label: "held writer")
+        writer.suspend()
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, writer: writer,
+                                         factory: { _, _, _, callback in FakeAgentRuntime(callback) })
+        writer.resume()
+        sessions.shutdown()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: expired.record.path), "The record moved out again")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: record.path), "The deletion keeps a record for what remains")
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: expired.outputs.deletingLastPathComponent().path)
+        try restart(root)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: expired.outputs.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: record.path))
+    }
+
+    /// A ref Git can't remove yet, as behind another process's lock, keeps its checkpoint
+    /// record and the deletion's until a later start removes it; the other ref goes now.
+    func testACheckpointRefGitCannotRemoveYetIsRemovedAtALaterStart() async throws {
+        let root = try root(), repo = try GitTestRepo(commit: true), expired = try await expiredConversation(in: root)
+        let record = try checkpoint(in: repo)
+        let file = try save(record, as: UUID().uuidString, for: expired.session, in: root)
+        let lock = URL(fileURLWithPath: repo.path).appendingPathComponent(".git/" + record.before.reference + ".lock")
+        try Data().write(to: lock)
+
+        try restart(root)
+        let deletion = root.appendingPathComponent("removing/\(expired.session).json")
+        XCTAssertTrue(pins(record.before, in: repo), "The locked ref stays")
+        XCTAssertFalse(pins(record.after, in: repo), "The other ref goes on its own")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path), "Its checkpoint record stays to try again")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: deletion.path))
+
+        try FileManager.default.removeItem(at: lock)
+        try restart(root)
+        XCTAssertFalse(pins(record.before, in: repo))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.deletingLastPathComponent().path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: deletion.path))
+    }
+
+    /// An interrupted clear leaves the archive's checkpoint records beside the cleared
+    /// conversation's own. Deleting that conversation keeps the archive's refs.
+    func testDeletingAClearedConversationKeepsItsArchivesCheckpoints() async throws {
+        let root = try root(), repo = try GitTestRepo(commit: true), expired = try await expiredConversation(in: root)
+        let archive = SessionId()
+        try markCleared(expired.record, into: archive)
+        let own = try checkpoint(in: repo), archived = try checkpoint(in: repo)
+        _ = try save(own, as: UUID().uuidString, for: expired.session, in: root)
+        let turn = UUID().uuidString
+        _ = try save(archived, as: turn, for: expired.session, in: root)
+        let archiveCopy = try save(archived, as: turn, for: archive, in: root)
+
+        try restart(root)
+        XCTAssertFalse(pins(own.before, in: repo))
+        XCTAssertFalse(pins(own.after, in: repo))
+        XCTAssertTrue(pins(archived.before, in: repo), "The archive's checkpoint keeps its refs")
+        XCTAssertTrue(pins(archived.after, in: repo))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: archiveCopy.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("checkpoints/\(expired.session)").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("removing/\(expired.session).json").path))
+    }
+
+    /// A record that came back, as from a backup, wins over its unfinished deletion.
+    func testAConversationRestoredDuringItsDeletionKeepsItsFiles() async throws {
+        let root = try root(), expired = try await expiredConversation(in: root)
+        try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: expired.record.path)
+        let attachment = root.appendingPathComponent("attachments/" + expired.session.description + "/image.png")
+        try FileManager.default.createDirectory(at: attachment.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("png".utf8).write(to: attachment)
+        let record = root.appendingPathComponent("removing/" + expired.session.description + ".json")
+        try FileManager.default.createDirectory(at: record.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: expired.record, to: record)
+
+        try restart(root)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: attachment.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: expired.record.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: record.path))
+    }
+
+    /// An archive whose checkpoint records can't be read yet may own the refs a deleted
+    /// conversation's records name: they stay, and the deletion waits until it can tell.
+    func testDeletingAClearedConversationWaitsForAnArchiveItCannotRead() async throws {
+        try skipAsRoot()
+        let root = try root(), repo = try GitTestRepo(commit: true), expired = try await expiredConversation(in: root)
+        let archive = SessionId()
+        try markCleared(expired.record, into: archive)
+        let shared = try checkpoint(in: repo), turn = UUID().uuidString
+        _ = try save(shared, as: turn, for: expired.session, in: root)
+        _ = try save(shared, as: turn, for: archive, in: root)
+        let archived = root.appendingPathComponent("checkpoints/\(archive)", isDirectory: true)
+        try restrict(archived, to: 0o000)
+
+        try restart(root)
+        let deletion = root.appendingPathComponent("removing/\(expired.session).json")
+        XCTAssertTrue(pins(shared.before, in: repo))
+        XCTAssertTrue(pins(shared.after, in: repo))
+        XCTAssertTrue(exists(deletion), "The deletion waits for the archive")
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: archived.path)
+        try restart(root)
+        XCTAssertTrue(pins(shared.before, in: repo), "The archive's refs stay")
+        XCTAssertTrue(pins(shared.after, in: repo))
+        XCTAssertFalse(exists(root.appendingPathComponent("checkpoints/\(expired.session)")))
+        XCTAssertFalse(exists(deletion))
+    }
+
+    /// A record whose details are damaged still names its refs, which go; one that names
+    /// none that can be read stays with the deletion.
+    func testDamagedCheckpointRecordsNeverLoseTheirRefs() async throws {
+        let root = try root(), repo = try GitTestRepo(commit: true), expired = try await expiredConversation(in: root)
+        let record = try checkpoint(in: repo)
+        let damaged = try save(record, as: UUID().uuidString, for: expired.session, in: root)
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: damaged)) as? [String: Any])
+        json["files"] = "not a list"
+        try JSONSerialization.data(withJSONObject: json).write(to: damaged)
+        let unreadable = damaged.deletingLastPathComponent().appendingPathComponent(UUID().uuidString + ".json")
+        try Data("{ not a record".utf8).write(to: unreadable)
+
+        try restart(root)
+        XCTAssertFalse(pins(record.before, in: repo))
+        XCTAssertFalse(pins(record.after, in: repo))
+        XCTAssertFalse(exists(damaged))
+        XCTAssertTrue(exists(unreadable), "A record whose refs can't be read stays")
+        XCTAssertTrue(exists(root.appendingPathComponent("removing/\(expired.session).json")))
+    }
+
+    /// A conversation with one checkpointed turn, cleared once into `first`, and the copy
+    /// of that checkpoint a first clear that couldn't retire it would leave behind.
+    private func clearedWithLeftover(_ storage: URL, repo: GitTestRepo)
+        async throws -> (sessions: AgentSessions, id: SessionId, first: SessionId, revision: UInt64, leftover: URL, record: AgentCheckpointRecord) {
+        try repo.write("file.txt", "before\n")
+        try repo.commit("initial")
+        let directory = repo.path
+        let sessions = try AgentSessions(root: storage, projectDirectory: { _ in directory }, factory: { _, _, _, callback in
+            SkillCaptureRuntime(callback) { try "after\n".write(toFile: directory + "/file.txt", atomically: true, encoding: .utf8) }
+        })
+        let id = SessionId(), first = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Change this file", model: nil))
+        let old = try await waitForQueue(sessions, id) { $0.status == .idle && $0.turns?.first?.checkpoint != nil }
+        let checkpoint = try XCTUnwrap(old.turns?.first?.checkpoint)
+        let cleared = try await sessions.handle(.clear(session: id, archive: first, expectedRevision: old.revision))
+        let archivedRecord = storage.appendingPathComponent("checkpoints/\(first)/\(checkpoint.id).json")
+        let record = try JSONDecoder().decode(AgentCheckpointRecord.self, from: Data(contentsOf: archivedRecord))
+        let leftover = storage.appendingPathComponent("checkpoints/\(id)/\(checkpoint.id).json")
+        try FileManager.default.createDirectory(at: leftover.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: archivedRecord, to: leftover)
+        return (sessions, id, first, cleared.revision, leftover, record)
+    }
+
+    /// A second clear before the store restarts leaves an earlier clear's leftover with its
+    /// archive, rather than taking it into its own, where cleanup would unpin its refs.
+    func testASecondClearLeavesTheFirstArchivesCheckpointsAlone() async throws {
+        let storage = try root(), repo = try GitTestRepo(commit: false)
+        let state = try await clearedWithLeftover(storage, repo: repo)
+        let second = SessionId()
+        _ = try await state.sessions.handle(.clear(session: state.id, archive: second, expectedRevision: state.revision))
+        state.sessions.shutdown()
+        XCTAssertFalse(exists(storage.appendingPathComponent("checkpoints/\(second)/\(state.leftover.lastPathComponent)")),
+                       "The second archive took only the conversation's own checkpoints")
+
+        let restored = try AgentSessions(root: storage, projectDirectory: { _ in repo.path })
+        restored.shutdown()
+        XCTAssertTrue(pins(state.record.before, in: repo), "The first archive's refs stay")
+        XCTAssertTrue(pins(state.record.after, in: repo))
+    }
+
+    /// While an earlier archive can't be read, a second clear can't tell its leftovers from
+    /// the conversation's own, so it waits; the conversation stays as it was.
+    func testASecondClearWaitsForAnEarlierArchiveItCannotRead() async throws {
+        try skipAsRoot()
+        let storage = try root(), repo = try GitTestRepo(commit: false)
+        let state = try await clearedWithLeftover(storage, repo: repo)
+        defer { state.sessions.shutdown() }
+        let archived = storage.appendingPathComponent("checkpoints/\(state.first)", isDirectory: true)
+        try restrict(archived, to: 0o000)
+        let second = SessionId()
+        do {
+            _ = try await state.sessions.handle(.clear(session: state.id, archive: second, expectedRevision: state.revision))
+            XCTFail("The clear must wait")
+        } catch {}
+        XCTAssertTrue(exists(state.leftover), "The conversation is kept as it was")
+        XCTAssertFalse(exists(storage.appendingPathComponent("\(second).json")))
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: archived.path)
+        _ = try await state.sessions.handle(.clear(session: state.id, archive: second, expectedRevision: state.revision))
+        XCTAssertFalse(exists(state.leftover))
+    }
+
+    /// A store whose folder can't be listed fails to open, and leaves no deletion running
+    /// after it failed, when another runtime may own the store.
+    func testAStoreThatCannotBeListedStartsNoDeletion() async throws {
+        try skipAsRoot()
+        let root = try root(), expired = try await expiredConversation(in: root)
+        let record = root.appendingPathComponent("removing/\(expired.session).json")
+        try FileManager.default.createDirectory(at: record.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.moveItem(at: expired.record, to: record)
+        try restrict(root, to: 0o300)
+
+        let writer = DispatchQueue(label: "held writer")
+        writer.suspend()
+        XCTAssertThrowsError(try AgentSessions(root: root, projectDirectory: { _ in root.path }, writer: writer,
+                                               factory: { _, _, _, callback in FakeAgentRuntime(callback) }))
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
+        writer.resume()
+        writer.sync {}
+        XCTAssertTrue(exists(expired.outputs.appendingPathComponent("tool.txt")), "Nothing was deleted")
+        XCTAssertTrue(exists(record))
+    }
+
+    /// A pending baseline an interrupted clear left with the conversation is the archive's
+    /// even after the archive finished it into a record under another name.
+    func testAPendingBaselineTheArchiveFinishedIsStillTheArchives() async throws {
+        let root = try root(), repo = try GitTestRepo(commit: true), expired = try await expiredConversation(in: root)
+        let archive = SessionId()
+        try markCleared(expired.record, into: archive)
+        let record = try checkpoint(in: repo), turn = UUID().uuidString
+        _ = try save(record, as: turn, for: archive, in: root)
+        let folder = root.appendingPathComponent("checkpoints/\(expired.session)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try JSONEncoder().encode(AgentCheckpointPending(turnID: turn, before: record.before))
+            .write(to: folder.appendingPathComponent("pending-\(turn).json"))
+
+        try restart(root)
+        XCTAssertTrue(pins(record.before, in: repo), "The archive's baseline keeps its ref")
+        XCTAssertTrue(pins(record.after, in: repo))
+        XCTAssertFalse(exists(folder))
+        XCTAssertFalse(exists(root.appendingPathComponent("removing/\(expired.session).json")))
+    }
+
+    /// An archive record that can't be decoded may pin the refs a deleted conversation's
+    /// records name: they stay, and so does the deletion's record.
+    func testAnArchiveRecordThatCannotBeDecodedLeavesOwnershipUnknown() async throws {
+        let root = try root(), repo = try GitTestRepo(commit: true), expired = try await expiredConversation(in: root)
+        let archive = SessionId()
+        try markCleared(expired.record, into: archive)
+        let shared = try checkpoint(in: repo), turn = UUID().uuidString
+        _ = try save(shared, as: turn, for: expired.session, in: root)
+        let damaged = try save(shared, as: turn, for: archive, in: root)
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: damaged)) as? [String: Any])
+        var before = try XCTUnwrap(json["before"] as? [String: Any])
+        before["directory"] = 42
+        json["before"] = before
+        try JSONSerialization.data(withJSONObject: json).write(to: damaged)
+
+        try restart(root)
+        XCTAssertTrue(pins(shared.before, in: repo))
+        XCTAssertTrue(pins(shared.after, in: repo))
+        XCTAssertTrue(exists(root.appendingPathComponent("removing/\(expired.session).json")), "The deletion waits")
+    }
+
+    /// While the checkpoints folder can't be searched, a clear can't tell an earlier clear's
+    /// leftovers from the conversation's own, so it waits.
+    func testAClearWaitsWhileTheCheckpointsFolderCannotBeSearched() async throws {
+        try skipAsRoot()
+        let storage = try root(), repo = try GitTestRepo(commit: false)
+        let state = try await clearedWithLeftover(storage, repo: repo)
+        defer { state.sessions.shutdown() }
+        let checkpoints = storage.appendingPathComponent("checkpoints", isDirectory: true)
+        try restrict(checkpoints, to: 0o000)
+        let second = SessionId()
+        do {
+            _ = try await state.sessions.handle(.clear(session: state.id, archive: second, expectedRevision: state.revision))
+            XCTFail("The clear must wait")
+        } catch {}
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: checkpoints.path)
+        XCTAssertTrue(exists(state.leftover))
+        XCTAssertFalse(exists(storage.appendingPathComponent("\(second).json")))
+    }
+
+    /// An archive's checkpoints are copies another conversation's leftovers point to by its
+    /// name alone, so it is never cleared itself.
+    func testAnArchiveCannotBeCleared() async throws {
+        let storage = try root(), repo = try GitTestRepo(commit: false)
+        let state = try await clearedWithLeftover(storage, repo: repo)
+        defer { state.sessions.shutdown() }
+        let archive = try await state.sessions.handle(.read(session: state.first))
+        do {
+            _ = try await state.sessions.handle(.clear(session: state.first, archive: SessionId(), expectedRevision: archive.revision))
+            XCTFail("An archive can't be cleared")
+        } catch {}
+        XCTAssertTrue(exists(storage.appendingPathComponent("checkpoints/\(state.first)")))
+    }
+
+    /// Records from before snapshots kept their repository gain it at the next start, while
+    /// their folder still leads there.
+    func testOlderCheckpointRecordsGainTheirRepository() async throws {
+        let storage = try root(), repo = try GitTestRepo(commit: false)
+        try repo.write("file.txt", "before\n")
+        try repo.commit("initial")
+        let directory = repo.path
+        let sessions = try AgentSessions(root: storage, projectDirectory: { _ in directory }, factory: { _, _, _, callback in
+            SkillCaptureRuntime(callback) { try "after\n".write(toFile: directory + "/file.txt", atomically: true, encoding: .utf8) }
+        })
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Change this file", model: nil))
+        let done = try await waitForQueue(sessions, id) { $0.status == .idle && $0.turns?.first?.checkpoint != nil }
+        sessions.shutdown()
+        let file = storage.appendingPathComponent("checkpoints/\(id)/\(try XCTUnwrap(done.turns?.first?.checkpoint?.id)).json")
+        // As a version before snapshots kept their repository wrote it.
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any])
+        for key in ["before", "after"] {
+            var snapshot = try XCTUnwrap(json[key] as? [String: Any])
+            snapshot.removeValue(forKey: "repository")
+            json[key] = snapshot
+        }
+        try JSONSerialization.data(withJSONObject: json).write(to: file)
+        XCTAssertFalse(try String(contentsOf: file, encoding: .utf8).contains("repository"))
+
+        try restart(storage)
+        let upgraded = try JSONDecoder().decode(AgentCheckpointRecord.self, from: Data(contentsOf: file))
+        let common = try repo.run("rev-parse", "--path-format=absolute", "--git-common-dir").trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(upgraded.before.repository, common)
+        XCTAssertEqual(upgraded.after.repository, common)
+    }
+
+    /// A Git whose `write-tree` waits for `gate` from its `from`th run on, so a checkpoint
+    /// stays being taken until the test lets it finish; `count` tells how many began.
+    private func gatedGit(_ tools: URL, from: Int) throws -> (git: GitCommand, gate: URL, count: () -> Int) {
+        try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: true)
+        let gate = tools.appendingPathComponent("gate"), count = tools.appendingPathComponent("count")
+        let git = try AgentCheckpointTests.git("""
+            for a in "$@"; do
+              if [ "$a" = write-tree ]; then
+                n=$(($(cat '\(count.path)' 2>/dev/null || echo 0) + 1)); echo $n > '\(count.path)'
+                if [ $n -ge \(from) ]; then while [ ! -f '\(gate.path)' ]; do sleep 0.05; done; fi
+              fi
+            done
+            """, in: tools)
+        return (git, gate, { Int(((try? String(contentsOf: count, encoding: .utf8)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0 })
+    }
+
+    private func waitUntil(_ timeout: TimeInterval = 10, _ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            guard Date() < deadline else { return XCTFail("Timed out") }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
+    /// A checkpoint still being taken when the store shuts down finishes first: it makes a
+    /// ref and a record the store's next owner must find whole.
+    func testShutdownWaitsForACheckpointBeingTaken() async throws {
+        let root = try root(), repo = try GitTestRepo(commit: true)
+        let gated = try gatedGit(root.appendingPathComponent("tools"), from: 2)
+        let session = SessionId(), writer = DispatchQueue(label: "writer")
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in repo.path }, writer: writer,
+                                         checkpoints: AgentCheckpointStore(git: gated.git), factory: { _, _, _, callback in FakeAgentRuntime(callback) })
+        _ = try await sessions.handle(.create(session: session, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: session, text: "Work", model: nil))
+        let stopped = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async { sessions.shutdown(); stopped.signal() }
+        // Shutting down ends the turn, whose checkpoint is then taken.
+        try await waitUntil { gated.count() >= 2 }
+        // Nothing else holds shutdown up: what it queued is written.
+        sessions.publishActivity()
+        writer.sync {}
+        XCTAssertEqual(stopped.wait(timeout: .now() + 0.3), .timedOut, "Shutdown waits for the checkpoint being taken")
+        try Data().write(to: gated.gate)
+        XCTAssertEqual(stopped.wait(timeout: .now() + 10), .success)
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("checkpoints/\(session)").path)) ?? []
+        XCTAssertTrue(files.contains { !$0.hasPrefix("pending-") && $0.hasSuffix(".json") }, "\(files)")
+    }
+
+    /// A store whose last turn ended while its checkpoint was still being taken: the
+    /// baseline kept as a version before snapshots kept their repository wrote it, and no
+    /// record yet, so opening the store takes the checkpoint again.
+    private func unfinishedCheckpoint(_ storage: URL, repo: GitTestRepo) async throws -> (session: SessionId, record: URL, before: AgentCheckpointStore.Snapshot) {
+        try repo.write("file.txt", "before\n")
+        try repo.commit("initial")
+        let directory = repo.path
+        let sessions = try AgentSessions(root: storage, projectDirectory: { _ in directory }, factory: { _, _, _, callback in
+            SkillCaptureRuntime(callback) { try "after\n".write(toFile: directory + "/file.txt", atomically: true, encoding: .utf8) }
+        })
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Change this file", model: nil))
+        let done = try await waitForQueue(sessions, id) { $0.status == .idle && $0.turns?.first?.checkpoint != nil }
+        sessions.shutdown()
+        let turn = try XCTUnwrap(done.turns?.first?.checkpoint?.id)
+        let folder = storage.appendingPathComponent("checkpoints/\(id)", isDirectory: true)
+        let record = folder.appendingPathComponent(turn + ".json")
+        let finished = try JSONDecoder().decode(AgentCheckpointRecord.self, from: Data(contentsOf: record))
+        try FileManager.default.removeItem(at: record)
+        var before = finished.before
+        before.repository = nil
+        try JSONEncoder().encode(AgentCheckpointPending(turnID: turn, before: before)).write(to: folder.appendingPathComponent("pending-\(turn).json"))
+        let saved = storage.appendingPathComponent("\(id).json")
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: saved)) as? [String: Any])
+        var snapshot = try XCTUnwrap(json["snapshot"] as? [String: Any])
+        var turns = try XCTUnwrap(snapshot["turns"] as? [[String: Any]])
+        turns[0].removeValue(forKey: "checkpoint")
+        snapshot["turns"] = turns
+        json["snapshot"] = snapshot
+        try JSONSerialization.data(withJSONObject: json).write(to: saved)
+        return (id, record, finished.before)
+    }
+
+    /// The record a recovered checkpoint gets names the repository even when its baseline,
+    /// read before older records were upgraded, didn't.
+    func testARecoveredCheckpointKeepsItsRepository() async throws {
+        let storage = try root().appendingPathComponent("agents"), repo = try GitTestRepo(commit: false)
+        let unfinished = try await unfinishedCheckpoint(storage, repo: repo)
+        let gated = try gatedGit(storage.deletingLastPathComponent().appendingPathComponent("tools"), from: 1)
+        let writer = DispatchQueue(label: "held writer")
+        writer.suspend()
+        let sessions = try AgentSessions(root: storage, projectDirectory: { _ in repo.path }, writer: writer,
+                                         checkpoints: AgentCheckpointStore(git: gated.git), factory: { _, _, _, callback in FakeAgentRuntime(callback) })
+        // Older records are upgraded while the checkpoint is still being taken.
+        try await waitUntil { gated.count() >= 1 }
+        writer.resume()
+        writer.sync {}
+        try Data().write(to: gated.gate)
+        try await waitUntil { FileManager.default.fileExists(atPath: unfinished.record.path) }
+        sessions.shutdown()
+        let record = try JSONDecoder().decode(AgentCheckpointRecord.self, from: Data(contentsOf: unfinished.record))
+        XCTAssertEqual(record.before.reference, unfinished.before.reference)
+        XCTAssertEqual(record.before.repository, unfinished.before.repository)
+    }
+
+    /// A checkpoint still being taken when shutdown gives up waiting keeps the store held
+    /// until it is written, so no other runtime opens the store meanwhile.
+    func testTheStoreStaysHeldUntilACheckpointOutlastingShutdownIsWritten() async throws {
+        let root = try root(), storage = root.appendingPathComponent("agents"), repo = try GitTestRepo(commit: false)
+        let unfinished = try await unfinishedCheckpoint(storage, repo: repo)
+        let gated = try gatedGit(root.appendingPathComponent("tools"), from: 1)
+        let service = try AgentRuntimeService(storageDirectory: storage, home: root, checkpoints: AgentCheckpointStore(git: gated.git),
+                                              projectDirectory: { _ in URL(fileURLWithPath: repo.path) })
+        service.checkpointDrain = 0.2
+        try await waitUntil { gated.count() >= 1 }
+        await Task.detached { service.shutdown() }.value
+        let lock = storage.appendingPathComponent("runtime.lock")
+        XCTAssertThrowsError(try FileLock.tryLock(lock), "The store stays held") { XCTAssertEqual($0 as? FileLock.Failure, .held) }
+
+        try Data().write(to: gated.gate)
+        var reopened: FileLock?
+        let deadline = Date().addingTimeInterval(10)
+        while reopened == nil, Date() < deadline {
+            reopened = try? FileLock.tryLock(lock)
+            if reopened == nil { try await Task.sleep(for: .milliseconds(20)) }
+        }
+        XCTAssertNotNil(reopened, "Released once the checkpoint was written")
+        reopened?.unlock()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unfinished.record.path))
+    }
+
+    /// A store shut down with its default wait releases nothing before a checkpoint being
+    /// taken is written, however long that takes, so the host may let another runtime in
+    /// as soon as it returns: even a store the host owns, which the runtime couldn't lock.
+    func testShutdownReturnsOnlyOnceACheckpointIsWritten() async throws {
+        let root = try root(), storage = root.appendingPathComponent("agents"), repo = try GitTestRepo(commit: false)
+        let unfinished = try await unfinishedCheckpoint(storage, repo: repo)
+        let gated = try gatedGit(root.appendingPathComponent("tools"), from: 1)
+        // Nothing of the runtime's own holds this store: only shutdown's wait keeps it.
+        try FileManager.default.createDirectory(at: storage.appendingPathComponent("runtime.lock"), withIntermediateDirectories: true)
+        let service = try AgentRuntimeService(storageDirectory: storage, home: root, hostOwnsStore: true,
+                                              checkpoints: AgentCheckpointStore(git: gated.git),
+                                              projectDirectory: { _ in URL(fileURLWithPath: repo.path) })
+        XCTAssertNil(service.checkpointDrain, "Shutdown waits however long checkpoints take")
+        try await waitUntil { gated.count() >= 1 }
+        let stopped = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async { service.shutdown(); stopped.signal() }
+        XCTAssertEqual(stopped.wait(timeout: .now() + 0.5), .timedOut)
+        try Data().write(to: gated.gate)
+        XCTAssertEqual(stopped.wait(timeout: .now() + 10), .success)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unfinished.record.path), "Written before shutdown returned")
+    }
+
+    /// Shutdown called from every Swift task worker at once, as a host closing workspaces
+    /// from a task group may, still returns: the checkpoint it waits for needs no worker.
+    func testShutdownFinishesACheckpointWhileEveryTaskWorkerIsBlocked() async throws {
+        let root = try root(), repo = try GitTestRepo(commit: true)
+        let gated = try gatedGit(root.appendingPathComponent("tools"), from: 2)
+        let session = SessionId()
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in repo.path },
+                                         checkpoints: AgentCheckpointStore(git: gated.git), factory: { _, _, _, callback in FakeAgentRuntime(callback) })
+        _ = try await sessions.handle(.create(session: session, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: session, text: "Work", model: nil))
+        let began = DispatchSemaphore(value: 0), stopped = DispatchSemaphore(value: 0)
+        Task.detached { began.signal(); sessions.shutdown(); stopped.signal() }
+        XCTAssertEqual(began.wait(timeout: .now() + 10), .success)
+        // Shutting down ends the turn, whose checkpoint is then taken.
+        try await waitUntil { gated.count() >= 2 }
+        let result = try TaskWorkers().whileBlocked {
+            try Data().write(to: gated.gate)
+            return stopped.wait(timeout: .now() + 10)
+        }
+        XCTAssertEqual(result, .success, "Shutdown returns without a free task worker")
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("checkpoints/\(session)").path)) ?? []
+        XCTAssertTrue(files.contains { !$0.hasPrefix("pending-") && $0.hasSuffix(".json") }, "\(files)")
+    }
+
+    /// A revert under way when the store shuts down is applied and recorded first, without
+    /// a free Swift task worker; one asked for after is refused and changes nothing.
+    func testShutdownFinishesARevertUnderWayAndRefusesLaterOnes() async throws {
+        let root = try root(), repo = try GitTestRepo(commit: false)
+        try repo.write("file.txt", "before\n")
+        try repo.commit("initial")
+        let directory = repo.path, tools = root.appendingPathComponent("tools")
+        try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: true)
+        let began = tools.appendingPathComponent("began"), gate = tools.appendingPathComponent("gate")
+        // Restoring a file waits for `gate`; nothing else reads blobs.
+        let git = try AgentCheckpointTests.git("""
+            for a in "$@"; do
+              if [ "$a" = cat-file ]; then touch '\(began.path)'; while [ ! -f '\(gate.path)' ]; do sleep 0.05; done; fi
+            done
+            """, in: tools)
+        let writer = DispatchQueue(label: "writer"), runtimeStopped = DispatchSemaphore(value: 0)
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in directory }, writer: writer,
+                                         checkpoints: AgentCheckpointStore(git: git), factory: { _, _, _, callback in
+            SkillCaptureRuntime(callback, onSend: { try "after\n".write(toFile: directory + "/file.txt", atomically: true, encoding: .utf8) },
+                                onStop: { runtimeStopped.signal() })
+        })
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Change this file", model: nil))
+        let done = try await waitForQueue(sessions, id) { $0.status == .idle && $0.turns?.first?.checkpoint != nil }
+        let checkpoint = try XCTUnwrap(done.turns?.first?.checkpoint?.id)
+        let revert = Task { try await sessions.conversation(.revert(session: id, checkpoint: checkpoint, paths: nil, force: true)) }
+        try await waitUntil { FileManager.default.fileExists(atPath: began.path) }
+
+        let shutdownBegan = DispatchSemaphore(value: 0), stopped = DispatchSemaphore(value: 0)
+        Task.detached { shutdownBegan.signal(); sessions.shutdown(); stopped.signal() }
+        XCTAssertEqual(shutdownBegan.wait(timeout: .now() + 10), .success)
+        // Shutdown has saved every conversation and stops their providers: what it queued is written.
+        XCTAssertEqual(runtimeStopped.wait(timeout: .now() + 10), .success)
+        writer.sync {}
+        let result = try TaskWorkers().whileBlocked {
+            XCTAssertEqual(stopped.wait(timeout: .now() + 0.3), .timedOut, "Shutdown waits for the revert under way")
+            try Data().write(to: gate)
+            return stopped.wait(timeout: .now() + 10)
+        }
+        XCTAssertEqual(result, .success, "Shutdown returns without a free task worker")
+        let saved = try String(contentsOf: root.appendingPathComponent("\(id).json"), encoding: .utf8)
+        XCTAssertTrue(saved.contains("Reverted 1 file to before a turn."), "Recorded before shutdown returned")
+        guard case .revert(let reply) = try await revert.value else { return XCTFail("Unexpected reply") }
+        XCTAssertEqual(reply.reverted, ["file.txt"])
+        XCTAssertEqual(try String(contentsOfFile: directory + "/file.txt", encoding: .utf8), "before\n")
+
+        try "edited later\n".write(toFile: directory + "/file.txt", atomically: true, encoding: .utf8)
+        do {
+            _ = try await sessions.conversation(.revert(session: id, checkpoint: checkpoint, paths: nil, force: true))
+            XCTFail("A revert after shutdown is refused")
+        } catch {}
+        XCTAssertEqual(try String(contentsOfFile: directory + "/file.txt", encoding: .utf8), "edited later\n")
+    }
+
+    /// A conversation closed after shutdown stays as shutdown saved it: the store may
+    /// already be another runtime's.
+    func testClosingAfterShutdownWritesNothing() async throws {
+        let root = try root(), writer = DispatchQueue(label: "writer")
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, writer: writer,
+                                         factory: { _, _, _, callback in FakeAgentRuntime(callback) })
+        let id = SessionId(), project = ProjectId()
+        _ = try await sessions.handle(.create(session: id, project: project, provider: .claude))
+        sessions.shutdown()
+        let file = root.appendingPathComponent("\(id).json")
+        let saved = try Data(contentsOf: file)
+        _ = try await sessions.handle(.close(session: id))
+        sessions.close(project: project)
+        writer.sync {}
+        XCTAssertEqual(try Data(contentsOf: file), saved)
+    }
+
+    /// A checkpoint ref Git may or may not have made, and couldn't say, is kept track of
+    /// and removed when the store next opens, rather than pinning its files for good: a
+    /// turn's baseline as well as its final state.
+    func testARefACaptureLeftUnsettledIsRemovedAtTheNextStart() async throws {
+        for unsettledFrom in [1, 2] {
+            let root = try root(), repo = try GitTestRepo(commit: true)
+            let tools = root.appendingPathComponent("tools"), made = tools.appendingPathComponent("made")
+            try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: true)
+            // From its `unsettledFrom`th, makes checkpoint refs without reporting it, and can
+            // neither find nor remove them.
+            let git = try AgentCheckpointTests.git("""
+                case " $* " in
+                  *" show-ref --exists "*) head -c 5000000 /dev/zero; exit 0 ;;
+                  *" update-ref --no-deref -d "*) exit 1 ;;
+                  *" update-ref refs/tab/checkpoints/"*)
+                    n=$(($(cat '\(made.path)' 2>/dev/null || echo 0) + 1)); echo $n > '\(made.path)'
+                    if [ $n -ge \(unsettledFrom) ]; then /usr/bin/git "$@"; head -c 5000000 /dev/zero; exit 0; fi ;;
+                esac
+                """, in: tools)
+            let id = SessionId()
+            let sessions = try AgentSessions(root: root, projectDirectory: { _ in repo.path }, checkpoints: AgentCheckpointStore(git: git),
+                                             factory: { _, _, _, callback in SkillCaptureRuntime(callback) })
+            _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+            _ = try await sessions.handle(.send(session: id, text: "Work", model: nil))
+            _ = try await waitForQueue(sessions, id) { $0.status == .idle && $0.turns?.first?.completedAt != nil }
+            sessions.shutdown()
+            let done = try await sessions.handle(.read(session: id))
+            XCTAssertNil(done.turns?.first?.checkpoint, "No checkpoint stands on a ref that may not be there")
+            let unsettled = try FileManager.default.contentsOfDirectory(at: root.appendingPathComponent("checkpoints/.unsettled"),
+                                                                        includingPropertiesForKeys: nil)
+            XCTAssertEqual(unsettled.count, 1, "\(unsettledFrom)")
+            let snapshot = try JSONDecoder().decode(AgentCheckpointStore.Snapshot.self, from: Data(contentsOf: try XCTUnwrap(unsettled.first)))
+            XCTAssertNoThrow(try repo.run("rev-parse", "--verify", snapshot.reference), "Git made it")
+
+            try restart(root)
+            XCTAssertThrowsError(try repo.run("rev-parse", "--verify", "--quiet", snapshot.reference), "Removed at the next start")
+            XCTAssertFalse(exists(try XCTUnwrap(unsettled.first)))
+        }
+    }
+
+    /// A checkpoint ref the turn couldn't use, and Git couldn't remove then, is removed
+    /// when the store next opens: a baseline whose record couldn't be saved, and a final
+    /// state whose changes couldn't be read.
+    func testARefATurnCouldntUseIsRemovedAtTheNextStart() async throws {
+        for baselineUnsaved in [true, false] {
+            let root = try root(), repo = try GitTestRepo(commit: true)
+            let tools = root.appendingPathComponent("tools")
+            try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: true)
+            // Can neither remove a checkpoint ref nor read a turn's changes.
+            let git = try AgentCheckpointTests.git("""
+                case " $* " in
+                  *" update-ref --no-deref -d "*) exit 1 ;;
+                  *" diff --numstat "*) exit 1 ;;
+                esac
+                """, in: tools)
+            let id = SessionId(), blocked = root.appendingPathComponent("checkpoints/\(id)")
+            if baselineUnsaved {
+                // Where its baseline's record would go is taken.
+                try FileManager.default.createDirectory(at: blocked.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data().write(to: blocked)
+            }
+            let sessions = try AgentSessions(root: root, projectDirectory: { _ in repo.path }, checkpoints: AgentCheckpointStore(git: git),
+                                             factory: { _, _, _, callback in SkillCaptureRuntime(callback) })
+            _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+            _ = try await sessions.handle(.send(session: id, text: "Work", model: nil))
+            _ = try await waitForQueue(sessions, id) { $0.status == .idle && $0.turns?.first?.completedAt != nil }
+            sessions.shutdown()
+            let kept = try FileManager.default.contentsOfDirectory(at: root.appendingPathComponent("checkpoints/.unsettled"),
+                                                                   includingPropertiesForKeys: nil)
+            XCTAssertEqual(kept.count, 1, "\(baselineUnsaved)")
+            let snapshot = try JSONDecoder().decode(AgentCheckpointStore.Snapshot.self, from: Data(contentsOf: try XCTUnwrap(kept.first)))
+            XCTAssertNoThrow(try repo.run("rev-parse", "--verify", snapshot.reference), "Git couldn't remove it")
+            if baselineUnsaved { try FileManager.default.removeItem(at: blocked) }
+
+            try restart(root)
+            XCTAssertThrowsError(try repo.run("rev-parse", "--verify", "--quiet", snapshot.reference), "Removed at the next start")
+            XCTAssertFalse(exists(try XCTUnwrap(kept.first)))
+        }
+    }
+
+    /// A revert runs in turn with what else changes the conversation's files: a turn
+    /// asked for while it is applied starts after it, so the revert never undoes the
+    /// turn's work, and a clear asked for meanwhile waits for it too.
+    func testARevertRunsInTurnWithTurnsAndClears() async throws {
+        let root = try root(), repo = try GitTestRepo(commit: false)
+        try repo.write("file.txt", "before\n")
+        try repo.commit("initial")
+        let directory = repo.path, tools = root.appendingPathComponent("tools")
+        try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: true)
+        let began = tools.appendingPathComponent("began"), gate = tools.appendingPathComponent("gate")
+        // Restoring a file waits for `gate`; nothing else reads blobs.
+        let git = try AgentCheckpointTests.git("""
+            for a in "$@"; do
+              if [ "$a" = cat-file ]; then touch '\(began.path)'; while [ ! -f '\(gate.path)' ]; do sleep 0.05; done; fi
+            done
+            """, in: tools)
+        let turns = TurnCounter()
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in directory }, checkpoints: AgentCheckpointStore(git: git),
+                                         factory: { _, _, _, callback in
+            SkillCaptureRuntime(callback, onSend: {
+                try "turn \(turns.next())\n".write(toFile: directory + "/file.txt", atomically: true, encoding: .utf8)
+            })
+        })
+        defer { sessions.shutdown() }
+        defer { try? Data().write(to: gate) }
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Change this file", model: nil))
+        let done = try await waitForQueue(sessions, id) { $0.status == .idle && $0.turns?.first?.checkpoint != nil }
+        let checkpoint = try XCTUnwrap(done.turns?.first?.checkpoint?.id)
+
+        let revert = Task { try await sessions.conversation(.revert(session: id, checkpoint: checkpoint, paths: nil, force: true)) }
+        try await waitUntil { FileManager.default.fileExists(atPath: began.path) }
+        let next = Task { try await sessions.handle(.send(session: id, text: "Change it again", model: nil)) }
+        // Admitted, its checkpoint queued behind the revert.
+        _ = try await waitForQueue(sessions, id) { $0.turns?.count == 2 }
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(turns.count, 1, "The next turn waits for the revert")
+        try Data().write(to: gate)
+        guard case .revert(let reply) = try await revert.value else { return XCTFail("Unexpected reply") }
+        XCTAssertEqual(reply.reverted, ["file.txt"])
+        _ = try await next.value
+        let again = try await waitForQueue(sessions, id) { $0.status == .idle && $0.turns?.count == 2 && $0.turns?.last?.checkpoint != nil }
+        XCTAssertEqual(try String(contentsOfFile: directory + "/file.txt", encoding: .utf8), "turn 2\n", "The later turn's work stays")
+
+        try FileManager.default.removeItem(at: began)
+        try FileManager.default.removeItem(at: gate)
+        let second = Task { try await sessions.conversation(.revert(session: id, checkpoint: checkpoint, paths: nil, force: true)) }
+        try await waitUntil { FileManager.default.fileExists(atPath: began.path) }
+        let waiting = DispatchSemaphore(value: 0), waited = CompletionFlag()
+        sessions.clearStep = { step in if step == .waiting { waiting.signal() } else { waited.set() } }
+        let clearing = Task { try await sessions.handle(.clear(session: id, archive: SessionId(), expectedRevision: again.revision)) }
+        XCTAssertEqual(waiting.wait(timeout: .now() + 10), .success, "The clear waits for the conversation's checkpoints")
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertFalse(waited.isSet, "A clear waits for the revert being applied")
+        try Data().write(to: gate)
+        _ = try await second.value
+        // The revert's notice changed the conversation the clear was asked for.
+        do {
+            _ = try await clearing.value
+            XCTFail("The clear sees the conversation the revert changed")
+        } catch {
+            XCTAssertEqual((error as? AgentRuntimeError)?.message, "The conversation changed. Review it before clearing.")
+        }
+        let after = try await sessions.handle(.read(session: id))
+        XCTAssertTrue(after.items.contains { $0.text == "Reverted 1 file to before a turn." && $0.kind == .notice })
+    }
+
+    /// No revert is admitted while an agent works, in the foreground or the background: it
+    /// may be changing the same files.
+    func testARevertIsRefusedWhileTheAgentWorks() async throws {
+        let root = try root(), repo = try GitTestRepo(commit: false)
+        try repo.write("file.txt", "before\n")
+        try repo.commit("initial")
+        let directory = repo.path, turns = TurnCounter(), box = AgentRuntimeBox()
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in directory }, factory: { _, _, _, callback in
+            let runtime = FakeAgentRuntime(callback)
+            runtime.onSend = {
+                // The first turn ends; later ones keep working.
+                guard turns.next() == 1 else { return }
+                try "after\n".write(toFile: directory + "/file.txt", atomically: true, encoding: .utf8)
+                callback(.status(.idle))
+            }
+            box.install(runtime)
+            return runtime
+        })
+        defer { sessions.shutdown() }
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Change this file", model: nil))
+        let done = try await waitForQueue(sessions, id) { $0.status == .idle && $0.turns?.first?.checkpoint != nil }
+        let checkpoint = try XCTUnwrap(done.turns?.first?.checkpoint?.id)
+        func assertRefused(_ reason: String) async {
+            do {
+                _ = try await sessions.conversation(.revert(session: id, checkpoint: checkpoint, paths: nil, force: true))
+                XCTFail("Refused while \(reason)")
+            } catch {
+                XCTAssertEqual((error as? ServiceError)?.message, "Stop active work before reverting.", reason)
+            }
+            XCTAssertEqual(try? String(contentsOfFile: directory + "/file.txt", encoding: .utf8), "after\n", reason)
+        }
+
+        // The turn ended, but an agent it started works on in the background.
+        box.runtime?.callback(.subagents([AgentSubagent(id: "a1", toolUseID: "task", description: "Edit in the background", background: true)]))
+        _ = try await waitForQueue(sessions, id) { $0.subagents?.first?.status == .running }
+        await assertRefused("a background agent works")
+        box.runtime?.callback(.subagents([AgentSubagent(id: "a1", toolUseID: "task", description: "Edit in the background",
+                                                        background: true, status: .completed)]))
+        _ = try await waitForQueue(sessions, id) { $0.subagents?.first?.status == .completed }
+
+        _ = try await sessions.handle(.send(session: id, text: "Keep working", model: nil))
+        _ = try await waitForQueue(sessions, id) { $0.status == .working }
+        await assertRefused("the agent works")
+    }
+
+    /// A message's files are written when it is admitted, so a clear asked for after it
+    /// was stopped, before its turn could start, archives them whole.
+    func testAStoppedMessagesFilesAreArchivedWhole() async throws {
+        let root = try root(), gate = root.appendingPathComponent("gate")
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: { _, _, _, callback in
+            let runtime = FakeAgentRuntime(callback)
+            // The provider takes its first settings slowly, holding the turn before it starts.
+            runtime.onAccess = { _ in
+                while !FileManager.default.fileExists(atPath: gate.path) { try await Task.sleep(for: .milliseconds(20)) }
+            }
+            return runtime
+        })
+        defer { sessions.shutdown() }
+        defer { try? Data().write(to: gate) }
+        let id = SessionId(), archive = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        let notes = AgentChatAttachment(id: "notes", name: "notes.txt", mimeType: "text/plain", data: Data("Notes".utf8))
+        let sending = Task { try await sessions.handle(.send(session: id, text: "Read this", model: nil, attachments: [notes])) }
+        let admitted = try await waitForQueue(sessions, id) { $0.items.contains { $0.kind == .user && $0.attachments?.isEmpty == false } }
+        let item = try XCTUnwrap(admitted.items.first { $0.kind == .user }?.id)
+        _ = try await sessions.handle(.interrupt(session: id))
+        let stopped = try await waitForQueue(sessions, id) { $0.status == .idle }
+        _ = try await sessions.handle(.clear(session: id, archive: archive, expectedRevision: stopped.revision))
+        try Data().write(to: gate)
+        _ = try? await sending.value
+        let kept = try await sessions.attachment(AgentAttachmentRequest(session: archive, item: item, attachment: "notes"))
+        XCTAssertEqual(kept.attachment.data, Data("Notes".utf8))
+    }
+
+    /// A revert admitted before a message is queued before the message's checkpoint, so
+    /// the message's turn starts after the revert, however the two interleave.
+    func testARevertAdmittedBeforeAMessageIsAppliedFirst() async throws {
+        let root = try root(), repo = try GitTestRepo(commit: false)
+        try repo.write("file.txt", "before\n")
+        try repo.commit("initial")
+        let directory = repo.path, tools = root.appendingPathComponent("tools")
+        try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: true)
+        let began = tools.appendingPathComponent("began"), gate = tools.appendingPathComponent("gate")
+        let count = tools.appendingPathComponent("count")
+        // Restoring a file waits for `gate`; nothing else reads blobs. Each checkpoint taken is counted.
+        let git = try AgentCheckpointTests.git("""
+            for a in "$@"; do
+              if [ "$a" = write-tree ]; then n=$(($(cat '\(count.path)' 2>/dev/null || echo 0) + 1)); echo $n > '\(count.path)'; fi
+              if [ "$a" = cat-file ]; then touch '\(began.path)'; while [ ! -f '\(gate.path)' ]; do sleep 0.05; done; fi
+            done
+            """, in: tools)
+        func checkpointsTaken() -> Int {
+            Int(((try? String(contentsOf: count, encoding: .utf8)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+        }
+        let turns = TurnCounter()
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in directory }, checkpoints: AgentCheckpointStore(git: git),
+                                         factory: { _, _, _, callback in
+            SkillCaptureRuntime(callback, onSend: {
+                try "turn \(turns.next())\n".write(toFile: directory + "/file.txt", atomically: true, encoding: .utf8)
+            })
+        })
+        let admitted = DispatchSemaphore(value: 0), proceed = DispatchSemaphore(value: 0)
+        defer { sessions.shutdown() }
+        defer { proceed.signal(); try? Data().write(to: gate) }
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Change this file", model: nil))
+        let done = try await waitForQueue(sessions, id) { $0.status == .idle && $0.turns?.first?.checkpoint != nil }
+        let checkpoint = try XCTUnwrap(done.turns?.first?.checkpoint?.id)
+
+        let held = CompletionFlag()
+        sessions.revertAdmitted = { [weak sessions] in
+            // Admitted and queued in one step on the sessions queue: nothing is admitted between.
+            if sessions?.onSessionsQueue == true { held.set() }
+            admitted.signal(); proceed.wait()
+        }
+        let revert = Task { try await sessions.conversation(.revert(session: id, checkpoint: checkpoint, paths: nil, force: true)) }
+        XCTAssertEqual(admitted.wait(timeout: .now() + 10), .success)
+        XCTAssertTrue(held.isSet, "Held between admission and queueing on the sessions queue")
+        // Asked for while the revert is admitted but not yet queued: were the message admitted
+        // meanwhile, its checkpoint would be taken before the revert is queued at all.
+        let taken = checkpointsTaken()
+        let next = Task { try await sessions.handle(.send(session: id, text: "Change it again", model: nil)) }
+        for _ in 0..<50 where checkpointsTaken() == taken { try await Task.sleep(for: .milliseconds(20)) }
+        proceed.signal()
+        try await waitUntil { FileManager.default.fileExists(atPath: began.path) }
+        _ = try await waitForQueue(sessions, id) { $0.turns?.count == 2 }
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(turns.count, 1, "The message's turn waits for the revert")
+        try Data().write(to: gate)
+        guard case .revert(let reply) = try await revert.value else { return XCTFail("Unexpected reply") }
+        XCTAssertEqual(reply.reverted, ["file.txt"])
+        _ = try await next.value
+        _ = try await waitForQueue(sessions, id) { $0.status == .idle && $0.turns?.count == 2 }
+        XCTAssertEqual(try String(contentsOfFile: directory + "/file.txt", encoding: .utf8), "turn 2\n", "The later turn's work stays")
+    }
+
+    /// A conversation closed while its provider still stops takes no revert until it has:
+    /// the provider may still change files.
+    func testARevertWaitsForAClosedConversationsProviderToStop() async throws {
+        let root = try root(), repo = try GitTestRepo(commit: false), gate = root.appendingPathComponent("gate")
+        try repo.write("file.txt", "before\n")
+        try repo.commit("initial")
+        let directory = repo.path, stopping = DispatchSemaphore(value: 0)
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in directory }, factory: { _, _, _, callback in
+            let runtime = FakeAgentRuntime(callback)
+            runtime.folder = AgentFolder(directory)
+            runtime.onSend = {
+                try "after\n".write(toFile: directory + "/file.txt", atomically: true, encoding: .utf8)
+                callback(.status(.idle))
+            }
+            runtime.onStop = {
+                stopping.signal()
+                while !FileManager.default.fileExists(atPath: gate.path) { Thread.sleep(forTimeInterval: 0.02) }
+            }
+            return runtime
+        })
+        defer { sessions.shutdown() }
+        defer { try? Data().write(to: gate) }
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Change this file", model: nil))
+        let done = try await waitForQueue(sessions, id) { $0.status == .idle && $0.turns?.first?.checkpoint != nil }
+        let checkpoint = try XCTUnwrap(done.turns?.first?.checkpoint?.id)
+        _ = try await sessions.handle(.close(session: id))
+        XCTAssertEqual(stopping.wait(timeout: .now() + 10), .success)
+        do {
+            _ = try await sessions.conversation(.revert(session: id, checkpoint: checkpoint, paths: nil, force: true))
+            XCTFail("No revert while the provider stops")
+        } catch {
+            XCTAssertEqual((error as? AgentRuntimeError)?.message, "The agent is still stopping. Try again shortly.")
+        }
+        XCTAssertEqual(try String(contentsOfFile: directory + "/file.txt", encoding: .utf8), "after\n")
+        // Cleared meanwhile, its archive keeps the checkpoint, which waits for the provider too.
+        let closed = try await sessions.handle(.read(session: id))
+        let archive = SessionId()
+        _ = try await sessions.handle(.clear(session: id, archive: archive, expectedRevision: closed.revision))
+        do {
+            _ = try await sessions.conversation(.revert(session: archive, checkpoint: checkpoint, paths: nil, force: true))
+            XCTFail("No revert from the archive while the provider stops")
+        } catch {
+            XCTAssertEqual((error as? AgentRuntimeError)?.message, "The agent is still stopping. Try again shortly.")
+        }
+        XCTAssertEqual(try String(contentsOfFile: directory + "/file.txt", encoding: .utf8), "after\n")
+        try Data().write(to: gate)
+        var reverted: AgentRevertReply?
+        for _ in 0..<200 where reverted == nil {
+            if case .revert(let reply)? = try? await sessions.conversation(.revert(session: archive, checkpoint: checkpoint, paths: nil, force: true)) {
+                reverted = reply
+            } else { try await Task.sleep(for: .milliseconds(20)) }
+        }
+        XCTAssertEqual(reverted?.reverted, ["file.txt"], "Once it stopped")
+    }
+
+    /// A provider whose own replaced process still exits, as Claude's after a stop, takes
+    /// no revert meanwhile either.
+    func testARevertWaitsForAProcessTheProviderReplaced() async throws {
+        let root = try root(), repo = try GitTestRepo(commit: false)
+        try repo.write("file.txt", "before\n")
+        try repo.commit("initial")
+        let directory = repo.path, box = AgentRuntimeBox()
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in directory }, factory: { _, _, _, callback in
+            let runtime = FakeAgentRuntime(callback)
+            runtime.folder = AgentFolder(directory)
+            runtime.onSend = {
+                try "after\n".write(toFile: directory + "/file.txt", atomically: true, encoding: .utf8)
+                callback(.status(.idle))
+            }
+            box.install(runtime)
+            return runtime
+        })
+        defer { sessions.shutdown() }
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Change this file", model: nil))
+        let done = try await waitForQueue(sessions, id) { $0.status == .idle && $0.turns?.first?.checkpoint != nil }
+        let checkpoint = try XCTUnwrap(done.turns?.first?.checkpoint?.id)
+        let runtime = try XCTUnwrap(box.runtime)
+        runtime.exiting = true
+        do {
+            _ = try await sessions.conversation(.revert(session: id, checkpoint: checkpoint, paths: nil, force: true))
+            XCTFail("No revert while a replaced process exits")
+        } catch {
+            XCTAssertEqual((error as? AgentRuntimeError)?.message, "The agent is still stopping. Try again shortly.")
+        }
+        runtime.exiting = false
+        guard case .revert(let reply) = try await sessions.conversation(.revert(session: id, checkpoint: checkpoint, paths: nil, force: true)) else {
+            return XCTFail("Unexpected reply")
+        }
+        XCTAssertEqual(reply.reverted, ["file.txt"])
+    }
+
+    /// Another conversation's provider process still exiting in the same folder, however
+    /// that folder is spelled, holds a revert there too: it may still change its files.
+    func testARevertWaitsForAnyProcessStillExitingInItsFolder() async throws {
+        let root = try root(), repo = try GitTestRepo(commit: false)
+        try repo.write("file.txt", "before\n")
+        try repo.commit("initial")
+        let link = root.appendingPathComponent("linked-project")
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: repo.path)
+        let projectA = ProjectId(), projectB = ProjectId(), box = AgentRuntimeBox()
+        let sessions = try AgentSessions(root: root, projectDirectory: { $0 == projectA ? link.path : repo.path }, factory: { _, directory, _, callback in
+            let runtime = FakeAgentRuntime(callback)
+            runtime.folder = AgentFolder(directory)
+            runtime.onSend = {
+                try "after \(directory)\n".write(toFile: repo.path + "/file.txt", atomically: true, encoding: .utf8)
+                callback(.status(.idle))
+            }
+            if directory == link.path { box.install(runtime) }
+            return runtime
+        })
+        defer { sessions.shutdown() }
+        let a = SessionId(), b = SessionId()
+        _ = try await sessions.handle(.create(session: a, project: projectA, provider: .claude))
+        _ = try await sessions.handle(.create(session: b, project: projectB, provider: .claude))
+        _ = try await sessions.handle(.send(session: b, text: "Change this file", model: nil))
+        let done = try await waitForQueue(sessions, b) { $0.status == .idle && $0.turns?.first?.checkpoint != nil }
+        let checkpoint = try XCTUnwrap(done.turns?.first?.checkpoint?.id)
+        _ = try await sessions.handle(.send(session: a, text: "Work here too", model: nil))
+        _ = try await waitForQueue(sessions, a) { $0.status == .idle }
+        let other = try XCTUnwrap(box.runtime)
+        other.exiting = true
+        do {
+            _ = try await sessions.conversation(.revert(session: b, checkpoint: checkpoint, paths: nil, force: true))
+            XCTFail("No revert while another conversation's process exits in the folder")
+        } catch {
+            XCTAssertEqual((error as? AgentRuntimeError)?.message, "The agent is still stopping. Try again shortly.")
+        }
+        other.exiting = false
+        guard case .revert(let reply) = try await sessions.conversation(.revert(session: b, checkpoint: checkpoint, paths: nil, force: true)) else {
+            return XCTFail("Unexpected reply")
+        }
+        XCTAssertEqual(reply.reverted, ["file.txt"])
+    }
+
+    /// The host's callbacks run off the conversations' queue, in order, so one may call back
+    /// into them, even to shut them down.
+    func testCallbacksMayCallBackIntoTheConversations() async throws {
+        let root = try root()
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: { _, _, _, callback in
+            let runtime = FakeAgentRuntime(callback)
+            runtime.onSend = { callback(.status(.idle)) }
+            return runtime
+        })
+        defer { sessions.shutdown() }
+        let changed = CompletionFlag(), armed = CompletionFlag(), stopped = CompletionFlag()
+        sessions.activityChanged = { [weak sessions] _, _ in
+            guard let sessions else { return }
+            guard !sessions.onSessionsQueue else { return XCTFail("Called on the conversations' queue") }
+            _ = sessions.hasSessions
+            guard armed.isSet, !stopped.isSet else { return }
+            sessions.shutdown()
+            stopped.set()
+        }
+        sessions.changed = { [weak sessions] _, _ in
+            guard let sessions else { return }
+            guard !sessions.onSessionsQueue else { return XCTFail("Called on the conversations' queue") }
+            _ = sessions.hasSessions
+            changed.set()
+        }
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Hello", model: nil))
+        for _ in 0..<500 where !changed.isSet { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertTrue(changed.isSet)
+        armed.set()
+        sessions.publishActivity()
+        XCTAssertTrue(stopped.isSet, "Shut down from its own callback")
+    }
+
+    /// Publishing activity returns only once the callbacks it queued have run.
+    func testPublishingActivityWaitsForItsCallbacks() async throws {
+        let root = try root()
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: { _, _, _, callback in FakeAgentRuntime(callback) })
+        defer { sessions.shutdown() }
+        _ = try await sessions.handle(.create(session: SessionId(), project: ProjectId(), provider: .claude))
+        let held = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), holding = CompletionFlag()
+        sessions.activityChanged = { _, _ in
+            guard !holding.isSet else { return }
+            holding.set()
+            held.signal()
+            release.wait()
+        }
+        let published = CompletionFlag(), done = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            sessions.publishActivity()
+            published.set()
+            done.signal()
+        }
+        defer { release.signal(); XCTAssertEqual(done.wait(timeout: .now() + 10), .success) }
+        XCTAssertEqual(held.wait(timeout: .now() + 10), .success)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertFalse(published.isSet, "Returned while its callback still ran")
+    }
+
+    /// Shutdown returns once the callbacks already queued have run, so none runs after it.
+    func testShutdownWaitsForTheCallbacksAlreadyQueued() async throws {
+        let root = try root()
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: { _, _, _, callback in FakeAgentRuntime(callback) })
+        let held = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), holding = CompletionFlag()
+        sessions.changed = { _, _ in
+            guard !holding.isSet else { return }
+            holding.set()
+            held.signal()
+            release.wait()
+        }
+        _ = try await sessions.handle(.create(session: SessionId(), project: ProjectId(), provider: .claude))
+        XCTAssertEqual(held.wait(timeout: .now() + 10), .success)
+        let returned = CompletionFlag(), done = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            sessions.shutdown()
+            returned.set()
+            done.signal()
+        }
+        defer { release.signal(); XCTAssertEqual(done.wait(timeout: .now() + 10), .success) }
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertFalse(returned.isSet, "Returned while a queued callback still ran")
+    }
+
+    /// Another conversation's provider whose folder was moved into the project since it
+    /// launched holds a revert there while it stops: where it works now is asked.
+    func testARevertWaitsForAProviderStoppingInAFolderMovedIntoItsProject() async throws {
+        let root = try root(), repo = try GitTestRepo(commit: false)
+        try repo.write("file.txt", "before\n")
+        try repo.commit("initial")
+        let outside = root.appendingPathComponent("outside")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        // The other conversation's provider process, working outside the project.
+        let worker = Process()
+        worker.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        worker.arguments = ["60"]
+        worker.currentDirectoryURL = outside
+        try worker.run()
+        defer { worker.terminate(); worker.waitUntilExit() }
+        let projectA = ProjectId(), projectB = ProjectId(), box = AgentRuntimeBox()
+        let sessions = try AgentSessions(root: root, projectDirectory: { $0 == projectA ? outside.path : repo.path }, factory: { _, directory, _, callback in
+            let runtime = FakeAgentRuntime(callback)
+            runtime.folder = AgentFolder(directory)
+            runtime.onSend = {
+                if directory == repo.path { try "after\n".write(toFile: repo.path + "/file.txt", atomically: true, encoding: .utf8) }
+                callback(.status(.idle))
+            }
+            if directory == outside.path {
+                runtime.processes = [worker.processIdentifier]
+                box.install(runtime)
+            }
+            return runtime
+        })
+        defer { sessions.shutdown() }
+        let a = SessionId(), b = SessionId()
+        _ = try await sessions.handle(.create(session: a, project: projectA, provider: .claude))
+        _ = try await sessions.handle(.create(session: b, project: projectB, provider: .claude))
+        _ = try await sessions.handle(.send(session: b, text: "Change this file", model: nil))
+        let done = try await waitForQueue(sessions, b) { $0.status == .idle && $0.turns?.first?.checkpoint != nil }
+        let checkpoint = try XCTUnwrap(done.turns?.first?.checkpoint?.id)
+        _ = try await sessions.handle(.send(session: a, text: "Work there", model: nil))
+        _ = try await waitForQueue(sessions, a) { $0.status == .idle }
+        let other = try XCTUnwrap(box.runtime)
+        try FileManager.default.moveItem(at: outside, to: URL(fileURLWithPath: repo.path).appendingPathComponent("moved"))
+        other.exiting = true
+        do {
+            _ = try await sessions.conversation(.revert(session: b, checkpoint: checkpoint, paths: nil, force: true))
+            XCTFail("No revert while a provider stops in a folder moved into the project")
+        } catch {
+            XCTAssertEqual((error as? AgentRuntimeError)?.message, "The agent is still stopping. Try again shortly.")
+        }
+        XCTAssertEqual(try String(contentsOfFile: repo.path + "/file.txt", encoding: .utf8), "after\n")
+        other.exiting = false
+        guard case .revert(let reply) = try await sessions.conversation(.revert(session: b, checkpoint: checkpoint, paths: nil, force: true)) else {
+            return XCTFail("Unexpected reply")
+        }
+        XCTAssertEqual(reply.reverted, ["file.txt"])
+    }
+
+    /// A provider started outside the conversations, as for discovery, holds a revert while
+    /// it may still change files the revert restores, as in a folder inside the project.
+    func testARevertWaitsForADiscoveryProviderInItsFolder() async throws {
+        let root = try root(), repo = try GitTestRepo(commit: false)
+        try repo.write("file.txt", "before\n")
+        try repo.commit("initial")
+        let directory = repo.path, inner = repo.path + "/inner"
+        try FileManager.default.createDirectory(atPath: inner, withIntermediateDirectories: true)
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in directory }, factory: { _, _, _, callback in
+            SkillCaptureRuntime(callback, onSend: { try "after\n".write(toFile: directory + "/file.txt", atomically: true, encoding: .utf8) })
+        })
+        defer { sessions.shutdown() }
+        let discovering = CompletionFlag(), folder = AgentFolder(inner)
+        sessions.otherProvidersMayRun = { $0.holds(folder) && !discovering.isSet }
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Change this file", model: nil))
+        let done = try await waitForQueue(sessions, id) { $0.status == .idle && $0.turns?.first?.checkpoint != nil }
+        let checkpoint = try XCTUnwrap(done.turns?.first?.checkpoint?.id)
+        do {
+            _ = try await sessions.conversation(.revert(session: id, checkpoint: checkpoint, paths: nil, force: true))
+            XCTFail("No revert while a discovery provider may run in the folder")
+        } catch {
+            XCTAssertEqual((error as? AgentRuntimeError)?.message, "The agent is still stopping. Try again shortly.")
+        }
+        discovering.set()
+        guard case .revert(let reply) = try await sessions.conversation(.revert(session: id, checkpoint: checkpoint, paths: nil, force: true)) else {
+            return XCTFail("Unexpected reply")
+        }
+        XCTAssertEqual(reply.reverted, ["file.txt"])
+    }
+
+    /// A follow-up the user stopped after it may have reached the agent is reported as it
+    /// failed, not as never sent, and isn't sent again.
+    func testAFollowUpStoppedAfterHandOverIsReportedAsItFailed() async throws {
+        let root = try root(), gate = root.appendingPathComponent("gate"), steering = DispatchSemaphore(value: 0)
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: { _, _, _, callback in
+            let runtime = FakeAgentRuntime(callback)
+            // The agent took the follow-up, but never said so.
+            runtime.onSteer = {
+                steering.signal()
+                while !FileManager.default.fileExists(atPath: gate.path) { try await Task.sleep(for: .milliseconds(20)) }
+                throw AgentRuntimeError("The agent didn't acknowledge the message.")
+            }
+            return runtime
+        })
+        defer { sessions.shutdown() }
+        defer { try? Data().write(to: gate) }
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Work", model: nil))
+        _ = try await waitForQueue(sessions, id) { $0.status == .working }
+        let followUp = Task { try await sessions.handle(.send(session: id, text: "And this", model: nil)) }
+        XCTAssertEqual(steering.wait(timeout: .now() + 10), .success)
+        _ = try await sessions.handle(.interrupt(session: id))
+        _ = try await waitForQueue(sessions, id) { $0.status == .idle }
+        try Data().write(to: gate)
+        do {
+            _ = try await followUp.value
+            XCTFail("The follow-up failed")
+        } catch {
+            XCTAssertEqual((error as? AgentRuntimeError)?.message, "The agent didn't acknowledge the message.", "\(error)")
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        let after = try await sessions.handle(.read(session: id))
+        XCTAssertEqual(after.turns?.count, 1, "Not sent again")
+    }
+
+    /// A follow-up the user stopped never joins a turn the agent starts on its own later:
+    /// its hand-over was cancelled, whenever it comes to be handed over.
+    func testAStoppedFollowUpJoinsNoLaterTurn() async throws {
+        let root = try root(), writer = DispatchQueue(label: "writer"), steered = TurnCounter(), box = AgentRuntimeBox()
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, writer: writer, factory: { _, _, _, callback in
+            let runtime = FakeAgentRuntime(callback)
+            runtime.onSteer = { _ = steered.next() }
+            box.install(runtime)
+            return runtime
+        })
+        defer { sessions.shutdown() }
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Work", model: nil))
+        _ = try await waitForQueue(sessions, id) { $0.status == .working }
+        writer.suspend()
+        var suspended = true
+        defer { if suspended { writer.resume() } }
+        let admitted = DispatchSemaphore(value: 0)
+        sessions.followUpAdmitted = { admitted.signal() }
+        let file = AgentChatAttachment(id: "notes", name: "notes.txt", mimeType: "text/plain", data: Data("Notes".utf8))
+        let followUp = Task { try await sessions.handle(.send(session: id, text: "And this", model: nil, attachments: [file])) }
+        XCTAssertEqual(admitted.wait(timeout: .now() + 10), .success)
+        _ = try await sessions.handle(.interrupt(session: id))
+        _ = try await waitForQueue(sessions, id) { $0.status == .idle }
+        // The agent starts a turn of its own, as Claude does to answer a background agent.
+        box.runtime?.callback(.status(.working))
+        _ = try await waitForQueue(sessions, id) { $0.status == .working }
+        writer.resume()
+        suspended = false
+        do {
+            _ = try await followUp.value
+            XCTFail("The stopped follow-up isn't delivered")
+        } catch {
+            XCTAssertTrue(error is AgentDeliveryNotStarted, "\(error)")
+        }
+        XCTAssertEqual(steered.count, 0, "Never handed to the agent")
+    }
+
+    /// A follow-up whose turn the provider ends by closing, as Codex can when stopped while
+    /// compacting, is answered as never sent, not as delivered: a queued one stays queued.
+    func testAFollowUpWhoseTurnClosesIsNotCountedDelivered() async throws {
+        let root = try root(), writer = DispatchQueue(label: "writer")
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, writer: writer, factory: { _, _, _, callback in
+            let runtime = FakeAgentRuntime(callback)
+            runtime.onSteer = {}
+            runtime.onInterrupt = { callback(.status(.closed)) }
+            return runtime
+        })
+        defer { sessions.shutdown() }
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .codex))
+        _ = try await sessions.handle(.send(session: id, text: "Work", model: nil))
+        _ = try await waitForQueue(sessions, id) { $0.status == .working }
+        writer.suspend()
+        var suspended = true
+        defer { if suspended { writer.resume() } }
+        let admitted = DispatchSemaphore(value: 0)
+        sessions.followUpAdmitted = { admitted.signal() }
+        let file = AgentChatAttachment(id: "notes", name: "notes.txt", mimeType: "text/plain", data: Data("Notes".utf8))
+        let followUp = Task { try await sessions.handle(.send(session: id, text: "And this", model: nil, attachments: [file])) }
+        XCTAssertEqual(admitted.wait(timeout: .now() + 10), .success)
+        _ = try await sessions.handle(.interrupt(session: id))
+        do {
+            _ = try await followUp.value
+            XCTFail("Not delivered")
+        } catch {
+            XCTAssertTrue(error is AgentDeliveryNotStarted, "\(error)")
+        }
+        writer.resume()
+        suspended = false
+    }
+
+    /// A follow-up the user stopped just as it reached the provider's hand-over never
+    /// joins a turn the agent starts on its own afterwards.
+    func testAFollowUpStoppedAtItsHandOverJoinsNoLaterTurn() async throws {
+        let root = try root(), gate = root.appendingPathComponent("gate"), steered = TurnCounter(), box = AgentRuntimeBox()
+        let entered = DispatchSemaphore(value: 0)
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: { _, _, _, callback in
+            let runtime = FakeAgentRuntime(callback)
+            runtime.onSteer = { _ = steered.next() }
+            runtime.onSteerEntered = {
+                entered.signal()
+                while !FileManager.default.fileExists(atPath: gate.path), !Task.isCancelled { try? await Task.sleep(for: .milliseconds(20)) }
+            }
+            box.install(runtime)
+            return runtime
+        })
+        defer { sessions.shutdown() }
+        defer { try? Data().write(to: gate) }
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Work", model: nil))
+        _ = try await waitForQueue(sessions, id) { $0.status == .working }
+        let followUp = Task { try await sessions.handle(.send(session: id, text: "And this", model: nil)) }
+        XCTAssertEqual(entered.wait(timeout: .now() + 10), .success, "At its hand-over")
+        _ = try await sessions.handle(.interrupt(session: id))
+        _ = try await waitForQueue(sessions, id) { $0.status == .idle }
+        box.runtime?.callback(.status(.working))
+        _ = try await waitForQueue(sessions, id) { $0.status == .working }
+        try Data().write(to: gate)
+        do {
+            _ = try await followUp.value
+            XCTFail("The stopped follow-up isn't delivered")
+        } catch {
+            XCTAssertTrue(error is AgentDeliveryNotStarted, "\(error)")
+        }
+        XCTAssertEqual(steered.count, 0, "Never handed to the agent")
+    }
+
+    /// A conversation closed while its provider starts tells the provider to launch nothing
+    /// more, before a revert can look for it.
+    func testClosingTellsTheProviderToLaunchNothingMore() async throws {
+        let root = try root(), box = AgentRuntimeBox()
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: { _, _, _, callback in
+            let runtime = FakeAgentRuntime(callback)
+            box.install(runtime)
+            return runtime
+        })
+        defer { sessions.shutdown() }
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Work", model: nil))
+        let runtime = try XCTUnwrap(box.runtime)
+        XCTAssertFalse(runtime.launchesRefused)
+        _ = try await sessions.handle(.close(session: id))
+        XCTAssertTrue(runtime.launchesRefused)
+    }
+
+    /// A follow-up stopped while its files were written never reaches the agent, nor
+    /// starts a turn of its own once the stopped one ends.
+    func testAFollowUpStoppedBeforeItsFilesAreWrittenIsNotDelivered() async throws {
+        let root = try root(), writer = DispatchQueue(label: "writer"), steered = TurnCounter()
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, writer: writer, factory: { _, _, _, callback in
+            let runtime = FakeAgentRuntime(callback)
+            runtime.onSteer = { _ = steered.next() }
+            return runtime
+        })
+        defer { sessions.shutdown() }
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Work", model: nil))
+        _ = try await waitForQueue(sessions, id) { $0.status == .working }
+        writer.suspend()
+        var suspended = true
+        defer { if suspended { writer.resume() } }
+        let file = AgentChatAttachment(id: "notes", name: "notes.txt", mimeType: "text/plain", data: Data("Notes".utf8))
+        let admitted = DispatchSemaphore(value: 0)
+        sessions.followUpAdmitted = { admitted.signal() }
+        let followUp = Task { try await sessions.handle(.send(session: id, text: "And this", model: nil, attachments: [file])) }
+        XCTAssertEqual(admitted.wait(timeout: .now() + 10), .success, "Stopped only once the follow-up is admitted")
+        _ = try await sessions.handle(.interrupt(session: id))
+        _ = try await waitForQueue(sessions, id) { $0.status == .idle }
+        writer.resume()
+        suspended = false
+        do {
+            _ = try await followUp.value
+            XCTFail("The stopped follow-up isn't delivered")
+        } catch {
+            XCTAssertTrue(error is AgentDeliveryNotStarted, "\(error)")
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        let after = try await sessions.handle(.read(session: id))
+        XCTAssertEqual(steered.count, 0, "Never handed to the agent")
+        XCTAssertEqual(after.turns?.count, 1, "Nor a turn of its own")
+    }
+
+    /// A follow-up handed over just as the user stops the turn, which then ends before the
+    /// agent takes it, isn't sent again as a turn of its own.
+    func testAFollowUpStoppedAsItIsHandedOverStartsNoTurn() async throws {
+        let root = try root(), gate = root.appendingPathComponent("gate"), steering = DispatchSemaphore(value: 0)
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: { _, _, _, callback in
+            let runtime = FakeAgentRuntime(callback)
+            // The agent's turn ends before it takes the follow-up.
+            runtime.onSteer = {
+                steering.signal()
+                while !FileManager.default.fileExists(atPath: gate.path) { try await Task.sleep(for: .milliseconds(20)) }
+                throw AgentTurnFinishedError()
+            }
+            return runtime
+        })
+        defer { sessions.shutdown() }
+        defer { try? Data().write(to: gate) }
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Work", model: nil))
+        _ = try await waitForQueue(sessions, id) { $0.status == .working }
+        let followUp = Task { try await sessions.handle(.send(session: id, text: "And this", model: nil)) }
+        XCTAssertEqual(steering.wait(timeout: .now() + 10), .success)
+        _ = try await sessions.handle(.interrupt(session: id))
+        _ = try await waitForQueue(sessions, id) { $0.status == .idle }
+        try Data().write(to: gate)
+        do {
+            _ = try await followUp.value
+            XCTFail("The stopped follow-up isn't sent again")
+        } catch {
+            XCTAssertTrue(error is AgentDeliveryNotStarted, "\(error)")
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        let after = try await sessions.handle(.read(session: id))
+        XCTAssertEqual(after.turns?.count, 1, "No turn of its own")
+    }
+
+    /// An import never answers with a conversation being cleared, which is about to lose
+    /// what it would have continued.
+    func testAnImportIsNotAnsweredWithAConversationBeingCleared() async throws {
+        let root = try root(), writer = DispatchQueue(label: "writer")
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, writer: writer,
+                                         factory: { _, _, _, callback in FakeAgentRuntime(callback) })
+        defer { sessions.shutdown() }
+        let project = ProjectId(), first = SessionId()
+        let saved = AgentHistoryTranscript(items: [AgentChatItem(id: "u1", kind: .user, text: "Earlier work")])
+        let continued = try await sessions.importHistory(AgentHistoryImport(session: first, project: project, provider: .codex,
+                                                                            providerSession: "thread-1")) { _ in saved }
+        writer.sync {}
+        writer.suspend()
+        var suspended = true
+        defer { if suspended { writer.resume() } }
+        let clearing = Task { try await sessions.handle(.clear(session: first, archive: SessionId(), expectedRevision: continued.revision)) }
+        let clearingMessage = "The conversation is being cleared. Try again shortly."
+        var refusal: String?
+        for _ in 0..<500 where refusal != clearingMessage {
+            do {
+                _ = try await sessions.importHistory(AgentHistoryImport(session: SessionId(), project: project, provider: .codex,
+                                                                        providerSession: "thread-1")) { _ in saved }
+            } catch { refusal = (error as? AgentRuntimeError)?.message }
+            if refusal != clearingMessage { try await Task.sleep(for: .milliseconds(10)) }
+        }
+        XCTAssertEqual(refusal, clearingMessage, "Refused rather than answered with the conversation being cleared")
+        writer.resume()
+        suspended = false
+        _ = try await clearing.value
+    }
+
+    /// A clear that waited for the conversation's checkpoints while a revert was admitted
+    /// behind it is refused, rather than clearing the conversation under the revert.
+    func testAClearIsRefusedWhileARevertWaitsToBeApplied() async throws {
+        let root = try root(), repo = try GitTestRepo(commit: false)
+        try repo.write("file.txt", "before\n")
+        try repo.commit("initial")
+        let directory = repo.path, tools = root.appendingPathComponent("tools")
+        try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: true)
+        let restoring = tools.appendingPathComponent("restoring"), restored = tools.appendingPathComponent("restored")
+        // Restoring a file waits for `restored`.
+        let git = try AgentCheckpointTests.git("""
+            for a in "$@"; do
+              if [ "$a" = cat-file ]; then touch '\(restoring.path)'; while [ ! -f '\(restored.path)' ]; do sleep 0.05; done; fi
+            done
+            """, in: tools)
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in directory }, checkpoints: AgentCheckpointStore(git: git),
+                                         factory: { _, _, _, callback in
+            SkillCaptureRuntime(callback, onSend: { try "after\n".write(toFile: directory + "/file.txt", atomically: true, encoding: .utf8) })
+        })
+        let waited = DispatchSemaphore(value: 0), proceed = CompletionFlag()
+        defer { sessions.shutdown() }
+        defer { proceed.set(); try? Data().write(to: restored) }
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Change this file", model: nil))
+        let done = try await waitForQueue(sessions, id) { $0.status == .idle && $0.turns?.first?.checkpoint != nil }
+        sessions.clearStep = { step in
+            guard step == .waited else { return }
+            waited.signal()
+            while !proceed.isSet { try? await Task.sleep(for: .milliseconds(10)) }
+        }
+        let clearing = Task { try await sessions.handle(.clear(session: id, archive: SessionId(), expectedRevision: done.revision)) }
+        XCTAssertEqual(waited.wait(timeout: .now() + 10), .success, "The clear waited for the checkpoints")
+        let revert = Task {
+            try await sessions.conversation(.revert(session: id, checkpoint: try XCTUnwrap(done.turns?.first?.checkpoint?.id),
+                                                    paths: nil, force: true))
+        }
+        try await waitUntil { FileManager.default.fileExists(atPath: restoring.path) }
+        proceed.set()
+        do {
+            _ = try await clearing.value
+            XCTFail("The clear is refused while the revert is applied")
+        } catch {
+            XCTAssertEqual((error as? AgentRuntimeError)?.message, "A revert is being applied. Try again shortly.")
+        }
+        try Data().write(to: restored)
+        guard case .revert(let reply) = try await revert.value else { return XCTFail("Unexpected reply") }
+        XCTAssertEqual(reply.reverted, ["file.txt"])
+        let after = try await sessions.handle(.read(session: id))
+        XCTAssertNil(after.resetID, "Not cleared")
+    }
+
+    /// A clear and a history import into the same conversation never overlap: whichever
+    /// starts first is made or given up before the other is admitted.
+    func testAClearAndAnImportIntoOneConversationExcludeEachOther() async throws {
+        let root = try root(), gate = root.appendingPathComponent("gate"), writer = DispatchQueue(label: "writer")
+        defer { try? Data().write(to: gate) }
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, writer: writer,
+                                         factory: { _, _, _, callback in FakeAgentRuntime(callback) })
+        defer { sessions.shutdown() }
+        let project = ProjectId(), id = SessionId()
+        let created = try await sessions.handle(.create(session: id, project: project, provider: .claude))
+        let saved = AgentHistoryTranscript(items: [AgentChatItem(id: "u1", kind: .user, text: "Earlier work")])
+        let reading = DispatchSemaphore(value: 0)
+        let importing = Task {
+            try await sessions.importHistory(AgentHistoryImport(session: id, project: project, provider: .codex, providerSession: "thread-1")) { _ in
+                reading.signal()
+                while !FileManager.default.fileExists(atPath: gate.path) { Thread.sleep(forTimeInterval: 0.02) }
+                return saved
+            }
+        }
+        XCTAssertEqual(reading.wait(timeout: .now() + 10), .success)
+        do {
+            _ = try await sessions.handle(.clear(session: id, archive: SessionId(), expectedRevision: created.revision))
+            XCTFail("No clear while the import is made")
+        } catch {
+            XCTAssertEqual((error as? AgentRuntimeError)?.message, "A past conversation is being continued here. Try again shortly.")
+        }
+        try Data().write(to: gate)
+        let imported = try await importing.value
+        XCTAssertEqual(imported.providerSession, "thread-1")
+
+        // A clear under way, held at its writes: no import is admitted meanwhile.
+        let other = SessionId()
+        let fresh = try await sessions.handle(.create(session: other, project: project, provider: .claude))
+        writer.suspend()
+        var suspended = true
+        defer { if suspended { writer.resume() } }
+        let clearing = Task { try await sessions.handle(.clear(session: other, archive: SessionId(), expectedRevision: fresh.revision)) }
+        // Asked for from another project, an import changes nothing whatever the answer: it
+        // reports the clear once that is under way.
+        func refusal(_ request: AgentHistoryImport) async -> String? {
+            do { _ = try await sessions.importHistory(request) { _ in saved }; return nil }
+            catch { return (error as? AgentRuntimeError)?.message ?? (error as? ServiceError)?.message }
+        }
+        let clearingMessage = "The conversation is being cleared. Try again shortly."
+        var probe: String?
+        for _ in 0..<500 where probe != clearingMessage {
+            probe = await refusal(AgentHistoryImport(session: other, project: ProjectId(), provider: .codex, providerSession: "probe"))
+            if probe != clearingMessage { try await Task.sleep(for: .milliseconds(10)) }
+        }
+        XCTAssertEqual(probe, clearingMessage, "Admitted, the clear holds the conversation")
+        let refused = await refusal(AgentHistoryImport(session: other, project: project, provider: .codex, providerSession: "thread-2"))
+        XCTAssertEqual(refused, clearingMessage, "No import while the clear is under way")
+        writer.resume()
+        suspended = false
+        _ = try await clearing.value
+    }
+
+    /// Nothing is written once the store is released, however late a request finishes or
+    /// however often it is shut down: the store's next owner may have saved since.
+    func testNothingIsWrittenOnceTheStoreIsReleased() async throws {
+        let root = try root(), gate = root.appendingPathComponent("gate"), writer = DispatchQueue(label: "writer")
+        let changing = DispatchSemaphore(value: 0)
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, writer: writer, factory: { _, _, _, callback in
+            let runtime = FakeAgentRuntime(callback)
+            // The change asked for below waits for `gate`; the provider's first setting doesn't.
+            runtime.onAccess = { mode in
+                guard mode == .ask else { return }
+                changing.signal()
+                while !FileManager.default.fileExists(atPath: gate.path) { try await Task.sleep(for: .milliseconds(20)) }
+            }
+            return runtime
+        })
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        _ = try await sessions.handle(.send(session: id, text: "Work", model: nil))
+        let access = Task { try await sessions.handle(.setAccess(session: id, mode: .ask)) }
+        XCTAssertEqual(changing.wait(timeout: .now() + 10), .success)
+        sessions.shutdown()
+        // As the store's next owner might have, once it took over.
+        let file = root.appendingPathComponent("\(id).json")
+        try FileManager.default.removeItem(at: file)
+        try Data().write(to: gate)
+        _ = try? await access.value
+        sessions.shutdown()
+        writer.sync {}
+        XCTAssertFalse(exists(file), "Neither the late access change nor a second shutdown writes it again")
+    }
+
+    /// A message without files starts its turn while records wait to be written; one with
+    /// files waits for them, its files written in order with the conversation's others.
+    func testOnlyAMessagesFilesWaitForRecordsToBeWritten() async throws {
+        let root = try root(), writer = DispatchQueue(label: "writer"), sends = TurnCounter()
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, writer: writer,
+                                         factory: { _, _, _, callback in SkillCaptureRuntime(callback, onSend: { _ = sends.next() }) })
+        defer { sessions.shutdown() }
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        writer.suspend()
+        var suspended = true
+        defer { if suspended { writer.resume() } }
+        _ = try await sessions.handle(.send(session: id, text: "No files", model: nil))
+        try await waitUntil(5) { sends.count == 1 }
+        _ = try await waitForQueue(sessions, id) { $0.status == .idle }
+        let file = AgentChatAttachment(id: "notes", name: "notes.txt", mimeType: "text/plain", data: Data("Notes".utf8))
+        let sending = Task { try await sessions.handle(.send(session: id, text: "With a file", model: nil, attachments: [file])) }
+        _ = try await waitForQueue(sessions, id) { $0.turns?.count == 2 }
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(sends.count, 1, "Its files are written first")
+        writer.resume()
+        suspended = false
+        try await waitUntil(5) { sends.count == 2 }
+        _ = try await sending.value
+    }
+
+    /// A history import still reading its transcript when the store is released writes
+    /// none of its images after: the store's next owner may be importing it too.
+    func testAHistoryImportFinishingAfterReleaseWritesNothing() async throws {
+        let root = try root(), gate = root.appendingPathComponent("gate")
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: { _, _, _, callback in FakeAgentRuntime(callback) })
+        let png = try XCTUnwrap(Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="))
+        var saved = AgentHistoryTranscript(items: [AgentChatItem(id: "u1", kind: .user, text: "Look at this")])
+        saved.images = ["u1": [AgentChatAttachment(id: "shot", name: "shot.png", mimeType: "image/png", data: png)]]
+        let read = saved, reading = DispatchSemaphore(value: 0), session = SessionId()
+        let request = AgentHistoryImport(session: session, project: ProjectId(), provider: .codex, providerSession: "thread-1")
+        let importing = Task {
+            try await sessions.importHistory(request) { _ in
+                reading.signal()
+                while !FileManager.default.fileExists(atPath: gate.path) { Thread.sleep(forTimeInterval: 0.02) }
+                return read
+            }
+        }
+        XCTAssertEqual(reading.wait(timeout: .now() + 10), .success)
+        sessions.shutdown()
+        try Data().write(to: gate)
+        do { _ = try await importing.value; XCTFail("Refused once the store is released") } catch {}
+        XCTAssertFalse(exists(root.appendingPathComponent("attachments/\(session)")), "No image is written after release")
+    }
+
+    /// Images an import staged for a conversation it didn't make go with it, as when another
+    /// conversation continued the same one meanwhile; a second import into a conversation
+    /// already being made is refused, so neither stages over the other's images.
+    func testARefusedImportLeavesNoImages() async throws {
+        let root = try root(), gate = root.appendingPathComponent("gate"), writer = DispatchQueue(label: "writer")
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, writer: writer,
+                                         factory: { _, _, _, callback in FakeAgentRuntime(callback) })
+        defer { sessions.shutdown() }
+        let png = try XCTUnwrap(Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="))
+        var saved = AgentHistoryTranscript(items: [AgentChatItem(id: "u1", kind: .user, text: "Look at this")])
+        saved.images = ["u1": [AgentChatAttachment(id: "shot", name: "shot.png", mimeType: "image/png", data: png)]]
+        let read = saved, reading = DispatchSemaphore(value: 0)
+        let project = ProjectId(), first = SessionId(), other = SessionId()
+        let slow = Task {
+            try await sessions.importHistory(AgentHistoryImport(session: first, project: project, provider: .codex, providerSession: "thread-1")) { _ in
+                reading.signal()
+                while !FileManager.default.fileExists(atPath: gate.path) { Thread.sleep(forTimeInterval: 0.02) }
+                return read
+            }
+        }
+        XCTAssertEqual(reading.wait(timeout: .now() + 10), .success)
+        do {
+            _ = try await sessions.importHistory(AgentHistoryImport(session: first, project: project, provider: .codex,
+                                                                    providerSession: "thread-2")) { _ in read }
+            XCTFail("One import into a conversation at a time")
+        } catch {}
+        let continued = try await sessions.importHistory(AgentHistoryImport(session: other, project: project, provider: .codex,
+                                                                            providerSession: "thread-1")) { _ in read }
+        XCTAssertEqual(continued.session, other)
+        try Data().write(to: gate)
+        let result = try await slow.value
+        XCTAssertEqual(result.session, other, "The conversation that continued it meanwhile")
+        writer.sync {}
+        let folder = AgentToolImages.directoryName(item: "u1")
+        XCTAssertFalse(exists(root.appendingPathComponent("attachments/\(first)/\(folder)")), "Its images went")
+        XCTAssertTrue(exists(root.appendingPathComponent("attachments/\(other)/\(folder)")), "The other conversation keeps its own")
+    }
+
+    /// Copies a clear stopped while making are reclaimed when the store opens again.
+    func testCopiesAnInterruptedClearLeftAreReclaimed() async throws {
+        let root = try root()
+        let staging = root.appendingPathComponent("attachments/.copying-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        try Data("partial".utf8).write(to: staging.appendingPathComponent("photo.png"))
+        try restart(root)
+        XCTAssertFalse(exists(staging))
+    }
+
+    /// A clear retried after one that stopped while copying redoes the copy, so the archive
+    /// has everything before the conversation's own files go.
+    func testARetriedClearCopiesEverythingAgain() async throws {
+        let root = try root()
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: { _, _, _, callback in SkillCaptureRuntime(callback) })
+        defer { sessions.shutdown() }
+        let id = SessionId(), archive = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        let attachment = AgentChatAttachment(id: "notes", name: "notes.txt", mimeType: "text/plain", data: Data("Notes".utf8))
+        _ = try await sessions.handle(.send(session: id, text: "Read this", model: nil, attachments: [attachment]))
+        let ready = try await waitForQueue(sessions, id) { $0.status == .idle }
+        func files(_ folder: URL) -> Set<String> {
+            Set((FileManager.default.enumerator(atPath: folder.path)?.allObjects as? [String] ?? []).filter {
+                var directory: ObjCBool = false
+                return FileManager.default.fileExists(atPath: folder.appendingPathComponent($0).path, isDirectory: &directory) && !directory.boolValue
+            })
+        }
+        let originals = files(root.appendingPathComponent("attachments/\(id)"))
+        XCTAssertFalse(originals.isEmpty)
+        // What a clear that stopped while copying leaves: part of a copy.
+        let partial = root.appendingPathComponent("attachments/\(archive)", isDirectory: true)
+        try FileManager.default.createDirectory(at: partial, withIntermediateDirectories: true)
+        try Data("partial".utf8).write(to: partial.appendingPathComponent("stale.txt"))
+
+        _ = try await sessions.handle(.clear(session: id, archive: archive, expectedRevision: ready.revision))
+        XCTAssertEqual(files(partial), originals, "The archive has every file the conversation had")
     }
 
     func testImportedImagesBecomeAttachmentsAndTurnsAreTimed() async throws {
@@ -2119,10 +4035,12 @@ private final class SkillCaptureRuntime: AgentSessionRuntime, @unchecked Sendabl
     private let lock = NSLock()
     let callback: @Sendable (AgentRuntimeEvent) -> Void
     let onSend: @Sendable () throws -> Void
+    let onStop: @Sendable () -> Void
     private var received: [(String, [StagedAgentAttachment])] = []
     var sends: [(String, [StagedAgentAttachment])] { lock.withLock { received } }
-    init(_ callback: @escaping @Sendable (AgentRuntimeEvent) -> Void, onSend: @escaping @Sendable () throws -> Void = {}) {
-        self.callback = callback; self.onSend = onSend
+    init(_ callback: @escaping @Sendable (AgentRuntimeEvent) -> Void, onSend: @escaping @Sendable () throws -> Void = {},
+         onStop: @escaping @Sendable () -> Void = {}) {
+        self.callback = callback; self.onSend = onSend; self.onStop = onStop
     }
     func send(text: String, model: String?, reasoningEffort: AgentReasoningEffort?) async throws {}
     func send(text: String, model: String?, reasoningEffort: AgentReasoningEffort?, attachments: [StagedAgentAttachment]) async throws {
@@ -2133,7 +4051,50 @@ private final class SkillCaptureRuntime: AgentSessionRuntime, @unchecked Sendabl
     func approve(request: String, allow: Bool) async throws {}
     func setAccess(_ mode: AgentAccessMode) async throws {}
     func interrupt() async throws {}
-    func stop() {}
+    func stop() { onStop() }
+}
+
+/// Counts a runtime's turns across threads.
+private final class TurnCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var turns = 0
+    var count: Int { lock.withLock { turns } }
+    /// The number of the turn starting now.
+    func next() -> Int { lock.withLock { turns += 1; return turns } }
+}
+
+/// Set once a task finishes, for checking that it hasn't yet.
+final class CompletionFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+    var isSet: Bool { lock.withLock { done } }
+    func set() { lock.withLock { done = true } }
+    func clear() { lock.withLock { done = false } }
+}
+
+/// Blocks every Swift task worker, as synchronous calls made from a task group can: work
+/// that needs a worker to finish then waits until they are freed.
+private final class TaskWorkers: @unchecked Sendable {
+    private let started = DispatchSemaphore(value: 0), released = DispatchSemaphore(value: 0)
+
+    /// Runs `body` while no worker of any priority is free, then frees them.
+    func whileBlocked<T>(_ body: () throws -> T) rethrows -> T {
+        for priority in [TaskPriority.high, .medium, .low, .background] {
+            // Until one doesn't start: it still waits for a worker.
+            for _ in 0..<1024 {
+                Task.detached(priority: priority) { [self] in hold() }
+                guard started.wait(timeout: .now() + 0.5) == .success else { break }
+            }
+        }
+        defer { released.signal() }
+        return try body()
+    }
+
+    private func hold() {
+        started.signal()
+        released.wait()
+        released.signal()
+    }
 }
 
 extension AgentSessionsTests {

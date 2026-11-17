@@ -35,6 +35,8 @@ final class AgentToolDisclosure: NSView, NSTextViewDelegate {
     private var hoverArea: NSTrackingArea?
     private let body = AgentRichTextView(frame: .zero)
     private let command = AgentRichTextView(frame: .zero)
+    /// The text views that can show links: the command and the output or report.
+    var linkTextViews: [AgentRichTextView] { [command, body] }
     private let exitStatus = AgentRichTextView(frame: .zero)
     private let replArguments = AgentReplArguments(frame: .zero)
     private var usesReplArguments: Bool { usesArgumentPanel && AgentReplArguments.accepts(item?.tool) }
@@ -175,6 +177,8 @@ final class AgentToolDisclosure: NSView, NSTextViewDelegate {
 
     func refresh(theme: AgentTheme) {
         self.theme = theme
+        body.linkIconTheme = theme
+        command.linkIconTheme = theme
         guard let item else { return }
         bodyHeights.removeAll(keepingCapacity: true)
         let activity = item.tool

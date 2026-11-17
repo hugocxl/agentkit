@@ -270,15 +270,21 @@ final class AgentMarkdownMediaTests: XCTestCase {
         _ = loader
     }
 
-    func testLinkIconsAreNotFetchedWhileStreamingOrWhenRemoteImagesAreOff() throws {
+    func testLinkIconsAreNotFetchedWhileStreamingOrWhenRemoteImagesAreOff() async throws {
         _ = NSApplication.shared
-        var calls = 0
-        let icons = AgentLinkFavicon(fetch: { _ in calls += 1; throw URLError(.badURL) })
-        let url = try XCTUnwrap(URL(string: "https://example.org/page"))
-        XCTAssertNotNil(icons.image(for: url, color: .blue, fetch: false), "A globe stands in while the message streams")
-        icons.policy = { .never }
-        XCTAssertNotNil(icons.image(for: url, color: .blue))
-        XCTAssertEqual(calls, 0)
+        var fetched: [URL] = []
+        let icons = AgentLinkFavicon(fetch: { fetched.append($0); throw URLError(.badURL) })
+        let streaming = try XCTUnwrap(URL(string: "https://streaming.example.com/page"))
+        let never = try XCTUnwrap(URL(string: "https://never.example.com/page"))
+        XCTAssertNotNil(icons.image(for: streaming, color: .blue, theme: .shared, fetch: false), "A globe stands in while the message streams")
+        XCTAssertNotNil(icons.image(for: never, color: .blue, theme: .shared, remoteImages: { .never }))
+        // Each fetch starts in a task of its own, in order: one allowed after them shows
+        // they had their chance.
+        let allowed = try XCTUnwrap(URL(string: "https://allowed.example.com/page"))
+        XCTAssertNotNil(icons.image(for: allowed, color: .blue, theme: .shared, remoteImages: { .clickToLoad }))
+        for _ in 0..<100 where fetched.isEmpty { try await Task.sleep(for: .milliseconds(10)) }
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(fetched, [try XCTUnwrap(AgentLinkFavicon.requestURL(host: "allowed.example.com"))])
     }
 
     func testRemoteImageSettingIsOptionalAndToleratesNewerValues() throws {

@@ -129,6 +129,585 @@ final class AgentRuntimeTests: XCTestCase {
         XCTAssertNotNil(users[1]["uuid"] as? String)
     }
 
+    /// Stopping Claude with a follow-up it hasn't taken replaces its process; until the old
+    /// one has exited, the runtime says so, as it may still change files.
+    func testAProcessClaudeStoppedCountsUntilItExits() async throws {
+        let recorder = AgentRuntimeRecorder()
+        // A provider that takes no notice of being asked to stop, so it exits only when killed.
+        let fixture = try AgentRuntimeFixture("""
+        trap '' TERM
+        take
+        emit '{"type":"control_response","response":{"subtype":"success","request_id":"1","response":{}}}'
+        take
+        exec sleep 30
+        """)
+        defer { fixture.remove() }
+        // Stopped, it stays until the test is done.
+        let grace = AgentProcess.stopGrace
+        AgentProcess.stopGrace = 30
+        defer { AgentProcess.stopGrace = grace }
+        let runtime = fixture.runtime(.claude, recorder: recorder)
+        defer { runtime.terminate() }
+        try await runtime.send(text: "Start", model: nil)
+        try await runtime.steer(text: "Follow up", attachments: [])
+        let folder = revertScope(fixture.directory.path)
+        XCTAssertFalse(runtime.isStopping(in: folder))
+        try await runtime.interrupt()
+        XCTAssertTrue(runtime.isStopping(in: folder), "The stopped process still exits")
+    }
+
+    /// A provider that fails stops its process, which counts as exiting until it has: it
+    /// may still change files.
+    func testAFailedProvidersProcessCountsUntilItExits() async throws {
+        let fixture = try AgentRuntimeFixture("""
+        trap '' TERM
+        take
+        emit 'not-json'
+        exec sleep 30
+        """)
+        defer { fixture.remove() }
+        // Stopped, it stays until the test is done.
+        let grace = AgentProcess.stopGrace
+        AgentProcess.stopGrace = 30
+        defer { AgentProcess.stopGrace = grace }
+        let recorder = AgentRuntimeRecorder()
+        let runtime = fixture.runtime(.codex, recorder: recorder)
+        defer { runtime.terminate() }
+        do { try await runtime.send(text: "hello", model: nil); XCTFail("Expected startup failure") } catch {}
+        XCTAssertEqual(recorder.failures.count, 1)
+        XCTAssertTrue(runtime.isStopping(in: revertScope(fixture.directory.path)), "The failed provider's process still exits")
+    }
+
+    /// Once a stop is asked for, a follow-up is refused rather than joining the turn being
+    /// stopped, in order with the stop on the runtime's queue.
+    func testAFollowUpAfterAStopIsRefused() async throws {
+        let recorder = AgentRuntimeRecorder()
+        let fixture = try AgentRuntimeFixture("""
+        take
+        emit '{"type":"control_response","response":{"subtype":"success","request_id":"1","response":{}}}'
+        take
+        take
+        hold
+        """)
+        defer { fixture.remove() }
+        let runtime = fixture.runtime(.claude, recorder: recorder)
+        defer { runtime.stop() }
+        try await runtime.send(text: "Start", model: nil)
+        try await runtime.interrupt()
+        do {
+            try await runtime.steer(text: "Too late", attachments: [])
+            XCTFail("Refused once the stop is asked for")
+        } catch {
+            XCTAssertTrue(error is AgentFollowUpRefused, "\(error)")
+        }
+    }
+
+    /// A follow-up's hand-over goes to whichever comes first, the provider taking it or Stop.
+    func testAFollowUpIsHandedOverOrStoppedNeverBoth() {
+        let taken = AgentDelivery()
+        XCTAssertTrue(taken.handOver())
+        XCTAssertFalse(taken.cancel(), "Too late to stop")
+        XCTAssertTrue(taken.handOver())
+        let stopped = AgentDelivery()
+        XCTAssertTrue(stopped.cancel())
+        XCTAssertFalse(stopped.handOver(), "Never handed over once stopped")
+        XCTAssertTrue(stopped.cancel())
+    }
+
+    /// A follow-up whose hand-over was cancelled is refused without reaching the provider.
+    func testAFollowUpWhoseHandOverWasCancelledIsRefused() async throws {
+        let recorder = AgentRuntimeRecorder()
+        let fixture = try AgentRuntimeFixture("""
+        take
+        emit '{"type":"control_response","response":{"subtype":"success","request_id":"1","response":{}}}'
+        take
+        hold
+        """)
+        defer { fixture.remove() }
+        let runtime = fixture.runtime(.claude, recorder: recorder)
+        defer { runtime.stop() }
+        try await runtime.send(text: "Start", model: nil)
+        let delivery = AgentDelivery()
+        delivery.cancel()
+        do {
+            try await runtime.steer(text: "Stopped", attachments: [], delivery: delivery)
+            XCTFail("Refused")
+        } catch {
+            XCTAssertTrue(error is AgentFollowUpRefused, "\(error)")
+        }
+        XCTAssertFalse(runtime.isStopping(in: revertScope(fixture.directory.path)))
+    }
+
+    /// A provider process the transport ends itself, as for a line past the limit, counts as
+    /// stopping until it has exited.
+    func testAProcessEndedForAnOversizedLineCountsAsStopping() throws {
+        let fixture = try AgentRuntimeFixture("""
+        trap '' TERM
+        head -c 4096 /dev/zero | tr '\\0' 'x'
+        exec sleep 30
+        """)
+        defer { fixture.remove() }
+        // Ended, it stays until the test is done.
+        let grace = AgentProcess.stopGrace
+        AgentProcess.stopGrace = 30
+        defer { AgentProcess.stopGrace = grace }
+        let ended = DispatchSemaphore(value: 0)
+        let process = try AgentProcess(launch: .init(executable: URL(fileURLWithPath: "/bin/sh"), arguments: [fixture.script.path, fixture.log.path],
+                                                     environment: AgentProcess.environment()),
+                                       directory: fixture.directory.path, maxLineBytes: 1024,
+                                       onLine: { _ in }, onExit: { _, _ in ended.signal() })
+        defer { process.stop(); process.waitForExit() }
+        var stopping = false
+        for _ in 0..<100 where !stopping {
+            stopping = process.isStopping
+            if !stopping { Thread.sleep(forTimeInterval: 0.02) }
+        }
+        XCTAssertTrue(stopping, "Ended by the transport, it still runs until killed")
+        _ = ended
+    }
+
+    /// A provider the transport ends itself, for a line or unended output past the limit, is
+    /// killed when it takes no notice, as a stopped one is, rather than running on.
+    func testAProcessEndedForOversizedOutputIsKilledWhenItTakesNoNotice() throws {
+        let grace = AgentProcess.stopGrace
+        AgentProcess.stopGrace = 0.2
+        defer { AgentProcess.stopGrace = grace }
+        for output in ["printf '%s\\n' \"$(head -c 4096 /dev/zero | tr '\\0' 'x')\"", "head -c 4096 /dev/zero | tr '\\0' 'x'"] {
+            let fixture = try AgentRuntimeFixture("""
+            trap '' TERM
+            \(output)
+            exec sleep 30
+            """)
+            defer { fixture.remove() }
+            let exited = DispatchSemaphore(value: 0)
+            let process = try AgentProcess(launch: .init(executable: URL(fileURLWithPath: "/bin/sh"), arguments: [fixture.script.path, fixture.log.path],
+                                                         environment: AgentProcess.environment()),
+                                           directory: fixture.directory.path, maxLineBytes: 1024,
+                                           onLine: { _ in }, onExit: { _, _ in exited.signal() })
+            defer { process.stop(); process.waitForExit() }
+            XCTAssertEqual(exited.wait(timeout: .now() + 10), .success, "Killed without being stopped: \(output)")
+            XCTAssertFalse(process.isStopping)
+        }
+    }
+
+    /// Asking whether a process stops never waits behind a write to a provider that stopped
+    /// reading, which can hold its input for seconds.
+    func testWhetherAProcessStopsIsKnownDuringAStalledWrite() throws {
+        let fixture = try AgentRuntimeFixture("""
+        trap '' TERM
+        emit 'ready'
+        exec sleep 30
+        """)
+        defer { fixture.remove() }
+        let ready = DispatchSemaphore(value: 0)
+        let process = try AgentProcess(launch: .init(executable: URL(fileURLWithPath: "/bin/sh"), arguments: [fixture.script.path, fixture.log.path],
+                                                     environment: AgentProcess.environment()),
+                                       directory: fixture.directory.path, onLine: { _ in ready.signal() }, onExit: { _, _ in })
+        defer { process.stop(); process.waitForExit() }
+        XCTAssertEqual(ready.wait(timeout: .now() + 10), .success, "It ignores being asked to stop")
+        // Larger than the pipe holds, to a provider that never reads it: the write holds the
+        // input, and is kept there, waiting for the provider, until the test is done.
+        let waiting = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), wrote = DispatchSemaphore(value: 0)
+        process.onWriteWaiting = { waiting.signal(); release.wait(); release.signal() }
+        DispatchQueue.global().async {
+            try? process.write(["type": "user", "text": String(repeating: "x", count: 1_000_000)])
+            wrote.signal()
+        }
+        XCTAssertEqual(waiting.wait(timeout: .now() + 10), .success)
+        defer { release.signal(); _ = wrote.wait(timeout: .now() + 10) }
+        // Stop itself waits for the input; whether it was asked for is known meanwhile.
+        DispatchQueue.global().async { process.stop() }
+        let known = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            let deadline = Date().addingTimeInterval(20)
+            var stopping = false
+            while !stopping, Date() < deadline {
+                stopping = process.isStopping
+                if !stopping { Thread.sleep(forTimeInterval: 0.01) }
+            }
+            if stopping { known.signal() }
+        }
+        XCTAssertEqual(known.wait(timeout: .now() + 10), .success, "Known while the write still holds the input")
+    }
+
+    /// A runtime told to launch nothing more starts no provider, however late its start runs.
+    func testARefusedRuntimeLaunchesNoProvider() async throws {
+        let fixture = try AgentRuntimeFixture("take\nhold")
+        defer { fixture.remove() }
+        let recorder = AgentRuntimeRecorder()
+        let runtime = fixture.runtime(.codex, recorder: recorder)
+        defer { runtime.stop() }
+        runtime.refuseLaunches()
+        do { try await runtime.send(text: "hello", model: nil); XCTFail("Nothing launched") } catch {}
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.log.path + ".args"), "No provider started")
+        XCTAssertFalse(runtime.mayRun(in: revertScope(fixture.directory.path)))
+    }
+
+    /// Each provider process keeps the folder it launched in: one that replaced a stopped
+    /// process after the folder's link was pointed elsewhere runs in the new folder, while
+    /// the stopped one still counts in the old.
+    func testAReplacementProviderKeepsItsOwnFolder() async throws {
+        // Each launch answers its own initialize request.
+        let fixture = try AgentRuntimeFixture(#"""
+        trap '' TERM
+        take
+        id=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+        emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$id\",\"response\":{}}}"
+        take
+        exec sleep 30
+        """#)
+        defer { fixture.remove() }
+        let first = fixture.directory.appendingPathComponent("first"), second = fixture.directory.appendingPathComponent("second")
+        let link = fixture.directory.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: first, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: first.path)
+        // The stopped provider stays until its overlap with the next is checked.
+        let grace = AgentProcess.stopGrace
+        AgentProcess.stopGrace = 30
+        defer { AgentProcess.stopGrace = grace }
+        let recorder = AgentRuntimeRecorder()
+        let runtime = AgentRuntime(provider: .claude, directory: link.path, resumeSession: nil,
+                                   launchBuilder: { arguments in
+                                       .init(executable: URL(fileURLWithPath: "/bin/sh"), arguments: [fixture.script.path, fixture.log.path] + arguments,
+                                             environment: AgentProcess.environment())
+                                   }, requestTimeout: 3, onEvent: { recorder.receive($0) })
+        defer { runtime.terminate() }
+        try await runtime.send(text: "Start", model: nil)
+        try await runtime.steer(text: "Follow up", attachments: [])
+        // Stopped with its follow-up untaken, its process is replaced at the next message.
+        try await runtime.interrupt()
+        let firstFolder = revertScope(first.path), secondFolder = revertScope(second.path)
+        XCTAssertTrue(runtime.isStopping(in: firstFolder))
+        try FileManager.default.removeItem(at: link)
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: second.path)
+        try await runtime.send(text: "Again", model: nil)
+        XCTAssertTrue(runtime.mayRun(in: secondFolder), "The new provider runs in the folder the link leads to now")
+        XCTAssertTrue(runtime.isStopping(in: firstFolder), "The stopped one still counts where it ran")
+        XCTAssertFalse(runtime.isStopping(in: secondFolder))
+    }
+
+    /// Codex works in the physical folder its provider launched in, even when a link on the
+    /// way is pointed elsewhere while it starts.
+    func testCodexWorksInTheFolderItLaunchedIn() async throws {
+        let fixture = try AgentRuntimeFixture("""
+        take
+        while [ ! -f "$log.gate" ]; do sleep 0.05; done
+        emit '{"id":1,"result":{}}'
+        take
+        take
+        emit '{"id":2,"result":{"thread":{"id":"thread"}}}'
+        take
+        emit '{"id":3,"result":{"turn":{"id":"one"}}}'
+        hold
+        """)
+        defer { fixture.remove() }
+        let first = fixture.directory.appendingPathComponent("first"), second = fixture.directory.appendingPathComponent("second")
+        let link = fixture.directory.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: first, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: first.path)
+        let recorder = AgentRuntimeRecorder()
+        let runtime = AgentRuntime(provider: .codex, directory: link.path, resumeSession: nil,
+                                   launchBuilder: { arguments in
+                                       .init(executable: URL(fileURLWithPath: "/bin/sh"), arguments: [fixture.script.path, fixture.log.path] + arguments,
+                                             environment: AgentProcess.environment())
+                                   }, requestTimeout: 5, onEvent: { recorder.receive($0) })
+        defer { runtime.stop() }
+        let sending = Task { try await runtime.send(text: "Start", model: nil) }
+        // Launched, and waiting for its first answer: the link is pointed elsewhere now.
+        for _ in 0..<200 where ((try? fixture.messages()) ?? []).isEmpty { try await Task.sleep(for: .milliseconds(20)) }
+        try FileManager.default.removeItem(at: link)
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: second.path)
+        try Data().write(to: URL(fileURLWithPath: fixture.log.path + ".gate"))
+        try await sending.value
+        let start = try XCTUnwrap(fixture.messages().first { $0["method"] as? String == "thread/start" })
+        let cwd = try XCTUnwrap((start["params"] as? [String: Any])?["cwd"] as? String)
+        XCTAssertEqual(cwd, first.resolvingSymlinksInPath().path, "Codex works where its provider launched")
+        XCTAssertTrue(runtime.mayRun(in: revertScope(first.path)))
+        XCTAssertFalse(runtime.mayRun(in: revertScope(second.path)))
+    }
+
+    /// Providers started for discovery count in their folder from before they launch until
+    /// they exit, stopping included, so a revert there waits for them.
+    func testDiscoveryProvidersCountInTheirFolderUntilTheyExit() throws {
+        let fixture = try AgentRuntimeFixture("""
+        trap '' TERM
+        emit 'ready'
+        while [ ! -f "$log.gate" ]; do sleep 0.05; done
+        """)
+        defer { fixture.remove() }
+        // Stopped, it stays until let go.
+        let grace = AgentProcess.stopGrace
+        AgentProcess.stopGrace = 30
+        defer { AgentProcess.stopGrace = grace }
+        let tracker = AgentProcessTracker(), ready = DispatchSemaphore(value: 0), exited = DispatchSemaphore(value: 0)
+        let folder = revertScope(fixture.directory.path)
+        let process = try tracker.launch(.init(executable: URL(fileURLWithPath: "/bin/sh"), arguments: [fixture.script.path, fixture.log.path],
+                                               environment: AgentProcess.environment()),
+                                         directory: fixture.directory.path, onLine: { _ in ready.signal() }, onExit: { _, _ in exited.signal() })
+        defer { try? Data().write(to: URL(fileURLWithPath: fixture.log.path + ".gate")); process.stop(); process.waitForExit() }
+        XCTAssertTrue(tracker.mayRun(in: folder))
+        XCTAssertEqual(ready.wait(timeout: .now() + 10), .success, "It ignores being asked to stop")
+        process.stop()
+        XCTAssertTrue(tracker.mayRun(in: folder), "Stopping, it still counts")
+        try Data().write(to: URL(fileURLWithPath: fixture.log.path + ".gate"))
+        XCTAssertEqual(exited.wait(timeout: .now() + 10), .success)
+        XCTAssertFalse(tracker.mayRun(in: folder), "Gone once it exited")
+    }
+
+    /// A discovery provider counts in its folder from before its process starts.
+    func testADiscoveryProviderCountsBeforeItsProcessStarts() throws {
+        let fixture = try AgentRuntimeFixture("exit 0")
+        defer { fixture.remove() }
+        let tracker = AgentProcessTracker(), reserved = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let launched = DispatchSemaphore(value: 0)
+        tracker.onReserved = { reserved.signal(); release.wait() }
+        DispatchQueue.global().async {
+            let process = try? tracker.launch(.init(executable: URL(fileURLWithPath: "/bin/sh"), arguments: [fixture.script.path, fixture.log.path],
+                                                    environment: AgentProcess.environment()),
+                                              directory: fixture.directory.path, onLine: { _ in }, onExit: { _, _ in })
+            process?.stop()
+            process?.waitForExit()
+            launched.signal()
+        }
+        XCTAssertEqual(reserved.wait(timeout: .now() + 10), .success)
+        defer { release.signal(); _ = launched.wait(timeout: .now() + 10) }
+        XCTAssertTrue(tracker.mayRun(in: revertScope(fixture.directory.path)), "Reserved before it starts")
+        XCTAssertEqual(tracker.processIDs(), [], "No process yet")
+    }
+
+    /// Reading a discovery provider's folder, which may stall on a slow volume, holds up no
+    /// revert asking meanwhile whether a provider may run in its own.
+    func testReadingADiscoveryProvidersFolderHoldsUpNoRevert() throws {
+        let fixture = try AgentRuntimeFixture("exec sleep 30")
+        defer { fixture.remove() }
+        let tracker = AgentProcessTracker(), reading = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        tracker.readFolder = { path in reading.signal(); release.wait(); return AgentFolder(path) }
+        let launched = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            let process = try? tracker.launch(.init(executable: URL(fileURLWithPath: "/bin/sh"), arguments: [fixture.script.path, fixture.log.path],
+                                                    environment: AgentProcess.environment()),
+                                              directory: fixture.directory.path, onLine: { _ in }, onExit: { _, _ in })
+            process?.stop()
+            process?.waitForExit()
+            launched.signal()
+        }
+        XCTAssertEqual(reading.wait(timeout: .now() + 10), .success)
+        defer { release.signal(); _ = launched.wait(timeout: .now() + 10) }
+        let elsewhere = revertScope(FileManager.default.temporaryDirectory.appendingPathComponent("elsewhere-\(UUID())").path)
+        let answered = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async { _ = tracker.mayRun(in: elsewhere); answered.signal() }
+        XCTAssertEqual(answered.wait(timeout: .now() + 10), .success, "Answered while the folder is still being read")
+    }
+
+    /// A folder meets itself however its path is spelled, and the folders inside and around
+    /// it, but neither one beside it nor one a link on its path passes through.
+    func testFoldersMeetTheFoldersInsideAndAroundThem() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("agent-folders-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let outer = root.appendingPathComponent("outer"), inner = outer.appendingPathComponent("inner")
+        let beside = root.appendingPathComponent("beside"), link = beside.appendingPathComponent("link")
+        try FileManager.default.createDirectory(at: inner, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: beside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: inner.path)
+        let folder = AgentFolder(outer.path)
+        XCTAssertTrue(folder.overlaps(AgentFolder(outer.path + "/../outer")), "Itself, however spelled")
+        XCTAssertTrue(folder.overlaps(AgentFolder(inner.path)), "A folder inside it")
+        XCTAssertTrue(AgentFolder(inner.path).overlaps(folder), "A folder around it")
+        XCTAssertTrue(AgentFolder(link.path).overlaps(AgentFolder(inner.path)), "Itself, through a link")
+        XCTAssertTrue(AgentFolder(link.path).overlaps(folder), "Around the folder a link leads to")
+        XCTAssertFalse(AgentFolder(link.path).overlaps(AgentFolder(beside.path)), "Not the folder a link passes through")
+        XCTAssertFalse(folder.overlaps(AgentFolder(beside.path)), "Not a folder beside it")
+    }
+
+    /// A provider counts in the folders around its own and inside it, where its work may
+    /// change files a revert there restores, but not in a folder beside it.
+    func testAProviderCountsInTheFoldersAroundAndInsideItsOwn() async throws {
+        let fixture = try AgentRuntimeFixture("""
+        trap '' TERM
+        take
+        emit '{"type":"control_response","response":{"subtype":"success","request_id":"1","response":{}}}'
+        take
+        while [ ! -f "$log.gate" ]; do sleep 0.05; done
+        """)
+        defer { fixture.remove() }
+        // Stopped, it stays until let go.
+        let grace = AgentProcess.stopGrace
+        AgentProcess.stopGrace = 30
+        defer { AgentProcess.stopGrace = grace }
+        let project = fixture.directory.appendingPathComponent("project"), inner = project.appendingPathComponent("inner")
+        let beside = fixture.directory.appendingPathComponent("beside")
+        try FileManager.default.createDirectory(at: inner, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: beside, withIntermediateDirectories: true)
+        let recorder = AgentRuntimeRecorder()
+        let runtime = AgentRuntime(provider: .claude, directory: project.path, resumeSession: nil,
+                                   launchBuilder: { arguments in
+                                       .init(executable: URL(fileURLWithPath: "/bin/sh"), arguments: [fixture.script.path, fixture.log.path] + arguments,
+                                             environment: AgentProcess.environment())
+                                   }, requestTimeout: 5, onEvent: { recorder.receive($0) })
+        defer { try? Data().write(to: URL(fileURLWithPath: fixture.log.path + ".gate")); runtime.terminate() }
+        try await runtime.send(text: "Start", model: nil)
+        XCTAssertTrue(runtime.mayRun(in: revertScope(fixture.directory.path)), "Around its folder")
+        XCTAssertTrue(runtime.mayRun(in: revertScope(inner.path)), "Inside its folder")
+        XCTAssertFalse(runtime.mayRun(in: revertScope(beside.path)), "Not beside it")
+        runtime.stop()
+        XCTAssertTrue(runtime.isStopping(in: revertScope(fixture.directory.path)), "Stopping, around its folder")
+        XCTAssertTrue(runtime.isStopping(in: revertScope(inner.path)), "Stopping, inside its folder")
+        XCTAssertFalse(runtime.isStopping(in: revertScope(beside.path)))
+    }
+
+    /// A folder meets the folders around it under every name the system gives them: through
+    /// `/private`, which Foundation's resolved paths leave out, and on the data volume a
+    /// firmlink leads into.
+    func testFoldersMeetTheFoldersAroundThemUnderEveryName() {
+        XCTAssertTrue(AgentFolder("/tmp").overlaps(AgentFolder("/private")), "Around it, through /private")
+        XCTAssertTrue(AgentFolder("/tmp").overlaps(AgentFolder("/System/Volumes/Data")), "Around it, on the data volume")
+        XCTAssertTrue(AgentFolder("/Users/Shared").overlaps(AgentFolder("/System/Volumes/Data/Users")), "Around it, behind the firmlink")
+        XCTAssertFalse(AgentFolder("/tmp").overlaps(AgentFolder("/Users")), "Not a folder beside it")
+    }
+
+    /// A provider whose folder moved into another since it launched is found there by where
+    /// it works now, which the folders around it at its launch no longer tell.
+    func testAProviderIsFoundWhereItWorksNowAfterItsFolderMoved() async throws {
+        let fixture = try AgentRuntimeFixture("""
+        trap '' TERM
+        take
+        emit '{"type":"control_response","response":{"subtype":"success","request_id":"1","response":{}}}'
+        take
+        while [ ! -f "$log.gate" ]; do sleep 0.05; done
+        """)
+        defer { fixture.remove() }
+        // Stopped, it stays until let go.
+        let grace = AgentProcess.stopGrace
+        AgentProcess.stopGrace = 30
+        defer { AgentProcess.stopGrace = grace }
+        let outside = fixture.directory.appendingPathComponent("outside"), project = fixture.directory.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let recorder = AgentRuntimeRecorder()
+        let runtime = AgentRuntime(provider: .claude, directory: outside.path, resumeSession: nil,
+                                   launchBuilder: { arguments in
+                                       .init(executable: URL(fileURLWithPath: "/bin/sh"), arguments: [fixture.script.path, fixture.log.path] + arguments,
+                                             environment: AgentProcess.environment())
+                                   }, requestTimeout: 5, onEvent: { recorder.receive($0) })
+        defer { try? Data().write(to: URL(fileURLWithPath: fixture.log.path + ".gate")); runtime.terminate() }
+        try await runtime.send(text: "Start", model: nil)
+        XCTAssertEqual(runtime.providerProcesses().count, 1)
+        XCTAssertFalse(runtime.mayRun(in: revertScope(project.path, candidates: runtime.providerProcesses())), "Beside the project")
+        // Its folder moves into the project while it works.
+        try FileManager.default.moveItem(at: outside, to: project.appendingPathComponent("moved"))
+        runtime.stop()
+        XCTAssertFalse(runtime.isStopping(in: revertScope(project.path)), "Where it launched no longer tells")
+        XCTAssertTrue(runtime.isStopping(in: revertScope(project.path, candidates: runtime.providerProcesses())), "Where it works now does")
+        XCTAssertTrue(runtime.mayRun(in: revertScope(project.path, candidates: runtime.providerProcesses())))
+    }
+
+    /// Where a process works is trusted only once the system's name for it leads there: a deep
+    /// folder's name is cut short, and a removed one's may lead to whatever took its place, so
+    /// either process may be working anywhere and holds every revert.
+    func testWhereAProcessWorksIsTrustedOnlyWhenItsNameLeadsThere() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("agent-cwd-\(UUID())")
+        let replaced = root.appendingPathComponent("replaced"), elsewhere = root.deletingLastPathComponent().appendingPathComponent("agent-elsewhere-\(UUID())")
+        try FileManager.default.createDirectory(at: replaced, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: elsewhere)
+            // Too deep for paths: removed a folder at a time.
+            let remove = Process()
+            remove.executableURL = URL(fileURLWithPath: "/bin/rm")
+            remove.arguments = ["-rf", root.path]
+            try? remove.run()
+            remove.waitUntilExit()
+        }
+        var workers: [Process] = []
+        defer { for worker in workers { worker.terminate(); worker.waitUntilExit() } }
+        func launch(_ script: String, in folder: URL) throws -> Process {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = ["-c", script]
+            process.currentDirectoryURL = folder
+            try process.run()
+            workers.append(process)
+            return process
+        }
+        let here = try launch("exec sleep 30", in: root)
+        // Deeper than a path the system names whole.
+        let deep = try launch("for i in $(seq 1 60); do mkdir d0123456789012345678901234567890 && cd d0123456789012345678901234567890 || exit 1; done; touch '\(root.path)/deep'; exec sleep 30", in: root)
+        let moved = try launch("exec sleep 30", in: replaced)
+        for _ in 0..<1000 where !FileManager.default.fileExists(atPath: root.path + "/deep") { Thread.sleep(forTimeInterval: 0.01) }
+        // Removed, and another folder made in its place.
+        try FileManager.default.removeItem(at: replaced)
+        try FileManager.default.createDirectory(at: replaced, withIntermediateDirectories: true)
+        guard case .folder(let path)? = AgentProcess.workingDirectory(of: here.processIdentifier) else { return XCTFail("Told where it works") }
+        XCTAssertEqual(AgentFolder(path).identity, AgentFolder(root.path).identity)
+        XCTAssertEqual(AgentProcess.workingDirectory(of: deep.processIdentifier), .unknown, "Its name is cut short")
+        XCTAssertEqual(AgentProcess.workingDirectory(of: moved.processIdentifier), .unknown, "Its name leads to another folder")
+        XCTAssertEqual(revertScope(elsewhere.path, candidates: [here, deep, moved].map(\.processIdentifier)).processes,
+                       [deep.processIdentifier, moved.processIdentifier], "Either may work there")
+        here.terminate()
+        here.waitUntilExit()
+        XCTAssertNil(AgentProcess.workingDirectory(of: here.processIdentifier), "Gone")
+    }
+
+    /// Another user's process, which this one can't read, may work anywhere.
+    func testAProcessThatCantBeReadMayWorkAnywhere() throws {
+        try XCTSkipIf(geteuid() == 0, "Root reads every process")
+        XCTAssertEqual(AgentProcess.workingDirectory(of: 1), .unknown)
+    }
+
+    /// A discovery provider counts until it has exited, even while a helper it started still
+    /// holds its output open.
+    func testADiscoveryProviderStopsCountingOnceItExitsThoughItsOutputStaysOpen() throws {
+        // The helper stops when let go, or after a minute at most.
+        let fixture = try AgentRuntimeFixture("""
+        (i=0; while [ ! -f "$log.gate" ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done) &
+        echo $! > "$log.helper"
+        emit 'ready'
+        exit 0
+        """)
+        defer { fixture.remove() }
+        let tracker = AgentProcessTracker(), ready = DispatchSemaphore(value: 0), exited = DispatchSemaphore(value: 0)
+        let process = try tracker.launch(.init(executable: URL(fileURLWithPath: "/bin/sh"), arguments: [fixture.script.path, fixture.log.path],
+                                               environment: AgentProcess.environment()),
+                                         directory: fixture.directory.path, onLine: { _ in ready.signal() }, onExit: { _, _ in exited.signal() })
+        defer {
+            try? Data().write(to: URL(fileURLWithPath: fixture.log.path + ".gate"))
+            if let helper = pid_t((try? String(contentsOfFile: fixture.log.path + ".helper", encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "") {
+                kill(helper, SIGKILL)
+            }
+            XCTAssertEqual(exited.wait(timeout: .now() + 10), .success, "Its output closes once the helper is gone")
+        }
+        XCTAssertEqual(ready.wait(timeout: .now() + 10), .success)
+        for _ in 0..<1000 where process.isRunning { Thread.sleep(forTimeInterval: 0.01) }
+        XCTAssertFalse(process.isRunning, "The provider exited")
+        XCTAssertFalse(tracker.mayRun(in: revertScope(fixture.directory.path)), "A helper holding its output keeps no revert waiting")
+        XCTAssertEqual(tracker.processIDs(), [])
+    }
+
+    /// A discovery provider whose folder moved since it launched is found where it works now.
+    func testADiscoveryProviderIsFoundWhereItWorksNowAfterItsFolderMoved() throws {
+        let fixture = try AgentRuntimeFixture("""
+        emit 'ready'
+        while [ ! -f "$log.gate" ]; do sleep 0.05; done
+        """)
+        defer { fixture.remove() }
+        let outside = fixture.directory.appendingPathComponent("outside"), project = fixture.directory.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let tracker = AgentProcessTracker(), ready = DispatchSemaphore(value: 0)
+        let process = try tracker.launch(.init(executable: URL(fileURLWithPath: "/bin/sh"), arguments: [fixture.script.path, fixture.log.path],
+                                               environment: AgentProcess.environment()),
+                                         directory: outside.path, onLine: { _ in ready.signal() }, onExit: { _, _ in })
+        defer { try? Data().write(to: URL(fileURLWithPath: fixture.log.path + ".gate")); process.stop(); process.waitForExit() }
+        XCTAssertEqual(ready.wait(timeout: .now() + 10), .success)
+        XCTAssertEqual(tracker.processIDs(), [process.processIdentifier])
+        try FileManager.default.moveItem(at: outside, to: project.appendingPathComponent("moved"))
+        XCTAssertFalse(tracker.mayRun(in: revertScope(project.path)), "Where it launched no longer tells")
+        XCTAssertTrue(tracker.mayRun(in: revertScope(project.path, candidates: tracker.processIDs())), "Where it works now does")
+    }
+
     /// After a background agent finishes, Claude answers it in a turn nobody sent. That
     /// turn is reported, and a prompt sent meanwhile waits for it instead of being
     /// refused or ended by its result.
@@ -1009,6 +1588,11 @@ final class AgentRuntimeRecorder: @unchecked Sendable {
         }
         return items
     }
+}
+
+/// What a revert in `path` restores files in, with `candidates` asked where they work now.
+func revertScope(_ path: String, candidates: [Int32] = []) -> AgentRevertScope {
+    AgentRevertScope(directory: path, candidates: candidates)
 }
 
 struct AgentRuntimeFixture: Sendable {

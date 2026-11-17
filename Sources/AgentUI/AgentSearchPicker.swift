@@ -13,11 +13,11 @@ final class AgentSearchPicker: NSWindowController, NSWindowDelegate, NSTableView
     var onClose: (() -> Void)?
     private let search = NSSearchField()
     private let table = NSTableView()
-    private let note = NSTextField(wrappingLabelWithString: "")
+    let note = NSTextField(wrappingLabelWithString: "")
     private var entries: [Entry] = []
     private var footerNote = ""
     private(set) var filtered: [Entry] = []
-    private let theme: AgentTheme
+    private(set) var theme: AgentTheme
 
     init(title: String, placeholder: String, theme: AgentTheme) {
         self.theme = theme
@@ -33,6 +33,8 @@ final class AgentSearchPicker: NSWindowController, NSWindowDelegate, NSTableView
         let content = ThemedBackground(color: { $0.floating })
         content.theme = theme
         panel.contentView = content
+        // Plain controls follow the theme changing in place, as for the system appearance.
+        content.onColorsChange = { [weak self] in self?.applyColors() }
         search.placeholderString = placeholder
         search.delegate = self
         search.setAccessibilityLabel(placeholder)
@@ -78,6 +80,24 @@ final class AgentSearchPicker: NSWindowController, NSWindowDelegate, NSTableView
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    /// Shows the picker in `theme` from now on, as the window it serves does.
+    func follow(_ theme: AgentTheme) {
+        guard self.theme !== theme else { return }
+        self.theme = theme
+        if let content = window?.contentView as? ThemedBackground {
+            content.theme = theme
+            content.themeDidChange()
+        }
+        applyColors()
+    }
+
+    /// Draws the window, footer and rows in the theme's colors, keeping the selection.
+    private func applyColors() {
+        window?.appearance = theme.nsAppearance
+        note.textColor = theme.fgDim
+        table.reloadData()
+    }
 
     func update(_ entries: [Entry], note: String = "") {
         guard self.entries != entries || footerNote != note else { return }

@@ -56,6 +56,12 @@ struct GitCommand: Sendable {
         return Self.trimmed(output.stdout)
     }
 
+    /// `run` that reports how `git` ended, whatever its exit status; `nil` when it couldn't
+    /// run or timed out.
+    func outcome(_ directory: String, _ arguments: [String]) -> ProcessOutput? {
+        try? launch(directory, arguments, extra: [:], input: nil, timeout: Self.localTimeout, truncate: nil)
+    }
+
     /// Commands that talk to remotes: a longer timeout and `gh` as GitHub's
     /// credential helper when it is installed.
     @discardableResult

@@ -96,8 +96,8 @@ final class AgentImageActions: NSObject {
     }
 
     private func announce(_ text: String, error: Bool = false) {
-        guard let root = view?.window?.contentView else { return }
-        Toast.show(text, style: error ? .error : .info, in: root)
+        guard let view else { return }
+        Toast.show(text, style: error ? .error : .info, in: view)
     }
 
     nonisolated static func png(_ data: Data, mimeType: String) throws -> Data {

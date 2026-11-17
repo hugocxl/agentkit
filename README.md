@@ -22,7 +22,7 @@ AgentKit does not bundle a model or manage provider accounts.
 Add `https://github.com/hugocxl/agentkit.git` in Xcode's package dependencies, or add:
 
 ```swift
-.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.1.0")
+.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.3.0")
 ```
 
 Select the products your target needs:
@@ -58,10 +58,16 @@ let tools = AgentToolConfiguration([
         ]
     )
 ]) { @MainActor call in
-    guard !Task.isCancelled, let text = call.arguments["text"]?.string else {
+    guard let text = call.arguments["text"]?.string else {
         return .failure("A title is required.")
     }
-    editor.addTitle(text) // Your app's normal editing and undo path.
+    guard let context = AgentToolExecutionContext.current else { return .failure("Not a tool call.") }
+    do {
+        // The edit lands only while this call may still change the project.
+        try context.withCommit { editor.addTitle(text) } // Your app's normal editing and undo path.
+    } catch {
+        return .failure("The call was cancelled before the title was added.")
+    }
     return AgentToolResult(text: "Added the title.")
 }
 
@@ -141,17 +147,25 @@ host.openFile = { path, line, column in
 host.openBrowser = { url in browser.open(url) }
 host.runCommand = { command in terminal.run(command) }
 host.remoteImages = { .clickToLoad }
+host.showNotice = { message, style in notices.show(message, isError: style == .error) }
 
 let conversation = AgentConversationViewController(connection: connection, host: host)
 ```
 
 Local connections supply file reads and file suggestions automatically. Remote hosts
 can supply their own asynchronous file service. Navigation, repository metadata,
-pull request previews, and workspace labels are optional callbacks. Bind menus and
-shortcuts by passing an `AgentShortcut` to `conversation.perform(_:)`.
+pull request previews, workspace labels and notices are optional callbacks; without
+`showNotice`, notices appear in an AgentKit notice stack in the window, if it has one.
+Repository metadata is read once per connection: an error with an `AgentCodedError`
+code, such as a folder outside Git, holds until `connectionChanged()`, while an
+uncoded failure is retried. Bind menus and shortcuts by passing an `AgentShortcut`
+to `conversation.perform(_:)`; map your own command identifiers explicitly, since
+`AgentShortcut`'s raw values are AgentKit's.
 
 Use `AgentTheme` to select light/dark palettes and appearance. Each controller can
-receive its own theme; `followSystem()` observes appearance changes without polling.
+receive its own theme, and its provider marks, link icons and controls follow it;
+`followSystem()` observes appearance changes without polling. An application with one
+theme can apply it to `AgentTheme.shared` and pass that to every controller.
 
 ## Own the lifecycle
 
@@ -232,13 +246,24 @@ notifications from `changed` to remote clients, or use independent `observe` str
 
 The service accepts an existing conversation directory directly. It preserves
 snapshot, transcript, attachment, checkpoint, and queue formats; clearing archives
-prior resources before resetting the original session. Call `refuseNewRequests`
-before host shutdown, then `shutdown` off the main thread to flush and release the
-store. `tryRefuseIfIdle` reserves shutdown atomically only when no conversation is live.
+prior resources before resetting the original session. The service locks its store;
+a second owner fails with `FileLock.Failure.held`, and other lock failures throw. A
+host that already owns the store exclusively, such as a server holding its own
+profile lock, passes `hostOwnsStore: true` to serve a store it can't lock, such as a
+read-only folder. Runtime errors
+go to unified logging; `AgentRuntimeLog.setErrorHandler` also sends them to your own
+log. Call `refuseNewRequests`
+before host shutdown, then `shutdown` off the main thread: it waits until every
+provider it started has exited, including model and command discovery, and every
+checkpoint being taken and revert under way is written, then flushes and releases the
+store, which can be opened again once it returns. It needs no free Swift task worker,
+so tasks may call it together. `tryRefuseIfIdle` reserves shutdown atomically only when no conversation is live.
 
 For an application-owned transport, build an `AgentConnection` and provide host
 navigation through `AgentHostServices`. Implement `AgentCodedError` on transport
-errors so the UI can distinguish unsupported services and missing conversations.
+errors so the UI can distinguish unsupported services and missing conversations,
+and set `backendAdvice` to tell people how to update your server when it predates
+a service, such as "Update Tab on it, then restart it."
 Tab uses all three products this way: AgentCore on its wire, AgentRuntime in its
 server, and AgentUI in its desktop pane adapter.
 

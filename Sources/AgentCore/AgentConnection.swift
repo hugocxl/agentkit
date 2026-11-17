@@ -9,6 +9,29 @@ public struct AgentConversationChange: Sendable, Equatable {
     }
 }
 
+/// What a conversation tells someone whose backend predates a service. A host that
+/// updates its own servers names them, as in "Update Tab on it, then restart it."
+public struct AgentBackendAdvice: Sendable, Equatable {
+    /// Follows "This server can't …" for a service the backend lacks.
+    public var restart: String
+    /// Follows "This server can't …" for a composer action, before trying it again.
+    public var update: String
+    /// Follows an action the connected backend does not support; the draft is kept.
+    public var reconnect: String
+    /// Why a conversation could not be cleared in place; it is unchanged.
+    public var clear: String
+
+    public init(restart: String = "Update or restart the conversation backend.",
+                update: String = "Update the conversation backend first.",
+                reconnect: String = "Update the conversation backend, then reconnect.",
+                clear: String = "Update the conversation backend to clear a conversation in place.") {
+        self.restart = restart; self.update = update; self.reconnect = reconnect; self.clear = clear
+    }
+
+    /// "This server can't `service`.", followed by how to get it.
+    public func cannot(_ service: String) -> String { "This server can't \(service). \(restart)" }
+}
+
 /// The boundary between a conversation surface and its owner, local or remote.
 /// Each observer receives its own stream; changes may coalesce because revisions
 /// identify authoritative state rather than individual text deltas.
@@ -21,6 +44,8 @@ public struct AgentConnection: Sendable {
     public var workingDirectory: URL?
     /// Optional per-conversation draft storage owned by the embedding application.
     public var draftURL: URL?
+    /// What to say when the backend predates a service.
+    public var backendAdvice = AgentBackendAdvice()
     public var request: @Sendable (AgentChatRequest) async throws -> AgentChatSnapshot
     public var observe: @Sendable () -> AsyncStream<AgentConversationChange>
     public var conversation: (@Sendable (AgentConversationRequest) async throws -> AgentConversationReply)?

@@ -45,6 +45,8 @@ final class AgentResponseView: NSView, NSTextViewDelegate {
     private var source: String?
     private var palette: ChromePalette?
     private var scheme: ColorScheme?
+    /// The theme the content was last made with: its views keep using it.
+    private weak var renderedTheme: AgentTheme?
     private var scale: CGFloat = 1
     private var sections: [AgentResponseSection] = []
     private var sectionGaps: [CGFloat] = []
@@ -99,9 +101,10 @@ final class AgentResponseView: NSView, NSTextViewDelegate {
     var sectionMeasurementCount: Int { retiredMeasurementCount + sections.reduce(0) { $0 + $1.measurementCount } }
 
     func setContent(_ source: String, theme: AgentTheme) {
-        let themeChanged = palette != theme.palette || scheme != theme.scheme || scale != AgentTextScale.factor
+        let themeChanged = renderedTheme !== theme || palette != theme.palette || scheme != theme.scheme || scale != AgentTextScale.factor
         guard self.source != source || themeChanged || renderedCardHosts != cardHosts else { return }
         self.source = source
+        renderedTheme = theme
         scale = AgentTextScale.factor
         preparedBlocks = nil
         palette = theme.palette
@@ -119,7 +122,8 @@ final class AgentResponseView: NSView, NSTextViewDelegate {
     }
 
     func setPreparedContent(_ blocks: [AgentMarkdown.Block], theme: AgentTheme) {
-        guard preparedBlocks != blocks || palette != theme.palette || scheme != theme.scheme || scale != AgentTextScale.factor || source == nil || renderedCardHosts != cardHosts else { return }
+        guard preparedBlocks != blocks || renderedTheme !== theme || palette != theme.palette || scheme != theme.scheme || scale != AgentTextScale.factor || source == nil || renderedCardHosts != cardHosts else { return }
+        renderedTheme = theme
         scale = AgentTextScale.factor
         preparedBlocks = blocks
         source = ""
@@ -523,6 +527,8 @@ class AgentResponseSection: NSView {
     private(set) var part: AgentResponsePart?
     private var palette: ChromePalette?
     private var scheme: ColorScheme?
+    /// The theme this section was last made with: its views keep using it.
+    private weak var renderedTheme: AgentTheme?
     private var scale: CGFloat = 1
     private var measurementWidth: CGFloat?
     private var measurementHeight: CGFloat = 0
@@ -533,7 +539,8 @@ class AgentResponseSection: NSView {
     var kind: Int { -1 }
 
     final func apply(_ part: AgentResponsePart, theme: AgentTheme, delegate: NSTextViewDelegate, references: [String: String] = [:], compactProse: Bool = false, lineBreaks: Bool = false, rawHTML: Bool = false) {
-        guard self.part != part || palette != theme.palette || scheme != theme.scheme || scale != AgentTextScale.factor || self.references != references || self.compactProse != compactProse || self.lineBreaks != lineBreaks || self.rawHTML != rawHTML else { return }
+        guard self.part != part || renderedTheme !== theme || palette != theme.palette || scheme != theme.scheme || scale != AgentTextScale.factor || self.references != references || self.compactProse != compactProse || self.lineBreaks != lineBreaks || self.rawHTML != rawHTML else { return }
+        renderedTheme = theme
         scale = AgentTextScale.factor
         self.lineBreaks = lineBreaks
         self.rawHTML = rawHTML
@@ -645,6 +652,7 @@ final class AgentResponseProse: AgentResponseSection {
         text.delegate = delegate
         let rendered = AgentMarkdown.render(blocks, theme: theme, fileLinks: true, references: references, compact: compactProse, lineBreaks: lineBreaks, listIndents: listIndents, rawHTML: rawHTML, cache: renderCache)
         fileIconTheme = theme
+        text.linkIconTheme = theme
         missingColor = AgentMarkdownPalette(theme: theme).muted
         if let services {
             let content = NSMutableAttributedString(attributedString: rendered)

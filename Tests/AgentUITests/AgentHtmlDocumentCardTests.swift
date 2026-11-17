@@ -248,6 +248,34 @@ final class AgentHtmlDocumentCardTests: XCTestCase {
         XCTAssertEqual(preview.webView.url?.scheme, "tab-media-preview")
     }
 
+    /// Once the conversation goes, its preview closes, one still loading opens no window, and
+    /// no image or diagram expands over it.
+    func testAGoneConversationClosesItsPreviewAndOpensNoneAfter() async throws {
+        _ = NSApplication.shared
+        let surface = surface([renderItem()])
+        try await surface.actions.previewHTMLDocument(attachmentID: "html")
+        XCTAssertNotNil(surface.actions.htmlPreview)
+        final class Gate: @unchecked Sendable { var entered = false; var open = false }
+        let gate = Gate(), html = html
+        surface.fetchAttachment = { _, _ in
+            gate.entered = true
+            while !gate.open { try await Task.sleep(for: .milliseconds(10)) }
+            return html
+        }
+        let loading = Task { try await surface.actions.previewHTMLDocument(attachmentID: "html") }
+        while !gate.entered { try await Task.sleep(for: .milliseconds(10)) }
+        surface.actions.closeWindows()
+        XCTAssertNil(surface.actions.htmlPreview)
+        gate.open = true
+        try await loading.value
+        XCTAssertNil(surface.actions.htmlPreview, "A preview loading as the conversation went opens no window")
+        let image = AgentChatAttachmentDescriptor(id: "image", name: "image.png", mimeType: "image/png", byteCount: 1)
+        surface.actions.expand(AgentMediaPreviewWindow(item: "item", attachments: [image], index: 0, fetch: { _, _ in Data() }, theme: .shared))
+        XCTAssertNil(surface.actions.expandedMedia, "Nothing expands over a conversation that went")
+        try await surface.actions.playMarkdownMedia(AgentMarkdownMedia(source: "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=", kind: .audio))
+        XCTAssertNil(surface.actions.markdownMediaPlayer, "Nothing plays for a conversation that went")
+    }
+
     func testPreviewRefusesAnItemThatIsNoLongerRetained() async throws {
         let surface = surface([renderItem()])
         surface.render(.init(session: SessionId(), project: ProjectId(), provider: .codex, status: .idle, revision: 2, items: []))

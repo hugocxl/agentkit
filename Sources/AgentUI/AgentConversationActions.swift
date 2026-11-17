@@ -19,10 +19,12 @@ final class AgentConversationActions {
     private var snapshot: AgentChatSnapshot? { surface?.snapshot }
     /// The open HTML document preview, if any.
     private(set) var htmlPreview: AgentConversationMediaWindow?
-    /// The open gallery of assistant Markdown images, if any.
-    private(set) var markdownMediaPreview: AgentMediaPreviewWindow?
+    /// The image or diagram expanded over the conversation, if any.
+    private(set) var expandedMedia: AgentMediaPreviewWindow?
     /// The open player of assistant Markdown video or audio, if any.
     private(set) var markdownMediaPlayer: AgentConversationMediaWindow?
+    /// Set once the conversation goes: it opens no window after.
+    private(set) var windowsClosed = false
 
     private func retained(_ id: String) throws -> AgentChatItem {
         guard let item = snapshot?.items.first(where: { $0.id == id }) else { throw ModelError("This message is no longer retained.") }
@@ -213,6 +215,7 @@ final class AgentConversationActions {
     /// inside the sandbox of the response; navigation away from it is blocked.
     func previewHTMLDocument(attachmentID: String, title: String? = nil) async throws {
         let document = try await htmlDocument(attachmentID: attachmentID)
+        guard !windowsClosed else { return }
         let name = title ?? AgentHtmlDocumentReference.title(in: document.data) ?? document.match.ownership.toolName
         let next = try AgentConversationMediaWindow.htmlDocument(data: document.data, name: name)
         next.onOpenLink = { [weak self] url in
@@ -237,9 +240,36 @@ final class AgentConversationActions {
             guard let offset = Int(descriptor.id), gallery.indices.contains(offset) else { throw ModelError("This image is unavailable.") }
             return try await loader.entry(for: gallery[offset]).data
         }, theme: surface.theme)
-        markdownMediaPreview?.close()
-        markdownMediaPreview = preview
-        preview.present(in: surface.window)
+        expand(preview)
+    }
+
+    /// Shows `preview` over the conversation in its current theme, in place of the one shown.
+    func expand(_ preview: AgentMediaPreviewWindow) {
+        guard !windowsClosed else { return }
+        expandedMedia?.close()
+        if let surface { preview.follow(surface.theme) }
+        preview.onClose = { [weak self, weak preview] in
+            if let self, self.expandedMedia === preview { self.expandedMedia = nil }
+        }
+        expandedMedia = preview
+        preview.present(in: surface?.window)
+    }
+
+    /// Closes the expanded image or diagram.
+    func closeExpandedMedia() {
+        expandedMedia?.close()
+        expandedMedia = nil
+    }
+
+    /// Closes every window the conversation opened, as when it goes, and opens none after,
+    /// however late a preview finishes loading.
+    func closeWindows() {
+        windowsClosed = true
+        closeExpandedMedia()
+        htmlPreview?.close()
+        htmlPreview = nil
+        markdownMediaPlayer?.close()
+        markdownMediaPlayer = nil
     }
 
     /// Plays assistant Markdown video or audio: project files and `data:` URIs in the
@@ -259,6 +289,7 @@ final class AgentConversationActions {
             next = try AgentConversationMediaWindow(resource: file.resource, name: media.name)
         }
         try Task.checkCancellation()
+        guard !windowsClosed else { return }
         markdownMediaPlayer?.close()
         markdownMediaPlayer = next
         presentWindow(next)

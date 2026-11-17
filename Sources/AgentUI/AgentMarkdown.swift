@@ -400,6 +400,10 @@ extension NSAttributedString.Key {
 private final class AgentTextLayoutManager: NSLayoutManager, NSLayoutManagerDelegate {
     /// Off while the text streams, so half-written link hosts are never looked up.
     var fetchesFavicons = true
+    /// The theme branded link icons are drawn in: the conversation's.
+    var iconTheme: AgentTheme?
+    /// Where link icons come from; tests stand in their own.
+    var favicons: AgentLinkFavicon?
     override init() {
         super.init()
         // Rich-text rows ensure layout when measured. Background TextKit work
@@ -490,6 +494,17 @@ private final class AgentTextLayoutManager: NSLayoutManager, NSLayoutManagerDele
         return NSRect(x: 0, y: 0, width: label.size().width + (size.map { AgentExternalLinkLayout.inset(fontSize: $0) } ?? 0) + codeWidth, height: label.size().height)
     }
 
+    /// The remote-image setting of the conversation this text shows; text outside one
+    /// fetches no link icon.
+    @MainActor private var remoteImagePolicy: RemoteImagePolicy {
+        var view: NSView? = textContainers.first?.textView
+        while let current = view {
+            if let scope = current as? AgentRemoteImageScope { return scope.remoteImagePolicy }
+            view = current.superview
+        }
+        return .never
+    }
+
     override func drawGlyphs(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
         super.drawGlyphs(forGlyphRange: glyphsToShow, at: origin)
         guard let textStorage else { return }
@@ -511,7 +526,10 @@ private final class AgentTextLayoutManager: NSLayoutManager, NSLayoutManagerDele
                     // callback does not carry that isolation in its signature.
                     let fileIcon = textStorage.attribute(.agentFileLinkImage, at: range.location, effectiveRange: nil) as? NSImage
                     let fetch = fetchesFavicons
-                    let icon = fileIcon ?? MainActor.assumeIsolated { AgentLinkFavicon.shared.image(for: url, color: color, manager: self, fetch: fetch) }
+                    let icon = fileIcon ?? MainActor.assumeIsolated {
+                        (self.favicons ?? AgentLinkFavicon.shared).image(for: url, color: color, theme: self.iconTheme, manager: self,
+                                                                         fetch: fetch, remoteImages: { self.remoteImagePolicy })
+                    }
                     if let image = icon {
                         let rect = NSRect(x: origin.x + fragment.minX + location.x + size * 0.25,
                             y: origin.y + fragment.minY + location.y - 14 + size * 0.125, width: 14, height: 14)
@@ -670,6 +688,22 @@ final class AgentRichTextView: NSTextView {
     private let ownedStorage: NSTextStorage?
     /// Metadata tooltips over file links; nil unless a conversation supplies its services.
     private(set) var fileLinkHover: AgentFileLinkHover?
+
+    /// The theme branded link icons are drawn in.
+    var linkIconTheme: AgentTheme {
+        get { (layoutManager as? AgentTextLayoutManager)?.iconTheme ?? .shared }
+        set {
+            guard let manager = layoutManager as? AgentTextLayoutManager, manager.iconTheme !== newValue else { return }
+            manager.iconTheme = newValue
+            needsDisplay = true
+        }
+    }
+
+    /// Where link icons come from; tests stand in their own.
+    var linkFavicons: AgentLinkFavicon? {
+        get { (layoutManager as? AgentTextLayoutManager)?.favicons }
+        set { (layoutManager as? AgentTextLayoutManager)?.favicons = newValue }
+    }
 
     /// Whether link icons may be fetched; off while the message streams.
     var fetchesFavicons: Bool {

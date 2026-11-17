@@ -78,18 +78,17 @@ open class ThemedView: NSView {
     }
 }
 
-/// Calls `update` now and whenever the shared theme's palette changes, while
-/// the view is in a window; for native controls tinted with theme colors.
+/// Calls `update` now and whenever `theme`'s palette changes, while the view is
+/// in a window; for native controls tinted with theme colors.
 @MainActor
 final class PaletteObserver {
     private var observation: AnyCancellable?
 
-    func observe(_ view: NSView, update: @escaping () -> Void) {
+    func observe(_ view: NSView, theme: AgentTheme, update: @escaping () -> Void) {
         guard view.window != nil else {
             observation = nil
             return
         }
-        let theme = AgentTheme.shared
         observation = Publishers.Merge3(theme.$palette.dropFirst().map { _ in () },
                                         theme.$interface.dropFirst().map { _ in () },
                                         theme.$accessibility.dropFirst().map { _ in () })
@@ -187,5 +186,15 @@ private struct ThemeColors: Equatable {
     init(_ theme: AgentTheme) {
         palette = theme.palette
         scheme = theme.scheme
+    }
+}
+
+extension AgentTheme {
+    /// Fires on the main queue once the theme's palette, interface or accessibility changed in
+    /// place, as for the system appearance, after the new values are stored.
+    var changes: AnyPublisher<Void, Never> {
+        Publishers.Merge3($palette.dropFirst().map { _ in () }, $interface.dropFirst().map { _ in () }, $accessibility.dropFirst().map { _ in () })
+            .receive(on: DispatchQueue.main)
+            .eraseToAnyPublisher()
     }
 }

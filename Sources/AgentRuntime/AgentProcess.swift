@@ -1,11 +1,16 @@
 import AgentCore
 import Darwin
 import Foundation
+import os
 
 /// NDJSON transport. Readers drain both pipes independently; stdout EOF precedes exit delivery.
 internal final class AgentProcess: @unchecked Sendable {
     // Eight 10 MiB tool images expand to about 107 MiB of base64, plus metadata.
     static let maxLineBytes = 128 * 1024 * 1024
+    /// How long a stopped provider has before it is killed; tests stretch it.
+    nonisolated(unsafe) static var stopGrace: TimeInterval = 1
+    /// Tests learn here, with the input held, that a write waits for a provider to read.
+    var onWriteWaiting: (@Sendable () -> Void)?
     struct Launch: Sendable {
         var executable: URL
         var arguments: [String]
@@ -18,6 +23,14 @@ internal final class AgentProcess: @unchecked Sendable {
     private let errors = Pipe()
     private var stopped = false
     private let lock = NSLock()
+    /// Set when it ended the provider itself, as for a line past the limit.
+    private let ended = OSAllocatedUnfairLock(initialState: false)
+    /// Set once it is asked to stop, read without the input lock a write may hold for seconds.
+    private let stopRequested = OSAllocatedUnfairLock(initialState: false)
+
+    /// Whether it was asked to stop, by its runtime or by itself, while it may still run:
+    /// until it has exited it may still change files.
+    var isStopping: Bool { (stopRequested.withLock { $0 } || ended.withLock { $0 }) && process.isRunning }
 
     static func environment() -> [String: String] {
         var environment = ProcessInfo.processInfo.environment
@@ -45,8 +58,8 @@ internal final class AgentProcess: @unchecked Sendable {
         throw AgentRuntimeError("\(name) CLI was not found. Install \(name == "claude" ? "Claude Code" : "Codex"), sign in with `\(name)`, and ensure it is on PATH (for example ~/.local/bin or /opt/homebrew/bin).")
     }
 
-    init(launch: Launch, directory: String, onLine: @escaping @Sendable (Data) -> Void,
-         onExit: @escaping @Sendable (Int32, String) -> Void) throws {
+    init(launch: Launch, directory: String, maxLineBytes: Int = AgentProcess.maxLineBytes,
+         onLine: @escaping @Sendable (Data) -> Void, onExit: @escaping @Sendable (Int32, String) -> Void) throws {
         process.executableURL = launch.executable
         process.arguments = launch.arguments
         process.environment = launch.environment
@@ -74,7 +87,7 @@ internal final class AgentProcess: @unchecked Sendable {
                 stderr.append(chunk)
             }
         }
-        Thread.detachNewThread { [output, process] in
+        Thread.detachNewThread { [output, process, ended] in
             var buffer = Data()
             var searchedThrough = 0
             var oversized = false
@@ -82,16 +95,22 @@ internal final class AgentProcess: @unchecked Sendable {
                 buffer.append(chunk)
                 while let newline = buffer[buffer.index(buffer.startIndex, offsetBy: searchedThrough)...].firstIndex(of: 10) {
                     let length = buffer.distance(from: buffer.startIndex, to: newline)
-                    if length > Self.maxLineBytes { oversized = true; process.terminate(); break readLoop }
+                    if length > maxLineBytes {
+                        oversized = true
+                        ended.withLock { $0 = true }
+                        Self.end(process)
+                        break readLoop
+                    }
                     let line = Data(buffer[..<newline])
                     buffer.removeSubrange(...newline)
                     searchedThrough = 0
                     if !line.isEmpty { onLine(line) }
                 }
                 searchedThrough = buffer.count
-                if buffer.count > Self.maxLineBytes {
+                if buffer.count > maxLineBytes {
                     oversized = true
-                    process.terminate()
+                    ended.withLock { $0 = true }
+                    Self.end(process)
                     break
                 }
             }
@@ -141,6 +160,7 @@ internal final class AgentProcess: @unchecked Sendable {
                 guard count < 0, errno == EAGAIN || errno == EWOULDBLOCK else {
                     throw AgentRuntimeError("Could not write agent input: \(String(cString: strerror(errno)))")
                 }
+                onWriteWaiting?()
                 var readiness = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
                 let result = Darwin.poll(&readiness, 1, 50)
                 if result < 0, errno != EINTR {
@@ -154,17 +174,66 @@ internal final class AgentProcess: @unchecked Sendable {
     }
 
     func stop() {
+        stopRequested.withLock { $0 = true }
         lock.lock()
         defer { lock.unlock() }
         guard !stopped else { return }
         stopped = true
         try? input.fileHandleForWriting.close()
         guard process.isRunning else { return }
+        Self.end(process)
+    }
+
+    /// Asks `process` to end, and kills it once `stopGrace` has passed if it took no notice.
+    private static func end(_ process: Process) {
         process.terminate()
         // Foundation's reader thread always waits/reaps, including escalation.
-        DispatchQueue.global().asyncAfter(deadline: .now() + 1) { [process] in
+        DispatchQueue.global().asyncAfter(deadline: .now() + stopGrace) { [process] in
             if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
         }
+    }
+
+    var isRunning: Bool { process.isRunning }
+
+    /// Its process's identifier, once launched.
+    var processIdentifier: Int32 { process.processIdentifier }
+
+    /// Where a process works now, as the system knows it.
+    enum WorkingDirectory: Equatable {
+        /// The folder the system names, checked to be the one it works in.
+        case folder(String)
+        /// A name that can't be trusted, such as a deep folder's cut short or a removed one's.
+        case unknown
+    }
+
+    /// Where process `pid` works now, wherever it launched; nil once it is gone.
+    static func workingDirectory(of pid: Int32) -> WorkingDirectory? {
+        guard pid > 0 else { return nil }
+        var info = proc_vnodepathinfo()
+        let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size) == size else {
+            return kill(pid, 0) == -1 && errno == ESRCH ? nil : .unknown
+        }
+        let path = withUnsafeBytes(of: &info.pvi_cdir.vip_path) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+        // The system keeps only a long path's tail, and a removed folder's old name, which
+        // another folder may have taken since.
+        var status = stat()
+        guard path.hasPrefix("/"), stat(path, &status) == 0,
+              UInt32(bitPattern: status.st_dev) == info.pvi_cdir.vip_vi.vi_stat.vst_dev,
+              status.st_ino == info.pvi_cdir.vip_vi.vi_stat.vst_ino else { return .unknown }
+        return .folder(path)
+    }
+
+    /// Waits until the stopped provider has exited, killing it once `grace` passes, so a
+    /// provider that ignores the request can't outlive a host about to exit and take the
+    /// scheduled escalation with it.
+    func waitForExit(grace: TimeInterval = 1) {
+        let deadline = Date().addingTimeInterval(grace)
+        while process.isRunning, Date() < deadline { usleep(10_000) }
+        guard process.isRunning else { return }
+        _ = Darwin.kill(process.processIdentifier, SIGKILL)
+        let reaped = Date().addingTimeInterval(1)
+        while process.isRunning, Date() < reaped { usleep(10_000) }
     }
 
     deinit { stop() }

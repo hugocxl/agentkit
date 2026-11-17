@@ -26,8 +26,8 @@ final class AgentCheckpointDiffWindow: NSWindowController, NSWindowDelegate, NST
     /// Opens the file in the editor at a line of the diff.
     var onOpenFile: ((String, Int?) -> Void)? { didSet { surface.openInEditor.isHidden = onOpenFile == nil } }
     var reviewComments: [AgentReviewComment] = [] { didSet { surface.updateReviewCount(reviewComments.count) } }
-    private var commentEditor: AgentTextEditorSheet?
-    private var commentPicker: AgentSearchPicker?
+    private(set) var commentEditor: AgentTextEditorSheet?
+    private(set) var commentPicker: AgentSearchPicker?
 
     init(session: SessionId, checkpoint: String, path: String?, theme: AgentTheme, fetch: @escaping Fetch) {
         self.session = session; self.checkpoint = checkpoint; self.fetch = fetch
@@ -66,6 +66,19 @@ final class AgentCheckpointDiffWindow: NSWindowController, NSWindowDelegate, NST
         load(path: path)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    /// The theme the window draws in.
+    var theme: AgentTheme { surface.theme }
+
+    /// Shows this window in `theme` from now on, as its conversation does.
+    func follow(_ theme: AgentTheme) {
+        guard surface.theme !== theme else { return }
+        surface.theme = theme
+        surface.themeDidChange()
+        commentEditor?.follow(theme)
+        commentPicker?.follow(theme)
+    }
+
     private func load(path: String?) {
         loadTask?.cancel()
         surface.showMessage("Loading changed files…")
@@ -132,7 +145,7 @@ final class AgentCheckpointDiffWindow: NSWindowController, NSWindowDelegate, NST
                                       firstLine: lines.first, lastLine: lines.last, source: lines.source, text: ""), existing: false)
     }
 
-    private func showComments() {
+    func showComments() {
         guard commentEditor == nil else { return }
         commentPicker?.close()
         let picker = AgentSearchPicker(title: "Review comments", placeholder: "Search comments or files…", theme: surface.theme)
@@ -147,7 +160,7 @@ final class AgentCheckpointDiffWindow: NSWindowController, NSWindowDelegate, NST
         picker.present(in: window)
     }
 
-    private func editComment(_ comment: AgentReviewComment, existing: Bool) {
+    func editComment(_ comment: AgentReviewComment, existing: Bool) {
         guard commentEditor == nil, let window else { return }
         let editor = AgentTextEditorSheet(title: existing ? "Edit review comment" : "Add review comment",
             detail: comment.location + "\nCheckpoint: " + checkpoint,
@@ -206,6 +219,8 @@ private final class AgentCheckpointDiffSurface: ThemedView {
     let reviewComments = PillButton("Comments", style: .plain)
     let draftReview = PillButton("Add comments to draft", style: .normal)
     private var reviewEnabled = false
+    /// The shown diff's line counts, colored again when the theme changes.
+    private var shownCounts: (additions: UInt64, deletions: UInt64)?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -249,8 +264,10 @@ private final class AgentCheckpointDiffSurface: ThemedView {
         diffScroll.isHidden = true; note.isHidden = true
         self.retry.isHidden = !retry
         counts.stringValue = ""
+        shownCounts = nil
     }
     func setDiff(_ diff: GitDiff) {
+        shownCounts = (diff.additions, diff.deletions)
         counts.attributedStringValue = AgentChangedFilesRow.stat(diff.additions, diff.deletions, font: AppFont.small, theme: theme)
         if diff.binary { showMessage("Binary file changed."); return }
         message.isHidden = true; retry.isHidden = true
@@ -306,6 +323,9 @@ private final class AgentCheckpointDiffSurface: ThemedView {
         wantsLayer = true; layer?.backgroundColor = theme.card.cgColor
         rows.theme = theme; rows.themeDidChange()
         path.textColor = theme.fg; message.textColor = theme.fgMuted; note.textColor = theme.fgDim
+        if let shownCounts {
+            counts.attributedStringValue = AgentChangedFilesRow.stat(shownCounts.additions, shownCounts.deletions, font: AppFont.small, theme: theme)
+        }
         files.reloadData()
     }
 }

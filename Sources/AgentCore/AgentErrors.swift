@@ -10,6 +10,9 @@ public struct ServiceError: Error, Sendable, CustomStringConvertible {
 
     public var description: String { message }
 }
+extension ServiceError: LocalizedError {
+    public var errorDescription: String? { message }
+}
 public extension ServiceError {
     static func unknownSession(_ id: SessionId) -> ServiceError { ServiceError(.unknownSession, "Unknown conversation: \(id)") }
 }

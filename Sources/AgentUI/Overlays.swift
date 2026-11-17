@@ -19,10 +19,13 @@ public enum Toast {
         }
     }
 
-    /// Shows `message` among the notices of `view`'s window.
+    /// Shows `message` where the host of `view`'s conversation shows notices, else
+    /// among the notices of `view`'s window, else in the conversation's own.
     @MainActor
     public static func show(_ message: String, style: Style = .info, in view: NSView) {
-        guard let stack = view.window?.contentView?.subviews.lazy.compactMap({ $0 as? NoticeStack }).first else { return }
+        let pane = sequence(first: view, next: { $0.superview }).lazy.compactMap({ $0 as? AgentPaneView }).first
+        if let pane, let host = pane.actions.project as? AgentHostActions, host.showNotice(message, style: style) { return }
+        guard let stack = view.window?.contentView?.subviews.lazy.compactMap({ $0 as? NoticeStack }).first ?? pane?.ownNotices() else { return }
         stack.show(notice(message, style: style), lifetime: lifetime(style))
     }
 }

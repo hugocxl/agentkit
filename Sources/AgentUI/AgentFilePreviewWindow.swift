@@ -25,6 +25,7 @@ struct AgentFilePreviewPayload: @unchecked Sendable {
 @MainActor
 final class AgentFilePreviewWindow: NSWindowController, NSWindowDelegate {
     let content = AgentFilePreviewView(frame: .zero)
+    let icon: FileIconView
     private let item: String
     private let attachment: AgentChatAttachmentDescriptor
     private let fetch: AgentAttachmentCache.Fetch
@@ -32,17 +33,23 @@ final class AgentFilePreviewWindow: NSWindowController, NSWindowDelegate {
     private var generation = 0
     private var data: Data?
 
-    init(item: String, attachment: AgentChatAttachmentDescriptor, fetch: @escaping AgentAttachmentCache.Fetch, theme: AgentTheme) {
+    /// `remoteImages` is the setting of the conversation the file is from.
+    init(item: String, attachment: AgentChatAttachmentDescriptor, fetch: @escaping AgentAttachmentCache.Fetch, theme: AgentTheme,
+         remoteImages: @escaping () -> RemoteImagePolicy = { AgentSettings().remoteImages }) {
         self.item = item; self.attachment = attachment; self.fetch = fetch
+        content.remoteImages = remoteImages
+        icon = FileIconView(path: attachment.name)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 600), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.title = attachment.name; window.isReleasedWhenClosed = false
         super.init(window: window)
         let accessory = NSTitlebarAccessoryViewController()
-        let icon = FileIconView(path: attachment.name)
         icon.theme = theme; icon.themeDidChange()
         accessory.view = icon; accessory.layoutAttribute = .left
         window.addTitlebarAccessoryViewController(accessory)
         content.theme = theme; content.themeDidChange()
+        // Its frame and native controls in the conversation's appearance, as it changes in place too.
+        window.appearance = theme.nsAppearance
+        content.onColorsChange = { [weak self] in self?.window?.appearance = self?.content.theme.nsAppearance }
         window.contentView = content; window.delegate = self
         window.minSize = NSSize(width: 360, height: 240); window.center()
         content.retry.onPress = { [weak self] in self?.load() }
@@ -58,8 +65,20 @@ final class AgentFilePreviewWindow: NSWindowController, NSWindowDelegate {
         load()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    /// Draws with `theme` from now on, as the conversation that opened it does.
+    func follow(_ theme: AgentTheme) {
+        guard content.theme !== theme else { return }
+        icon.theme = theme; icon.themeDidChange()
+        content.theme = theme; content.themeDidChange()
+        window?.appearance = theme.nsAppearance
+        content.expanded?.follow(theme)
+    }
     deinit { task?.cancel() }
-    func windowWillClose(_ notification: Notification) { task?.cancel(); generation += 1; data = nil; content.pdf.document = nil }
+    func windowWillClose(_ notification: Notification) {
+        task?.cancel(); generation += 1; data = nil; content.pdf.document = nil
+        content.expanded?.close()
+    }
     private func load() {
         task?.cancel(); generation += 1
         let token = generation, fetch = fetch, item = item, attachment = attachment
@@ -92,7 +111,23 @@ final class AgentFilePreviewWindow: NSWindowController, NSWindowDelegate {
 }
 
 @MainActor
-final class AgentFilePreviewView: ThemedView {
+final class AgentFilePreviewView: ThemedView, AgentMediaExpanding, AgentRemoteImageScope {
+    /// A diagram of the file expanded over it.
+    private(set) var expanded: AgentMediaPreviewWindow?
+    /// The remote-image setting of the conversation the file is from.
+    var remoteImages: () -> RemoteImagePolicy = { AgentSettings().remoteImages }
+    var remoteImagePolicy: RemoteImagePolicy { remoteImages() }
+
+    func expand(_ preview: AgentMediaPreviewWindow) {
+        expanded?.close()
+        preview.follow(theme)
+        preview.onClose = { [weak self, weak preview] in
+            if let self, self.expanded === preview { self.expanded = nil }
+        }
+        expanded = preview
+        preview.present(in: window)
+    }
+
     let pdf = PDFView()
     let scroll = NSScrollView()
     let text = AgentRichTextView(frame: .zero)

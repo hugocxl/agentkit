@@ -6,6 +6,12 @@ import Speech
 /// Audio is used only after an explicit click. Recognition never sends audio off the Mac.
 @MainActor
 final class AgentVoice: NSObject {
+    /// The app whose microphone and speech permissions System Settings lists.
+    static var applicationName: String {
+        let info = Bundle.main.infoDictionary
+        return info?["CFBundleDisplayName"] as? String ?? info?["CFBundleName"] as? String ?? "this app"
+    }
+
     enum State: Equatable { case idle, authorizing, listening }
     private(set) var state: State = .idle { didSet { onChange?() } }
     var onChange: (() -> Void)?
@@ -33,14 +39,14 @@ final class AgentVoice: NSObject {
             let microphone = await AVCaptureDevice.requestAccess(for: .audio)
             guard !Task.isCancelled, let self, self.generation == token else { return }
             guard microphone else {
-                self.stop(); self.onError?("Allow microphone access for Tab in System Settings → Privacy & Security → Microphone."); return
+                self.stop(); self.onError?("Allow microphone access for \(Self.applicationName) in System Settings → Privacy & Security → Microphone."); return
             }
             let permission = await withCheckedContinuation { continuation in
                 SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0) }
             }
             guard !Task.isCancelled, self.generation == token else { return }
             guard permission == .authorized else {
-                self.stop(); self.onError?("Allow speech recognition for Tab in System Settings → Privacy & Security → Speech Recognition."); return
+                self.stop(); self.onError?("Allow speech recognition for \(Self.applicationName) in System Settings → Privacy & Security → Speech Recognition."); return
             }
             do { try self.startRecognition(token: token) }
             catch { self.stop(); self.onError?(error.localizedDescription) }

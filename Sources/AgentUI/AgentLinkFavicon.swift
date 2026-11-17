@@ -1,6 +1,27 @@
 import AgentCore
 import AppKit
 
+/// A view showing one conversation's content, which follows that conversation's
+/// remote-image setting.
+@MainActor
+protocol AgentRemoteImageScope: AnyObject {
+    var remoteImagePolicy: RemoteImagePolicy { get }
+}
+
+/// Holds a window's content from one conversation, following its remote-image setting.
+@MainActor
+final class AgentRemoteImageScopeView: NSView, AgentRemoteImageScope {
+    var remoteImages: () -> RemoteImagePolicy
+    var remoteImagePolicy: RemoteImagePolicy { remoteImages() }
+
+    init(remoteImages: @escaping () -> RemoteImagePolicy) {
+        self.remoteImages = remoteImages
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+}
+
 /// Lazy shared favicon state, matching the source renderer's blank loading box and sticky globe fallback.
 @MainActor
 final class AgentLinkFavicon {
@@ -11,8 +32,6 @@ final class AgentLinkFavicon {
     private var images: [String: NSImage] = [:]
     private var failed: Set<String> = []
     private let fetch: Fetch
-    /// The remote-image setting: with `never`, no link icon is fetched either.
-    var policy: () -> RemoteImagePolicy = { AgentSettings().remoteImages }
 
     init(fetch: Fetch? = nil) {
         self.fetch = fetch ?? { url in
@@ -67,17 +86,19 @@ final class AgentLinkFavicon {
     }
 
     /// The icon for `url`'s host. `fetch` false, as while the message still streams and
-    /// its hosts may be half written, uses only what is already loaded, else a globe.
-    func image(for url: URL, color: NSColor, manager: NSLayoutManager? = nil, fetch allowed: Bool = true) -> NSImage? {
+    /// its hosts may be half written, uses only what is already loaded, else a globe; so
+    /// does `remoteImages`, the setting of the conversation the link is in, when `never`.
+    func image(for url: URL, color: NSColor, theme: AgentTheme? = nil, manager: NSLayoutManager? = nil, fetch allowed: Bool = true,
+               remoteImages: () -> RemoteImagePolicy = { AgentSettings().remoteImages }) -> NSImage? {
         guard let host = Self.host(for: url) else { return nil }
         if let brand = Self.brand(for: host) {
-            return AppIcon(rawValue: brand)?.image(size: 14, theme: AgentTheme.shared)
+            return AppIcon(rawValue: brand)?.image(size: 14, theme: theme ?? AgentTheme.shared)
         }
         guard let request = Self.requestURL(host: host), !failed.contains(host) else {
             return AppIcon.globe.image(size: 14, scale: AppIcon.inlineScale, color: color)
         }
         if let image = images[host] { return image }
-        guard allowed, policy() != .never else { return AppIcon.globe.image(size: 14, scale: AppIcon.inlineScale, color: color) }
+        guard allowed, remoteImages() != .never else { return AppIcon.globe.image(size: 14, scale: AppIcon.inlineScale, color: color) }
         if var observers = waiting[host] {
             if let manager, !observers.contains(where: { $0.manager === manager }) {
                 observers.removeAll { $0.manager == nil }; observers.append(Observer(manager: manager)); waiting[host] = observers
