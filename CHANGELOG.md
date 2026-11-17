@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1 - 2026-11-17
+
+### Fixed
+
+- Validate with the Xcode 27 SDK used for development and host releases instead of the hosted runner default.
+
 ## 1.2.0 - 2026-11-17
 
 ### Added
