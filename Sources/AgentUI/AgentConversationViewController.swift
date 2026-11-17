@@ -20,6 +20,12 @@ public final class AgentConversationViewController: NSViewController {
         get { controller.surface.theme }
         set { controller.surface.theme = newValue; controller.surface.themeDidChange() }
     }
+    /// Whether the conversation paints its pane background. Disable this to use
+    /// the embedding application's background; the composer keeps its styling.
+    public var drawsBackground: Bool {
+        get { controller.surface.drawsBackground }
+        set { controller.surface.drawsBackground = newValue }
+    }
     /// Called when the title or other conversation presentation changes.
     public var onChange: (() -> Void)? {
         get { controller.titleDidChange }

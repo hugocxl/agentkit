@@ -680,7 +680,7 @@ enum AgentToolRowPresentation {
     /// that way, so it reads as interrupted rather than running forever.
     static func status(_ item: AgentChatItem) -> AgentToolActivity.Status {
         let status = item.tool?.status ?? (item.isComplete ? .completed : .running)
-        return item.isComplete && status == .running ? .interrupted : status
+        return item.isComplete && (status == .running || status == .queued) ? .interrupted : status
     }
 
     /// The muted note after a tool's name: how it ended, if not plainly, and how long it
@@ -689,6 +689,8 @@ enum AgentToolRowPresentation {
         var parts: [String] = []
         let exitCode = activity?.presentsCommand == true ? activity?.exitCode : nil
         switch status {
+        case .queued: parts.append("Queued")
+        case .timedOut: parts.append("Timed out")
         case .interrupted: parts.append("Interrupted")
         case .failed: parts.append(exitCode.map { $0 != 0 ? "exit \($0)" : "Failed" } ?? "Failed")
         case .completed: if let exitCode, exitCode != 0 { parts.append("exit \(exitCode)") }
@@ -702,7 +704,7 @@ enum AgentToolRowPresentation {
     }
 
     static func indicatesFailure(_ activity: AgentToolActivity?, status: AgentToolActivity.Status) -> Bool {
-        if status == .failed || status == .denied { return true }
+        if status == .failed || status == .timedOut || status == .denied { return true }
         return activity?.presentsCommand == true && (activity?.exitCode ?? 0) != 0
     }
 

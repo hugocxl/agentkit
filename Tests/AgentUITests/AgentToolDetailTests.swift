@@ -136,6 +136,9 @@ final class AgentToolDetailTests: XCTestCase {
         XCTAssertFalse(glyphShown(shown))
         XCTAssertEqual(shown.suffix, "Interrupted")
         XCTAssertEqual(shown.iconColor, AgentTheme.shared.fgDim, "Interrupted is not a failure")
+        item.tool?.status = .queued
+        shown = try header(item)
+        XCTAssertEqual(shown.suffix, "Interrupted", "A recovered queued call is no longer pending")
         XCTAssertEqual(AgentCommandPresentation.output(AgentToolActivity(status: .interrupted), theme: .shared).string,
                        "Interrupted before output")
         XCTAssertEqual(AgentCommandPresentation.output(AgentToolActivity(status: .completed), theme: .shared).string, "No output.")

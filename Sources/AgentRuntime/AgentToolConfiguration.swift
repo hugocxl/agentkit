@@ -3,7 +3,8 @@ import Foundation
 
 /// Registers the host application's operations once for both Claude and Codex.
 /// Handlers run asynchronously and must honor cancellation before committing an edit.
-/// Calls in one conversation execute in order; duplicate call IDs reuse their result.
+/// Mutations execute in order; explicitly independent reads may bypass them.
+/// Duplicate call IDs reuse their result within a provider process.
 public struct AgentToolConfiguration: Sendable {
     public enum Access: Sendable {
         /// Application edits go through registered handlers. Claude's built-in tools
@@ -15,12 +16,22 @@ public struct AgentToolConfiguration: Sendable {
     }
     public var definitions: [AgentToolDefinition]
     public var access: Access
+    /// Only snapshot reads and cancellation/status operations belong here.
+    public var concurrentTools: Set<String>
+    /// Bounds a host invocation, not background work it explicitly schedules.
+    public var executionTimeout: TimeInterval
     public var handle: @Sendable (AgentToolCall) async -> AgentToolResult
     public init(_ definitions: [AgentToolDefinition], access: Access = .applicationOnly,
+                concurrentTools: Set<String> = [], executionTimeout: TimeInterval = 30,
                 handle: @escaping @Sendable (AgentToolCall) async -> AgentToolResult) {
         self.definitions = definitions; self.access = access; self.handle = handle
+        self.concurrentTools = concurrentTools; self.executionTimeout = executionTimeout
     }
     func validate() throws {
+        guard executionTimeout.isFinite, executionTimeout > 0,
+              concurrentTools.isSubset(of: Set(definitions.map(\.name))) else {
+            throw ModelError("Tool deadlines must be positive and independent tools must be registered.")
+        }
         guard Set(definitions.map(\.name)).count == definitions.count else {
             throw ModelError("Application tool names must be unique.")
         }

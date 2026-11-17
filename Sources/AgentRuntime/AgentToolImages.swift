@@ -14,7 +14,14 @@ internal enum AgentToolImages {
         var images: [AgentChatAttachment] = []
         var replacements: [AgentProviderJSON.Replacement] = []
         func block(_ value: Any, path: [AgentProviderJSON.Component]) -> Any {
-            guard let value = value as? [String: Any], value["type"] as? String == "image" else { return value }
+            guard let original = value as? [String: Any] else { return value }
+            var value = original
+            if value["type"] as? String == "inputImage", let url = value["imageUrl"] as? String {
+                guard url.hasPrefix("data:"), let separator = url.range(of: ";base64,") else { return original }
+                value = ["type": "image", "mimeType": String(url[url.index(url.startIndex, offsetBy: 5)..<separator.lowerBound]),
+                         "data": String(url[separator.upperBound...])]
+            }
+            guard value["type"] as? String == "image" else { return original }
             let source = value["source"] as? [String: Any]
             if let source, source["type"] as? String != "base64" { return value }
             guard let mime = (source == nil ? value["mimeType"] : source?["media_type"]) as? String,
@@ -37,8 +44,12 @@ internal enum AgentToolImages {
             let cleaned = values.enumerated().map { block($0.element, path: [.index($0.offset)]) }
             return Projection(output: cleaned, images: images, replacements: replacements)
         }
-        if var object = output as? [String: Any], let content = object["content"] as? [Any] {
-            object["content"] = content.enumerated().map { block($0.element, path: [.key("content"), .index($0.offset)]) }
+        if var object = output as? [String: Any], object["type"] == nil {
+            for key in ["content", "contentItems"] {
+                if let content = object[key] as? [Any] {
+                    object[key] = content.enumerated().map { block($0.element, path: [.key(key), .index($0.offset)]) }
+                }
+            }
             return Projection(output: object, images: images, replacements: replacements)
         }
         if let output {

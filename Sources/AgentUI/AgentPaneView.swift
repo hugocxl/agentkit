@@ -747,10 +747,14 @@ final class AgentPaneView: ThemedView {
         transcript.setApprovalsEnabled(enabled)
     }
 
+    var drawsBackground = true {
+        didSet { needsDisplay = true }
+    }
+
     override var wantsUpdateLayer: Bool { true }
 
     override func updateLayer() {
-        layer?.backgroundColor = theme.paneBackground.cgColor
+        layer?.backgroundColor = drawsBackground ? theme.paneBackground.cgColor : NSColor.clear.cgColor
     }
 
     override func themeDidChange() {

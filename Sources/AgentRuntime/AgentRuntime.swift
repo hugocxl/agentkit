@@ -1,5 +1,6 @@
 import AgentCore
 import Foundation
+import OSLog
 
 internal enum AgentRuntimeEvent: Sendable {
     case item(AgentChatItem)
@@ -58,7 +59,10 @@ internal final class AgentRuntime: @unchecked Sendable {
     private var applicationCalls: [String: ApplicationCall] = [:]
     private var applicationCallOrder: [String] = []
     private var applicationTasks: [String: Task<Void, Never>] = [:]
-    private var applicationTail: Task<Void, Never>?
+    private var applicationQueue: [String] = []
+    private var applicationSerialID: String?
+    private var applicationLeases: [UUID: AgentToolExecutionContext] = [:]
+    private var cancellingApplicationTools = false
     private var applicationOnly: Bool { applicationTools?.applicationOnly == true }
     private var resumeSession: String?
     private let onEvent: @Sendable (AgentRuntimeEvent) -> Void
@@ -819,6 +823,12 @@ internal final class AgentRuntime: @unchecked Sendable {
         if let method, let wireID = message["id"] {
             let id = agentRuntimeID(wireID)
             if method == "item/tool/call" {
+                if let thread = params["threadId"] as? String, thread != threadID {
+                    try write(["id": wireID, "result": Self.codexApplicationResult(.failure("Tool belongs to another thread."))]); return
+                }
+                if let turn = params["turnId"] as? String, turn != turnID {
+                    try write(["id": wireID, "result": Self.codexApplicationResult(.failure("Tool belongs to an inactive turn."))]); return
+                }
                 let call = AgentToolCall(id: params["callId"] as? String ?? id, name: params["tool"] as? String ?? "",
                                          arguments: try AgentJSONValue(foundation: params["arguments"] ?? [:]))
                 runApplicationTool(call) { result in ["id": wireID, "result": Self.codexApplicationResult(result)] }
@@ -864,6 +874,12 @@ internal final class AgentRuntime: @unchecked Sendable {
         // end or fill this conversation's turn.
         if message["id"] == nil, let thread = params["threadId"] as? String, let threadID, thread != threadID { return }
         if method == "thread/tokenUsage/updated", params["threadId"] as? String != threadID { return }
+        if let incomingTurn = params["turnId"] as? String, let turnID, incomingTurn != turnID { return }
+        if method == "turn/started" || method == "turn/completed" {
+            if let incomingTurn = (params["turn"] as? [String: Any])?["id"] as? String,
+               let turnID, incomingTurn != turnID { return }
+            if method == "turn/completed", !busy { return }
+        }
         codex.receive(message, source: source)
         if method == "turn/started", let turn = params["turn"] as? [String: Any] { turnID = turn["id"] as? String }
         if method == "turn/completed" {
@@ -890,6 +906,7 @@ internal final class AgentRuntime: @unchecked Sendable {
     }
 
     private func completeTurn() {
+        cancelApplicationTools()
         if provider == .claude, !unconsumedClaudeInputs.isEmpty {
             // Claude answers the remaining follow-ups in a turn of their own.
             claude.beginTurn()
@@ -1032,6 +1049,7 @@ private struct ApplicationCall {
     var call: AgentToolCall
     var item: AgentChatItem
     var result: AgentToolResult?
+    var context: AgentToolExecutionContext
     var replies: [(AgentToolResult) -> [String: Any]]
 }
 
@@ -1092,7 +1110,7 @@ extension AgentRuntime {
             guard let tools = applicationTools, tools.definitions.contains(where: { $0.name == call.name }) else {
                 try write(reply(.failure("Unknown application tool: \(call.name)"))); return
             }
-            guard !interruptRequested, call.arguments.object != nil, !call.id.isEmpty, call.id.utf8.count <= 1024 else {
+            guard busy, !interruptRequested, call.arguments.object != nil, !call.id.isEmpty, call.id.utf8.count <= 1024 else {
                 try write(reply(.failure("The tool call was cancelled or its arguments are invalid."))); return
             }
             if var existing = applicationCalls[call.id] {
@@ -1103,56 +1121,102 @@ extension AgentRuntime {
                 else { existing.replies.append(reply); applicationCalls[call.id] = existing }
                 return
             }
-            guard applicationTasks.count < 64 else {
+            guard applicationTasks.count + applicationQueue.count < 64 else {
                 try write(reply(.failure("Too many pending application tool calls."))); return
             }
-            let item = AgentChatItem(id: call.id, kind: .tool, text: call.name, isComplete: false,
+            var item = AgentChatItem(id: call.id, kind: .tool, text: call.name, isComplete: false,
                                      tool: .init(name: call.name, category: .other, input: call.arguments.text,
-                                                 status: .running, startedAt: Date(), presentation: .dynamicTool))
-            applicationCalls[call.id] = ApplicationCall(call: call, item: item, replies: [reply])
+                                                 status: .queued, presentation: .dynamicTool))
+            item.tool?.isApplicationTool = true
+            let context = AgentToolExecutionContext(callID: call.id, tool: call.name)
+            applicationLeases[context.id] = context
+            applicationCalls[call.id] = ApplicationCall(call: call, item: item, context: context, replies: [reply])
             applicationCallOrder.append(call.id)
             onEvent(.item(item))
-            let generation = processGeneration, previous = applicationTail
-            let task = Task { [weak self] in
-                await previous?.value
-                guard !Task.isCancelled else { return }
-                let result = await tools.handle(call)
-                guard !Task.isCancelled else { return }
-                self?.queue.async { [weak self] in
-                    guard let self, !self.closed, !self.failed, self.processGeneration == generation,
-                          self.applicationTasks[call.id] != nil else { return }
-                    self.finishApplicationTool(call.id, result: result)
-                }
-            }
-            applicationTasks[call.id] = task
-            applicationTail = task
+            if tools.concurrentTools.contains(call.name) { startApplicationTool(call.id) }
+            else { applicationQueue.append(call.id); drainApplicationTools() }
         } catch { fail(error.localizedDescription) }
     }
 
-    private func finishApplicationTool(_ id: String, result supplied: AgentToolResult, interrupted: Bool = false) {
+    private func drainApplicationTools() {
+        guard !cancellingApplicationTools, busy, !interruptRequested, applicationSerialID == nil,
+              !applicationQueue.isEmpty else { return }
+        let id = applicationQueue.removeFirst()
+        applicationSerialID = id
+        startApplicationTool(id)
+    }
+
+    private func startApplicationTool(_ id: String) {
+        guard let tools = applicationTools, var pending = applicationCalls[id], pending.result == nil else { return }
+        let context = pending.context, call = pending.call, generation = processGeneration
+        pending.item.tool?.status = .running
+        pending.item.tool?.startedAt = Date()
+        AgentLog.logger.info("application_tool_start call=\(id, privacy: .public) tool=\(call.name, privacy: .public) lease=\(context.id.uuidString, privacy: .public)")
+        applicationCalls[id] = pending
+        onEvent(.item(pending.item))
+        applicationTasks[id] = Task { [weak self] in
+            let result = await AgentToolExecutionContext.$current.withValue(context) {
+                guard !context.isCancelled, !Task.isCancelled else { return AgentToolResult.failure("Tool call cancelled.") }
+                return await tools.handle(call)
+            }
+            self?.queue.async { [weak self] in
+                guard let self, !self.closed, !self.failed, self.processGeneration == generation,
+                      self.applicationTasks[id] != nil, self.applicationCalls[id]?.context.id == context.id else { return }
+                self.finishApplicationTool(id, result: result)
+            }
+        }
+        // Do not race children in a task group: leaving its scope would wait for a
+        // cancellation-uncooperative host. This timer retires the invocation directly.
+        queue.asyncAfter(deadline: .now() + tools.executionTimeout) { [weak self] in
+            guard let self, self.applicationTasks[id] != nil,
+                  self.applicationCalls[id]?.context.id == context.id else { return }
+            context.revoke()
+            self.applicationTasks[id]?.cancel()
+            self.finishApplicationTool(id, result: .failure("Tool timed out. Execution authority was revoked; inspect the application state before retrying."), timedOut: true)
+        }
+    }
+
+    private func finishApplicationTool(_ id: String, result supplied: AgentToolResult, interrupted: Bool = false, timedOut: Bool = false) {
         guard var pending = applicationCalls[id], pending.result == nil else { return }
         var result = supplied
         do {
             try AgentChatAttachment.validate(result.images)
-            guard result.images.allSatisfy({ ["image/jpeg", "image/png", "image/gif", "image/webp"].contains($0.mimeType) }),
-                  result.text.utf8.count <= 1024 * 1024 else { throw AgentRuntimeError("Tool result exceeds the supported text or image format/size.") }
-        } catch { result = .failure(error.localizedDescription) }
+            guard result.images.allSatisfy({ ["image/jpeg", "image/png", "image/gif", "image/webp"].contains($0.mimeType) }) else {
+                throw AgentRuntimeError("Unsupported tool image format.")
+            }
+        } catch {
+            result.images = []
+            result.text += "\nPresentation warning: " + error.localizedDescription
+        }
+        let fullText = result.text
+        if result.text.utf8.count > 1024 * 1024 {
+            var summary: [String: Any] = ["presentation_warning": "Result exceeds transport limit. Execution outcome is unchanged; full output is retained in the tool inspector.", "is_error": result.isError]
+            if let original = try? JSONSerialization.jsonObject(with: Data(result.text.utf8)) as? [String: Any] {
+                for key in ["revision", "draft_id", "operation_id", "mutation", "error"] {
+                    if let value = original[key] as? String, value.utf8.count < 4096 { summary[key] = value }
+                }
+            }
+            result.text = agentRuntimeJSON(summary) ?? "Execution finished; full output is retained in the tool inspector."
+        }
         pending.result = result
         pending.item.isComplete = true
         pending.item.detail = result.text
-        pending.item.tool?.output = result.text
-        pending.item.tool?.status = interrupted ? .interrupted : result.isError ? .failed : .completed
+        pending.item.tool?.output = fullText
+        pending.item.tool?.status = interrupted ? .interrupted : timedOut ? .timedOut : result.isError ? .failed : .completed
         pending.item.tool?.completedAt = Date()
+        AgentLog.logger.info("application_tool_finish call=\(id, privacy: .public) tool=\(pending.call.name, privacy: .public) status=\(pending.item.tool?.status?.rawValue ?? "unknown", privacy: .public)")
         pending.item.attachments = result.images.isEmpty ? nil : result.images.map(\.descriptor)
         let replies = pending.replies
         pending.replies.removeAll()
         applicationCalls[id] = pending
         applicationTasks.removeValue(forKey: id)
+        if applicationSerialID == id { applicationSerialID = nil }
         onEvent(result.images.isEmpty ? .item(pending.item) : .toolItem(pending.item, images: result.images))
         if !closed, !failed {
             do { for reply in replies { try write(reply(result)) } }
             catch { fail(error.localizedDescription) }
         }
+        drainApplicationTools()
         // Keep enough completed call IDs to deduplicate provider retries without growing forever.
         while applicationCallOrder.count > 512, let first = applicationCallOrder.first,
               applicationCalls[first]?.result != nil {
@@ -1161,10 +1225,17 @@ extension AgentRuntime {
     }
 
     private func cancelApplicationTools() {
-        let tasks = applicationTasks
-        for (id, task) in tasks {
-            task.cancel()
-            finishApplicationTool(id, result: .failure("Tool call interrupted."), interrupted: true)
+        cancellingApplicationTools = true
+        let leases = applicationLeases.values
+        applicationLeases.removeAll()
+        for context in leases { context.revoke() }
+        let ids = Set(applicationTasks.keys).union(applicationQueue)
+        applicationQueue.removeAll()
+        applicationSerialID = nil
+        for id in ids {
+            applicationTasks[id]?.cancel()
+            finishApplicationTool(id, result: .failure("Tool call cancelled; no further work is authorized."), interrupted: true)
         }
+        cancellingApplicationTools = false
     }
 }

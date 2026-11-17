@@ -1,5 +1,6 @@
 import AgentCore
 import Foundation
+import CryptoKit
 
 /// Injectable boundary: tests never need a provider executable.
 protocol AgentSessionRuntime: Sendable {
@@ -182,6 +183,7 @@ final class AgentSessions: @unchecked Sendable {
     var changed: @Sendable (SessionId, UInt64) -> Void
     var checkDirectory: @Sendable (String) throws -> Void = { _ in }
     /// Host-supplied launch context; fork identity remains owned by the session store.
+    var applicationToolSignature: String?
     var capturesCheckpoints = true
     var defaultAccess: AgentAccessMode = .fullAccess
     var launchContext: @Sendable (SessionId, ProjectId) -> AgentLaunch = { _, _ in AgentLaunch() }
@@ -806,12 +808,26 @@ final class AgentSessions: @unchecked Sendable {
                 return
             }
             let generation = entry.generation
+            let initialLaunch = launchContext(id, entry.snapshot.project)
+            if let catalog = applicationToolSignature {
+                let signature = SHA256.hash(data: Data((catalog + "\n" + (initialLaunch.instructions ?? "")).utf8))
+                    .map { String(format: "%02x", $0) }.joined()
+                if entry.snapshot.applicationToolSignature != signature {
+                    if entry.snapshot.providerSession != nil {
+                        entry.snapshot.providerSession = nil
+                        entry.forkSource = nil; entry.forkPoint = nil
+                        entry.snapshot.items.append(AgentChatItem(kind: .notice,
+                            text: "Application capabilities changed. Started a fresh provider thread; your local conversation is retained. Inspect the current application state before continuing."))
+                    }
+                    entry.snapshot.applicationToolSignature = signature
+                }
+            }
             entry.runtime = factory(entry.snapshot.provider, entry.directory, entry.snapshot.providerSession) {
                 [weak self] event in
                 self?.queue.async { [weak self] in self?.receive(event, session: id, generation: generation) }
             }
             if let runtime = entry.runtime {
-                var launch = launchContext(id, entry.snapshot.project)
+                var launch = initialLaunch
                 launch.forkSource = entry.forkSource
                 launch.forkPoint = entry.forkPoint
                 runtime.prepare(launch)
@@ -961,6 +977,8 @@ final class AgentSessions: @unchecked Sendable {
         }
         if case .toolItem(let item, let images) = event {
             guard item.id.utf8.count <= 1024 else { return }
+            if item.tool?.isApplicationTool != true,
+               entry.snapshot.items.first(where: { $0.id == item.id })?.tool?.isApplicationTool == true { return }
             let directory = root.appendingPathComponent("attachments", isDirectory: true)
                 .appendingPathComponent(session.description, isDirectory: true)
                 .appendingPathComponent(AgentToolImages.directoryName(item: item.id), isDirectory: true)
@@ -996,6 +1014,8 @@ final class AgentSessions: @unchecked Sendable {
             return
         case .item(var item):
             guard item.id.utf8.count <= 1024 else { return }
+            if item.tool?.isApplicationTool != true,
+               entry.snapshot.items.first(where: { $0.id == item.id })?.tool?.isApplicationTool == true { return }
             keepFullOutput(&item, entry: entry)
             if item.kind == .approval, !item.isComplete,
                !entry.snapshot.items.contains(where: { $0.id == item.id }),
@@ -1420,8 +1440,12 @@ final class AgentSessions: @unchecked Sendable {
     /// The transcript keeps 16 KiB of a tool's output; a finished tool with more keeps the
     /// rest on disk, written by the persistence queue, so "Show full output" can read it.
     private func keepFullOutput(_ item: inout AgentChatItem, entry: Entry) {
-        guard item.kind == .tool, item.isComplete || item.tool?.status != .running,
-              let output = item.tool?.output, output.utf8.count > 16 * 1024 else { return }
+        guard item.kind == .tool, item.isComplete,
+              let originalOutput = item.tool?.output else { return }
+        let input = item.tool?.input ?? ""
+        let needsInput = input.utf8.count > 8 * 1024
+        guard originalOutput.utf8.count > 16 * 1024 || needsInput else { return }
+        let output = needsInput ? "Arguments\n" + input + "\n\nResult\n" + originalOutput : originalOutput
         let command = item.tool?.presentsCommand == true
         item.tool?.fullOutputBytes = output.utf8.count
         let file = outputFile(session: entry.snapshot.session, item: item.id)
@@ -1575,7 +1599,9 @@ final class AgentSessions: @unchecked Sendable {
     static func finishItems(_ items: inout [AgentChatItem]) {
         for index in items.indices {
             items[index].isComplete = true
-            if items[index].tool?.status == .running { items[index].tool?.status = .interrupted }
+            if items[index].tool?.status == .running || items[index].tool?.status == .queued {
+                items[index].tool?.status = .interrupted
+            }
         }
     }
 
@@ -1589,7 +1615,9 @@ final class AgentSessions: @unchecked Sendable {
     }
 
     private func observedItem(_ value: AgentChatItem, entry: Entry, previous: AgentChatItem? = nil) -> AgentChatItem {
+        if previous?.tool?.isApplicationTool == true, value.tool?.isApplicationTool != true, let previous { return previous }
         var item = value
+        item.attachments = item.attachments ?? previous?.attachments
         Self.dropDuplicateDetail(&item)
         item.questionnaire = item.questionnaire ?? previous?.questionnaire
         let now = Date()
@@ -2107,7 +2135,17 @@ final class AgentSessions: @unchecked Sendable {
         for file in (try? FileManager.default.contentsOfDirectory(at: archived, includingPropertiesForKeys: nil)) ?? []
             where file.pathExtension == "json" {
             let duplicate = current.appendingPathComponent(file.lastPathComponent)
-            guard FileManager.default.contentsEqual(atPath: file.path, andPath: duplicate.path) else { continue }
+            guard let archivedData = try? Data(contentsOf: file), let duplicateData = try? Data(contentsOf: duplicate) else { continue }
+            let decoder = JSONDecoder()
+            let matches: Bool
+            if let archived = try? decoder.decode(AgentCheckpointRecord.self, from: archivedData),
+               let original = try? decoder.decode(AgentCheckpointRecord.self, from: duplicateData) {
+                matches = archived.before == original.before && archived.after == original.after && archived.files == original.files
+            } else if let archived = try? decoder.decode(AgentCheckpointPending.self, from: archivedData),
+                      let original = try? decoder.decode(AgentCheckpointPending.self, from: duplicateData) {
+                matches = archived.turnID == original.turnID && archived.before == original.before
+            } else { matches = false }
+            guard matches else { continue }
             let name = file.deletingPathExtension().lastPathComponent
             transferred.insert(name.hasPrefix("pending-") ? String(name.dropFirst(8)) : name)
             try? FileManager.default.removeItem(at: duplicate)

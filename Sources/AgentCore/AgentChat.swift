@@ -152,6 +152,8 @@ public struct AgentChatSnapshot: Codable, Hashable, Sendable {
     public var project: ProjectId
     public var provider: AgentChatProvider
     public var providerSession: String?
+    /// Catalog/instruction signature used by the provider thread.
+    public var applicationToolSignature: String?
     public var model: String?
     /// Actual provider model, independent of the user's optional model override.
     public var commands: [String]?
@@ -201,7 +203,7 @@ public struct AgentChatSnapshot: Codable, Hashable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case commandDescriptors, resetID, session, project, provider, providerSession, model, commands, resolvedModel, contextUsage, subagents, reasoningEffort, accessMode, planMode, queuedPrompts, queuePaused, turns, status, revision, items, omittedItems, activity
+        case applicationToolSignature, commandDescriptors, resetID, session, project, provider, providerSession, model, commands, resolvedModel, contextUsage, subagents, reasoningEffort, accessMode, planMode, queuedPrompts, queuePaused, turns, status, revision, items, omittedItems, activity
     }
 
     public init(from decoder: Decoder) throws {
@@ -213,6 +215,7 @@ public struct AgentChatSnapshot: Codable, Hashable, Sendable {
         project = try c.decode(ProjectId.self, forKey: .project)
         provider = try c.decode(AgentChatProvider.self, forKey: .provider)
         providerSession = try c.decodeIfPresent(String.self, forKey: .providerSession)
+        applicationToolSignature = try c.decodeIfPresent(String.self, forKey: .applicationToolSignature)
         model = try c.decodeIfPresent(String.self, forKey: .model)
         commands = try c.decodeIfPresent([String].self, forKey: .commands)
         commandDescriptors = try c.decodeIfPresent([AgentCommandDescriptor].self, forKey: .commandDescriptors)

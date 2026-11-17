@@ -6,7 +6,7 @@ public struct AgentToolActivity: Codable, Hashable, Sendable {
         case command, read, search, edit, web, subagent, other
     }
     public enum Status: String, Codable, Hashable, Sendable {
-        case running, completed, failed, denied, interrupted
+        case queued, running, completed, failed, denied, interrupted, timedOut
     }
     /// Expanded inspector identity is independent of the compact row's semantic category.
     public enum Presentation: String, Codable, Hashable, Sendable {
@@ -89,6 +89,8 @@ public struct AgentToolActivity: Codable, Hashable, Sendable {
     /// The size of the whole output when the transcript keeps only part of it; the server
     /// holds the rest, read with `AgentConversationRequest.toolOutput`.
     public var fullOutputBytes: Int?
+    /// Host results take precedence over echoed provider notifications.
+    public var isApplicationTool: Bool?
 
     public init(name: String? = nil, category: Category? = nil, input: String? = nil,
                 output: String? = nil, status: Status? = nil, filePaths: [String]? = nil,

@@ -72,6 +72,10 @@ public final class AgentRuntimeService: @unchecked Sendable {
                              executable: executables[provider], tools: tools, onEvent: callback)
             })
         titles.onChange = { [weak sessions] in sessions?.publishActivity() }
+        if let tools {
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+            sessions.applicationToolSignature = String(decoding: try encoder.encode(tools.definitions.sorted { $0.name < $1.name }), as: UTF8.self)
+        }
         sessions.capturesCheckpoints = !applicationToolsOnly
         sessions.defaultAccess = applicationToolsOnly ? .ask : .fullAccess
         sessions.launchContext = { session, project in
@@ -115,7 +119,7 @@ public final class AgentRuntimeService: @unchecked Sendable {
         guard !applicationToolsOnly else { throw ServiceError(.unsupported, "Provider history is unavailable for application tools.") }
         let directory = try projectDirectory(request.project).path
         let open = sessions.openProviderSessions(), history = historyStore
-        return await Task.detached { history.list(directory: directory, excluding: open) }.value
+        return try await runBlocking { history.list(directory: directory, excluding: open) }
     }
     public func importHistory(_ request: AgentHistoryImport) async throws -> AgentChatSnapshot {
         guard !applicationToolsOnly else { throw ServiceError(.unsupported, "Provider history is unavailable for application tools.") }

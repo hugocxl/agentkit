@@ -2283,3 +2283,62 @@ extension AgentSessionsTests {
         XCTAssertEqual(box.runtime?.launches.first?.forkPoint, "message-1")
     }
 }
+
+
+extension AgentSessionsTests {
+    func testCatalogChangesStartFreshProviderThreadAndRetainTranscript() async throws {
+        let root = try root(), resumes = AgentRuntimeResumes()
+        let factory: AgentSessions.Factory = { _, _, resume, callback in
+            resumes.append(resume)
+            let runtime = FakeAgentRuntime(callback)
+            runtime.onSend = { callback(.item(.init(kind: .assistant, text: "Kept reply"))); callback(.status(.idle)) }
+            return runtime
+        }
+        let id = SessionId(), project = ProjectId()
+        var sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: factory)
+        sessions.applicationToolSignature = "catalog-one"
+        _ = try await sessions.handle(.create(session: id, project: project, provider: .codex))
+        _ = try await sessions.handle(.send(session: id, text: "First", model: nil))
+        _ = try await waitForQueue(sessions, id) { $0.status == .idle }
+        sessions.shutdown()
+        sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: factory)
+        sessions.applicationToolSignature = "catalog-two"
+        defer { sessions.shutdown() }
+        _ = try await sessions.handle(.send(session: id, text: "Second", model: nil))
+        let final = try await waitForQueue(sessions, id) { $0.status == .idle }
+        XCTAssertTrue(final.items.contains { $0.text == "First" })
+        XCTAssertTrue(final.items.contains { $0.text.contains("capabilities changed") })
+        XCTAssertNil(resumes.values.last ?? nil)
+    }
+
+    func testApplicationResultSurvivesProviderEchoAndRetainsFullArguments() async throws {
+        let root = try root()
+        let input = "{\"value\":\"" + String(repeating: "a", count: 12000) + "\"}"
+        let image = AgentChatAttachment(name: "frame.jpg", mimeType: "image/jpeg", data: Data([1, 2, 3]))
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: { _, _, _, callback in
+            let runtime = FakeAgentRuntime(callback)
+            runtime.onSend = {
+                var activity = AgentToolActivity(name: "review", input: input, output: "Reviewed", status: .completed)
+                activity.isApplicationTool = true
+                callback(.toolItem(.init(id: "review", kind: .tool, text: "review", tool: activity, attachments: [image.descriptor]), images: [image]))
+                callback(.item(.init(id: "review", kind: .tool, text: "review", tool: .init(name: "review", output: "data:image/jpeg;base64,AAAA", status: .completed))))
+                callback(.status(.idle))
+            }
+            return runtime
+        })
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .codex))
+        _ = try await sessions.handle(.send(session: id, text: "Review", model: nil))
+        let snapshot = try await waitForQueue(sessions, id) { $0.status == .idle }
+        let tool = try XCTUnwrap(snapshot.items.first { $0.id == "review" })
+        XCTAssertEqual(tool.attachments, [image.descriptor])
+        XCTAssertTrue(tool.tool?.output?.hasPrefix("Reviewed") == true)
+        guard case .toolOutput(let full) = try await sessions.conversation(.toolOutput(session: id, item: "review")) else { return XCTFail("No full arguments") }
+        XCTAssertTrue(full.text.contains(input))
+        sessions.shutdown()
+        let restored = try AgentSessions(root: root, projectDirectory: { _ in root.path })
+        defer { restored.shutdown() }
+        let reloaded = try await restored.handle(.read(session: id))
+        XCTAssertEqual(reloaded.items.first { $0.id == "review" }?.attachments, [image.descriptor])
+    }
+}

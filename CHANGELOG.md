@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.2.0 - 2026-11-17
+
+### Added
+
+- Embed conversations on the host background while preserving composer styling.
+- Bound application-tool execution with explicit scheduling, independent reads and revocable turn-scoped commit authority.
+- Show queued and timed-out tool states, retain large arguments for inspection, and refresh provider threads when application contracts change.
+
+### Fixed
+
+- Retire pending host tools when turns complete, fail or are interrupted without waiting for unresponsive workers.
+- Preserve application-owned results and image attachments against provider echoes, including Codex data-URL images.
+- Preserve successful execution outcomes when presentation limits are exceeded.
+- Compare archived checkpoint records semantically when recovering interrupted conversation clears.
+
 ## 1.1.0 - 2026-11-16
 
 ### Added
