@@ -5,7 +5,7 @@ library products: AgentCore, AgentRuntime, and AgentUI.
 
 - AgentCore owns portable conversation records and transport contracts.
 - AgentRuntime depends only on AgentCore and Apple frameworks. No AppKit or Tab dependencies.
-- AgentUI depends only on AgentCore, Apple frameworks, and IconsCXL. No runtime dependency.
+- AgentUI depends only on AgentCore, Apple frameworks, and Icons. No runtime dependency.
 - Keep the existing AppKit rendering and behavior. SwiftUI is an embedding wrapper.
 - Do not introduce application-specific project stores, sockets, pane layouts, or settings.
 - Host integrations belong in AgentHostServices; backend integrations use AgentConnection.

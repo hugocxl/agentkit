@@ -1,7 +1,7 @@
 import AgentCore
 import AppKit
 import SwiftUI
-import IconsCXL
+import Icons
 
 /// Tab Icons: signature marks carry their theme hue; UI templates inherit the caller's tint.
 public enum AppIcon: String, CaseIterable, Sendable {

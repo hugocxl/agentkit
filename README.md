@@ -33,7 +33,7 @@ Select the products your target needs:
 .product(name: "AgentUI", package: "agentkit"),
 ```
 
-The repository is private; consumers need GitHub access. IconsCXL is the package's
+The repository is private; consumers need GitHub access. Icons is the package's
 only external Swift dependency. Rendering uses AppKit rather than a web transcript.
 
 ## Build an AI-first app

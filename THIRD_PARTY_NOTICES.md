@@ -58,9 +58,9 @@ tools) are simplified adaptations of the brands' own marks, taken from:
 Their license texts are bundled in `Sources/AgentUI/Resources/TabIcons/LICENSE`.
 
 
-## IconsCXL
+## Icons
 
-The Swift package dependency supplies native icons. Its license and notices are included in the upstream package: https://github.com/hugocxl/iconscxl.
+The Swift package dependency supplies native icons. Its license and notices are included in the upstream package: https://github.com/hugocxl/icons.
 
 ## Themes
 
