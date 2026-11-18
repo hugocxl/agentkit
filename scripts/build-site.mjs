@@ -25,13 +25,13 @@ const facts = {
 const icon = (name) =>
   read(`website/art/icons/${name}.svg`)
     .trim()
-    .replace(/^<svg[^>]*>/, `<svg class="p9-icon" data-icon="${name}" viewBox="0 0 16 16" fill="none" aria-hidden="true">`)
+    .replace(/^<svg[^>]*>/, `<svg class="ds-icon" data-icon="${name}" viewBox="0 0 16 16" fill="none" aria-hidden="true">`)
     .replace(/\s*\n\s*/g, "");
 const vector = (name) =>
   read(`website/art/vectors/${name}.svg`)
     .trim()
     .replace(/^<svg([^>]*)>/, (_, attributes) =>
-      `<svg class="p9-vector" data-vector="${name}"${attributes.replace(/\s+xmlns="[^"]*"/, "").replace(/\s+color="[^"]*"/, "")}>`,
+      `<svg class="ds-vector" data-vector="${name}"${attributes.replace(/\s+xmlns="[^"]*"/, "").replace(/\s+color="[^"]*"/, "")}>`,
     )
     .replace(/\s*\n\s*/g, "");
 
@@ -40,10 +40,10 @@ const slug = (text) => text.toLowerCase().replace(/[^\w\s-]/g, "").trim().replac
 const github = "https://github.com/hugocxl/agentkit/blob/main/";
 const renderer = new marked.Renderer();
 renderer.code = ({ text }) =>
-  `<div class="p9-code"><pre tabindex="0"><code>${escape(text)}</code></pre><button type="button">Copy</button></div>\n`;
+  `<div class="ds-code"><pre tabindex="0"><code>${escape(text)}</code></pre><button type="button">Copy</button></div>\n`;
 const baseTable = renderer.table.bind(renderer);
 renderer.table = (token) =>
-  `<div class="p9-table-scroll" tabindex="0">${baseTable(token).replace("<table>", '<table class="p9-table">')}</div>\n`;
+  `<div class="ds-table-scroll" tabindex="0">${baseTable(token).replace("<table>", '<table class="ds-table">')}</div>\n`;
 const baseTableHeader = renderer.tablecell.bind(renderer);
 renderer.tablecell = (token) => baseTableHeader(token).replace(/^<th>/, '<th scope="col">');
 renderer.link = function ({ href, title, tokens }) {
@@ -71,7 +71,7 @@ const docs = groups
   .map((group) => {
     const body = marked.parser(Object.assign(group.tokens, { links: tokens.links }), { renderer });
     const heading = group.heading ? `        <h2>${marked.parseInline(group.heading.text)}</h2>\n` : "";
-    return `      <section class="p9-section"${group.id ? ` id="${group.id}"` : ""}>\n${heading}${body}      </section>`;
+    return `      <section class="ds-section"${group.id ? ` id="${group.id}"` : ""}>\n${heading}${body}      </section>`;
   })
   .join("\n");
 

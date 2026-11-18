@@ -1,278 +1,38 @@
 # AgentKit
 
-Embed a native AI conversation in your macOS app, backed by a locally installed
-Claude Code or Codex CLI. AgentKit includes the conversation UI, provider runtime,
-application tool calls, and persistent session management extracted from [Tab](https://github.com/hugocxl/tab).
+### A native AI conversation, inside your Mac app.
 
-One Swift package, three modules:
+**A Swift package that puts a full AI conversation inside your macOS app**, powered by the Claude Code or Codex CLI already installed on the Mac. It is the conversation from [Tab](https://hugocxl.github.io/tab/), with its interface, runtime and saved sessions, made into something any app can use.
 
-| Module | Use it for |
-| --- | --- |
-| `AgentCore` | Conversation models, commands, attachments, and the transport interface. |
-| `AgentRuntime` | Running local CLI providers and persisting conversations. No AppKit dependency. |
-| `AgentUI` | The native AppKit transcript and composer, with an optional SwiftUI wrapper. No runtime dependency. |
+[Read the docs](https://hugocxl.github.io/agentkit/docs.html) · [See the changelog](CHANGELOG.md) · [Visit the website](https://hugocxl.github.io/agentkit/)
 
-Requires macOS 14 or later on Apple silicon. Build with Xcode 26 or later and Swift
-6; the package uses Swift 5 language mode. The runtime launches installed provider
-executables. Install and sign in to the provider CLI before using a real conversation.
-AgentKit does not bundle a model or manage provider accounts.
+[![AgentKit's home page: a native conversation, your app's tools and local CLIs](.github/preview.png)](https://hugocxl.github.io/agentkit/)
 
-## Install
+## Built for AI-first apps
 
-Add `https://github.com/hugocxl/agentkit.git` in Xcode's package dependencies, or add:
+Your app describes what it can do, and the agent does it through your own tools. AgentKit brings the conversation, streaming, model selection, tool results and sessions, and the same tools work with both Claude Code and Codex.
 
-```swift
-.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.4.0")
-```
+Your app stays in charge. When it hands the agent its own tools, the provider's built-in tools are switched off or kept read-only, and every change goes through your app's own editing and undo.
 
-Select the products your target needs:
+## Everything a conversation needs
 
-```swift
-.product(name: "AgentCore", package: "agentkit"),
-.product(name: "AgentRuntime", package: "agentkit"),
-.product(name: "AgentUI", package: "agentkit"),
-```
+Streaming replies with Markdown, code, tables, math and diagrams. A composer with attachments, model and reasoning choices, approvals, questions and a prompt queue. Search, citations, subagent activity, file changes and checkpoints you can review.
 
-The repository is private; consumers need GitHub access. Icons is the package's
-only external Swift dependency. Rendering uses AppKit rather than a web transcript.
+Conversations and drafts are saved, so people pick up where they left off after a relaunch.
 
-## Build an AI-first app
+## At work in Tab and Filmatte
 
-Your app provides its domain tools and their handlers. AgentKit supplies the native
-conversation, streaming, local CLI connection, model selection, tool results, and
-session lifecycle. The same tool definitions work with both providers.
+Tab runs its agent panes on AgentKit, and Filmatte, a native video editor, lets an agent add text and cut the timeline through the editor's own tools. The [docs](https://hugocxl.github.io/agentkit/docs.html) show how to connect it to your app, from a single window to a server that hosts many projects.
 
-```swift
-import AgentCore
-import AgentRuntime
-import AgentUI
+## Made to feel at home
 
-let tools = AgentToolConfiguration([
-    AgentToolDefinition(
-        name: "add_title",
-        description: "Add a title to the current video project.",
-        inputSchema: [
-            "type": "object",
-            "properties": ["text": ["type": "string"]],
-            "required": ["text"]
-        ]
-    )
-]) { @MainActor call in
-    guard let text = call.arguments["text"]?.string else {
-        return .failure("A title is required.")
-    }
-    guard let context = AgentToolExecutionContext.current else { return .failure("Not a tool call.") }
-    do {
-        // The edit lands only while this call may still change the project.
-        try context.withCommit { editor.addTitle(text) } // Your app's normal editing and undo path.
-    } catch {
-        return .failure("The call was cancelled before the title was added.")
-    }
-    return AgentToolResult(text: "Added the title.")
-}
+- **Truly native.** Drawn in AppKit rather than a web view, with a SwiftUI wrapper when you need one.
+- **Runs on what is already there.** The CLI and account people already use. No bundled model, no accounts to manage.
+- **Try it without an account.** The example app runs an offline demo that makes no model requests.
+- **Free to use.** Open source, for personal and commercial work.
 
-// Persist this ID with the workspace; reuse it on subsequent launches.
-let workspace = try AgentWorkspace(
-    workingDirectory: projectDirectory,
-    storageDirectory: applicationSupport.appendingPathComponent("my-workspace"),
-    project: savedProjectID,
-    instructions: "Help edit this video using the application's tools.",
-    tools: tools
-)
+## License
 
-// Retain both objects. Persist the session ID to reopen the conversation.
-let connection = workspace.connect(provider: .codex, session: savedSessionID)
-let conversation = AgentConversationViewController(connection: connection)
-```
+AgentKit is [MIT licensed](LICENSE). Code and artwork adapted from T3 Code, Pierre's icons, Simple Icons, LobeHub Icons, Devicon and iTerm2-Color-Schemes keep their own licenses, and brand marks belong to their owners. [Third-party notices](THIRD_PARTY_NOTICES.md) has the details.
 
-Create UI objects on the main actor. Initialize a workspace off the main actor when
-loading persisted state. Creating a connection does not start a turn; the first
-submitted prompt starts the CLI. Use `.claude` to use Claude Code.
-
-Embed the controller directly in AppKit or retain it in your SwiftUI model and use:
-
-```swift
-AgentConversationView(controller: conversation)
-```
-
-Application tools default to `.applicationOnly` access: Claude's built-in tools are
-disabled; Codex runs read-only with shell execution disabled and no approvals. The
-host remains responsible for validating arguments, authorizing operations, and
-committing undoable edits. Handlers run in order per conversation and should honor
-cancellation before committing changes. AgentKit deduplicates retried call IDs,
-displays results, and returns `AgentToolResult.images` to both the model and UI.
-
-Application mode omits coding-specific commands, plan mode, provider-history import,
-and file-checkpoint rollback. Use your app's own undo tool. For a coding workspace,
-omit `tools`; to combine application and provider tools explicitly, pass
-`access: .providerTools` to `AgentToolConfiguration`.
-
-`executables`, `environment`, and `instructions` customize provider launches. Use a
-dedicated storage directory for each workspace; an ownership record and exclusive
-lock prevent accidental reuse or simultaneous writers. The working directory and
-storage directory are independent.
-
-[Filmatte](https://github.com/hugocxl/filmatte) is the first local consumer: its tool
-catalog and editor handlers remain in the app, while AgentKit supplies the UI and
-both CLI transports. The integration tests exercise real text-overlay and timeline
-edits through each installed provider.
-
-## What the conversation includes
-
-- Streaming replies, native Markdown, syntax-highlighted code, tables, math, and diagrams.
-- An editable composer with attachments, model and reasoning selection, and plan mode.
-- Tool activity, approvals, structured questions, prompt queues, and interruption.
-- Search, prompt navigation, context usage, citations, and subagent activity.
-- Persistent transcripts and drafts, provider-history import, and supported conversation forks.
-- Recorded file changes, Git checkpoints, diff review, and guarded revert operations.
-- Local file and media previews, including revision-checked ranged reads.
-
-Provider features vary. The adapters retain each provider's behavior rather than
-simulating unsupported operations. `AgentConnection.capabilities` controls optional UI features; `.steering` offers Send Now,
-which hands a draft to the running turn instead of queueing it. Host-specific actions such as opening another
-conversation, launching a terminal, or previewing a pull request require host services.
-
-## Integrate your app
-
-Pass `AgentHostServices` when constructing the controller to connect its actions to
-your application. File paths are resolved against the conversation's working directory.
-
-```swift
-var host = AgentHostServices(
-    directory: { workingDirectory.path },
-    isLocal: { true }
-)
-host.openFile = { path, line, column in
-    editor.open(path: path, line: line, column: column)
-}
-host.openBrowser = { url in browser.open(url) }
-host.runCommand = { command in terminal.run(command) }
-host.remoteImages = { .clickToLoad }
-host.showNotice = { message, style in notices.show(message, isError: style == .error) }
-
-let conversation = AgentConversationViewController(connection: connection, host: host)
-```
-
-Local connections supply file reads and file suggestions automatically. Remote hosts
-can supply their own asynchronous file service. Navigation, repository metadata,
-pull request previews, workspace labels and notices are optional callbacks; without
-`showNotice`, notices appear in an AgentKit notice stack in the window, if it has one.
-Repository metadata is read once per connection: an error with an `AgentCodedError`
-code, such as a folder outside Git, holds until `connectionChanged()`, while an
-uncoded failure is retried. Bind menus and shortcuts by passing an `AgentShortcut`
-to `conversation.perform(_:)`; map your own command identifiers explicitly, since
-`AgentShortcut`'s raw values are AgentKit's.
-
-Use `AgentTheme` to select light/dark palettes and appearance. Each controller can
-receive its own theme, and its provider marks, link icons and controls follow it;
-`followSystem()` observes appearance changes without polling. An application with one
-theme can apply it to `AgentTheme.shared` and pass that to every controller.
-
-## Own the lifecycle
-
-Hiding a view does not cancel the agent. This allows multiple conversations and
-background work. For an explicit close, first ask `canClose()`, then call
-`closeConversation()` and `dispose()` after the host commits to closing it.
-
-Before application termination:
-
-1. Await `conversation.flushDraft()` for each controller.
-2. Dispose the conversation controllers.
-3. Run `workspace.shutdown()` off the main actor and wait for it to return.
-
-Shutdown interrupts running work, saves state, finishes observers, and releases the
-workspace lock. It is idempotent. The example demonstrates an AppKit termination
-handler that keeps the main run loop available while the draft is saved. An agent
-cannot outlive its host process without an application-owned helper or daemon.
-
-## Use your own transport
-
-`AgentUI` depends only on `AgentCore`. Construct an `AgentConnection` with a request
-closure and an observation-stream factory, plus whichever optional services your
-backend supports. Each observer must receive its own stream. Revision notifications
-can coalesce; the UI reconciles authoritative snapshots and deltas.
-
-This lets a desktop UI talk to a separate local helper or remote server while the
-helper alone links `AgentRuntime`. The package has no dependency on Tab's daemon,
-sockets, workspace layout, terminal engine, or application model.
-
-## Run the example
-
-```sh
-swift run AgentKitExample
-```
-
-The default is an offline, streaming UI demo. It does not use a provider account or
-make model requests. To use a real CLI:
-
-```sh
-swift run AgentKitExample --provider codex --directory /path/to/project --storage /path/to/agent-state
-swift run AgentKitExample --provider claude --directory /path/to/project --storage /path/to/agent-state
-# Application-tool example: ask it to change the window title.
-swift run AgentKitExample --provider codex --app-tools --directory /tmp --storage /tmp/agentkit-app-demo
-```
-
-The example persists the workspace and conversation identities. To build a native
-app bundle:
-
-```sh
-scripts/bundle-example.sh
-open 'build/AgentKit Example.app'
-```
-
-## Validate
-
-```sh
-scripts/validate.sh
-```
-
-Validation builds with warnings as errors, runs the XCTest suites, bundles the
-standalone example, and verifies its ad-hoc signature. Provider tests exercise real
-local fixture subprocesses without credentials or model usage. Tests cover streaming,
-protocol normalization, interruption, queues, persistence, file safety, and native
-rendering, application-tool registration, retry deduplication, and cancellation. Live provider compatibility should also be checked when upgrading a CLI.
-
-[MIT license](LICENSE). Adapted code and artwork are credited in
-[third-party notices](THIRD_PARTY_NOTICES.md).
-
-## Serve multiple projects
-
-`AgentRuntimeService` owns a shared conversation store for hosts with multiple
-projects or a socket/SSH transport. Supply a project-to-directory resolver and
-optional `AgentLaunchContext` for application instructions and environment values.
-Route agent requests through `handle`, `conversation`, `attachment`, `checkpoint`,
-`modelCatalog`, `composerContext`, `history`, and `importHistory`. Forward revision
-notifications from `changed` to remote clients, or use independent `observe` streams.
-`AgentWorkspace` uses this same runtime with a single project resolver.
-
-The service accepts an existing conversation directory directly. It preserves
-snapshot, transcript, attachment, checkpoint, and queue formats; clearing archives
-prior resources before resetting the original session. The service locks its store;
-a second owner fails with `FileLock.Failure.held`, and other lock failures throw. A
-host that already owns the store exclusively, such as a server holding its own
-profile lock, passes `hostOwnsStore: true` to serve a store it can't lock, such as a
-read-only folder. Runtime errors
-go to unified logging; `AgentRuntimeLog.setErrorHandler` also sends them to your own
-log. Call `refuseNewRequests`
-before host shutdown, then `shutdown` off the main thread: it waits until every
-provider it started has exited, including model and command discovery, and every
-checkpoint being taken and revert under way is written, then flushes and releases the
-store, which can be opened again once it returns. It needs no free Swift task worker,
-so tasks may call it together. `tryRefuseIfIdle` reserves shutdown atomically only when no conversation is live.
-
-For an application-owned transport, build an `AgentConnection` and provide host
-navigation through `AgentHostServices`. Implement `AgentCodedError` on transport
-errors so the UI can distinguish unsupported services and missing conversations,
-and set `backendAdvice` to tell people how to update your server when it predates
-a service, such as "Update Tab on it, then restart it."
-Tab uses all three products this way: AgentCore on its wire, AgentRuntime in its
-server, and AgentUI in its desktop pane adapter.
-
-## Conversation commands
-
-Use `/help` for the supported commands and `/skills` to refresh installed skills.
-`/clear` resets the current conversation and archives its history; `/new` opens a
-conversation through the host. `/compact` uses provider compaction, `/fork` requires
-a host that can open another conversation, and `/copy` and `/export` include retained
-paginated history. Return executes commands; Tab completes them. Commands unavailable
-in the host preserve the draft and explain the limitation.
+Made by [Hugo](https://github.com/hugocxl), growing out of the conversation in [Tab](https://hugocxl.github.io/tab/). Ideas and contributions are welcome: [open an issue](https://github.com/hugocxl/agentkit/issues).

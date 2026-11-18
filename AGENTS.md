@@ -14,5 +14,7 @@ library products: AgentCore, AgentRuntime, and AgentUI.
 - No force unwraps or try! outside tests. Protect process, queue, and persistence ownership.
 - Test subprocess and lifecycle risks with fixture providers; do not require credentials in CI.
 - A change is finished only when scripts/validate.sh passes.
-- Keep AgentKitVersion, example bundle version, changelog, and release tags in agreement.
+- Keep AgentKitVersion, example bundle version, changelog, install snippet in docs/INTEGRATION.md, and release tags in agreement.
+- The README stays product-facing; integration detail lives in docs/INTEGRATION.md, which the website renders.
+- The website in website/ uses only the vendored @hugocxl/design-system (scripts/sync-design-system.mjs). Check it with `npm run build:site && npm run check:site`.
 - Commit or publish only when requested.
