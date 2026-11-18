@@ -8,5 +8,8 @@ public struct AgentCapabilities: OptionSet, Sendable {
     public static let attachments = Self(rawValue: 1 << 2)
     public static let promptQueue = Self(rawValue: 1 << 3)
     public static let providerCommands = Self(rawValue: 1 << 4)
-    public static let all: Self = [.modelSelection, .planMode, .attachments, .promptQueue, .providerCommands]
+    /// The backend can hand a queued prompt to the running turn (`deliverQueued` while working),
+    /// so the composer offers Send Now beside the default of queueing.
+    public static let steering = Self(rawValue: 1 << 5)
+    public static let all: Self = [.modelSelection, .planMode, .attachments, .promptQueue, .providerCommands, .steering]
 }

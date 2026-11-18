@@ -36,6 +36,10 @@ extension AgentPaneController {
             surface.navigatePrompt(previous: id == .previousPrompt)
             return true
         case .scrollToBottom: surface.scrollToEnd(); return true
+        case .sendAgentPromptNow: return performSendNowShortcut()
+        case .stashAgentDraft:
+            guard stashStore != nil, !surface.composer.hasMarkedText() else { return false }
+            stashDraft(); return true
         case .increaseFontSize: AgentTextScale.step(larger: true); return true
         case .decreaseFontSize: AgentTextScale.step(larger: false); return true
         default: break
@@ -79,8 +83,9 @@ extension AgentPaneView {
             transcript.onViewportSettled = { [weak self] in self?.paintFindMatches() }
             bar.frame = NSRect(x: 0, y: 0, width: bounds.width, height: AgentConversationFindBar.height)
             bar.isHidden = false
-            bar.counter = model.counter
             paintFindMatches()
+            onFindQuery?(bar.query)
+            refreshFindCounter()
         }
         bar.focus()
     }
@@ -98,10 +103,14 @@ extension AgentPaneView {
     }
 
     private func closeFind() {
+        // Escape first stops a search of earlier history, which then says how far it got.
+        if case .searching = archiveFind, let onStopArchiveSearch { onStopArchiveSearch(); return }
         findModel = nil
         transcript.onViewportSettled = nil
         findHighlighter.clear()
         findBar?.isHidden = true
+        onFindQuery?("")
+        archiveFind = .idle
         window?.makeFirstResponder(composer)
     }
 
@@ -109,18 +118,25 @@ extension AgentPaneView {
         guard var model = findModel else { return }
         model.search(query, in: snapshot?.items ?? [])
         findModel = model
+        onFindQuery?(query)
         findSelectionDidChange()
     }
 
     private func stepFind(previous: Bool) {
         guard var model = findModel else { return }
+        // Past the first or last shown match, an archived one comes next: it loads, then shows.
+        let pending = archiveFind.pending(excluding: Set(snapshot?.items.map(\.id) ?? []))
+        let atStart = model.selectedIndex.map { $0 == 0 } ?? true
+        let atEnd = model.selectedIndex.map { $0 == model.matches.count - 1 } ?? true
+        if previous, atStart, let hit = pending.last { onRevealArchived?(hit, true); return }
+        if !previous, atEnd, let hit = pending.first { onRevealArchived?(hit, false); return }
         if previous { model.selectPrevious() } else { model.selectNext() }
         findModel = model
         findSelectionDidChange()
     }
 
-    private func findSelectionDidChange() {
-        findBar?.counter = findModel?.counter ?? ""
+    func findSelectionDidChange() {
+        refreshFindCounter()
         paintFindMatches()
         revealFindSelection()
     }
@@ -130,7 +146,7 @@ extension AgentPaneView {
         guard var model = findModel else { return }
         model.update(snapshot?.items ?? [])
         findModel = model
-        findBar?.counter = model.counter
+        refreshFindCounter()
         paintFindMatches()
     }
 

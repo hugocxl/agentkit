@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.4.0 - 2026-11-18
+
+### Added
+
+- Send a prompt into the running turn with Send Now, through the `steering` capability and `AgentShortcut.sendAgentPromptNow`, while Return still queues it.
+- Edit a queued prompt's text, settings and attachments together with `updateQueued`, keeping an edit the backend didn't take to retry, copy or stash.
+- Stash unfinished drafts with `/stash` and restore them with `/stashes`, keeping citations, review comments, settings and attachments.
+- Offer an optimized copy of an image too large to attach.
+- Search a conversation's archived history from Find and reveal the matching message.
+- Save each child agent's steps, bounded and pageable through `subagentStepsPage`, so they outlive the provider and the runtime.
+- Keep closed conversations under a host-chosen `AgentConversationRetention`, and list, reopen, archive and delete them through `AgentConnection.library`.
+- Show Codex permission requests and MCP elicitation forms as native cards that offer the provider's own decisions, answered with `.decide`.
+- Keep a usage limit's reset time on the turn it stopped, with Retry and Resume at Reset through `.retryTurn` and `.scheduleRetry`.
+- Rewind a Claude conversation to an earlier message with `.rewind`, archiving it whole and restoring files only when asked.
+- Report each turn's checkpoint as recording, ready, unavailable or outside Git, with `.retryCheckpoint` when its baseline remains.
+- Announce approvals, questions, failures and finished turns to VoiceOver once.
+
+### Changed
+
+- Restore files only while no other conversation or child agent works in the same physical folder, all or nothing, naming any file that couldn't be put back.
+- Read review context and saved comment positions from the checkpoint rather than the working copy.
+- Parse streamed responses from the last finished block instead of from the start.
+
+### Fixed
+
+- Report what a long paste actually did, and drop imports and restored attachments that finish after their draft was cleared.
+- Keep loaded earlier messages in place across trims and reconnects.
+- Keep code lines visible while streaming tilde and longer fences.
+- Refresh an agent's steps window when a step changes in place.
+- Clear a question's selected option when the user types an answer, and the typed answer when they choose an option.
+- Expire requests from a child agent that has ended instead of answering them.
+
 ## 1.3.0 - 2026-11-17
 
 ### Added

@@ -4,7 +4,7 @@ import Foundation
 /// snapshot. A server that predates one of them can't decode it and replies
 /// `unsupported`, so clients fall back or say the server needs an update.
 public enum AgentConversationRequest: Codable, Hashable, Sendable {
-    /// The steps of the agent the tool call `toolUseID` started.
+    /// The steps of the agent the tool call `toolUseID` started: the newest page of them.
     case subagentSteps(session: SessionId, toolUseID: String)
     /// Puts files a turn changed back as they were before it: `paths` of the turn's
     /// changed files, or all of them when nil. Files changed again since the turn are
@@ -23,6 +23,20 @@ public enum AgentConversationRequest: Codable, Hashable, Sendable {
     /// the server's archive of them: up to `limit` that came before archive position
     /// `before`, or the newest when nil.
     case earlier(session: SessionId, before: Int?, limit: Int)
+    /// Up to `limit` of the agent's steps that came before step `before`, counted from its
+    /// first step, as `AgentSubagentSteps.start` counts them.
+    case subagentStepsPage(session: SessionId, toolUseID: String, before: Int, limit: Int)
+    /// Edit from Here: the conversation goes back to before its user message `at`, and its
+    /// provider continues from there. What it held before is kept whole as the archived
+    /// conversation `archive`, as a clear keeps it. With `restoreFiles`, the files the
+    /// removed turns changed are first put back as they were before `at`'s turn; files
+    /// changed since are listed in the reply's conflicts and nothing changes, unless `force`.
+    /// Refused unless the conversation is still at `revision`. Only turns marked
+    /// `rewindable` can be rewound to.
+    case rewind(session: SessionId, at: String, archive: SessionId, revision: UInt64, restoreFiles: Bool, force: Bool)
+    /// Records the file changes of the turn begun by user message `turn` again, from its
+    /// original baseline, after recording them failed.
+    case retryCheckpoint(session: SessionId, turn: String)
 }
 
 public enum AgentConversationReply: Codable, Hashable, Sendable {
@@ -32,6 +46,22 @@ public enum AgentConversationReply: Codable, Hashable, Sendable {
     case forked(AgentChatSnapshot)
     case toolOutput(AgentToolOutput)
     case earlier(AgentEarlierItems)
+    case rewound(AgentRewindReply)
+    /// The conversation as it is after the request.
+    case snapshot(AgentChatSnapshot)
+}
+
+/// What Edit from Here did. With `files.conflicts`, nothing changed and `snapshot` is nil.
+public struct AgentRewindReply: Codable, Hashable, Sendable {
+    /// The rewound conversation.
+    public var snapshot: AgentChatSnapshot?
+    /// The files put back, or those changed since that stopped it.
+    public var files: AgentRevertReply
+
+    public init(snapshot: AgentChatSnapshot?, files: AgentRevertReply = AgentRevertReply()) {
+        self.snapshot = snapshot
+        self.files = files
+    }
 }
 
 /// Archived items in conversation order: `items` start at archive position `start`, of
@@ -111,33 +141,63 @@ public struct AgentChatDelta: Codable, Hashable, Sendable {
 public struct AgentRevertReply: Codable, Hashable, Sendable {
     public var reverted: [String]
     public var conflicts: [String]
+    /// Files already as they were before the turn, as after another client's revert; they
+    /// needed no change. Nil from runtimes that predate it.
+    public var unchanged: [String]?
 
-    public init(reverted: [String] = [], conflicts: [String] = []) {
+    public init(reverted: [String] = [], conflicts: [String] = [], unchanged: [String]? = nil) {
         self.reverted = reverted
         self.conflicts = conflicts
+        self.unchanged = unchanged
     }
 }
 
-/// An agent's own tool calls and text, newest kept. The server holds them only while
-/// the provider process that ran the agent lives.
+/// An agent's own tool calls and text, newest kept, or one page of them. The server
+/// saves them with the conversation, bounded, so a finished agent's steps outlast its
+/// provider process and a server restart; earlier servers held them only in memory.
 public struct AgentSubagentSteps: Codable, Hashable, Sendable {
     public var toolUseID: String
     public var items: [AgentChatItem]
+    /// The steps' revision, as `AgentSubagent.stepsRevision` reports it.
+    public var revision: UInt64?
+    /// The position of the first item among every step the agent took, from zero.
+    public var start: Int?
+    /// How many steps the agent took, kept or not.
+    public var total: Int?
+    /// How many of its first steps the server no longer keeps: positions below this are gone.
+    public var omitted: Int?
+    /// The server keeps no steps of this agent: they were never saved, as by a server
+    /// that predates saving them, or gave way to newer agents'.
+    public var unavailable: Bool?
 
-    public init(toolUseID: String, items: [AgentChatItem]) {
+    public init(toolUseID: String, items: [AgentChatItem], revision: UInt64? = nil, start: Int? = nil,
+                total: Int? = nil, omitted: Int? = nil, unavailable: Bool? = nil) {
         self.toolUseID = toolUseID
         self.items = items
+        self.revision = revision
+        self.start = start
+        self.total = total
+        self.omitted = omitted
+        self.unavailable = unavailable
     }
 
+    /// One reply's bounds.
     public static let maxItems = 200
     public static let maxBytes = 256 * 1024
+    /// What the server keeps of one agent, newest first.
+    public static let savedItems = 2000
+    public static let savedBytes = 4 * 1024 * 1024
+    /// Agents a conversation keeps steps for, most recently changed first.
+    public static let savedAgents = 64
 }
 
 extension AgentConversationRequest {
     public var session: SessionId {
         switch self {
         case .subagentSteps(let session, _), .revert(let session, _, _, _), .readSince(let session, _),
-             .fork(let session, _, _, _), .toolOutput(let session, _), .earlier(let session, _, _): session
+             .fork(let session, _, _, _), .toolOutput(let session, _), .earlier(let session, _, _),
+             .subagentStepsPage(let session, _, _, _),
+             .rewind(let session, _, _, _, _, _), .retryCheckpoint(let session, _): session
         }
     }
 
@@ -145,6 +205,9 @@ extension AgentConversationRequest {
         switch self {
         case .subagentSteps(_, let toolUseID):
             guard !toolUseID.isEmpty, toolUseID.utf8.count <= 1024 else { throw .badRequest }
+        case .subagentStepsPage(_, let toolUseID, let before, let limit):
+            guard !toolUseID.isEmpty, toolUseID.utf8.count <= 1024, before >= 0,
+                  (1...AgentSubagentSteps.maxItems).contains(limit) else { throw .badRequest }
         case .revert(_, let checkpoint, let paths, _):
             guard UUID(uuidString: checkpoint) != nil, (paths?.count ?? 0) <= 4096,
                   (paths ?? []).allSatisfy({ !$0.isEmpty && $0.utf8.count <= 16 * 1024 && !$0.contains("\0") }) else { throw .badRequest }
@@ -155,6 +218,10 @@ extension AgentConversationRequest {
             guard session != from, !at.isEmpty, at.utf8.count <= 1024 else { throw .badRequest }
         case .earlier(_, let before, let limit):
             guard (1...AgentEarlierItems.maxItems).contains(limit), (before ?? 0) >= 0 else { throw .badRequest }
+        case .rewind(let session, let at, let archive, _, _, _):
+            guard session != archive, !at.isEmpty, at.utf8.count <= 1024 else { throw .badRequest }
+        case .retryCheckpoint(_, let turn):
+            guard !turn.isEmpty, turn.utf8.count <= 1024 else { throw .badRequest }
         }
     }
 }
@@ -164,11 +231,18 @@ extension AgentConversationReply {
         switch self {
         case .subagentSteps(let steps):
             guard steps.toolUseID.utf8.count <= 1024, steps.items.count <= AgentSubagentSteps.maxItems,
+                  (steps.start ?? 0) >= 0, (steps.omitted ?? 0) >= 0, (steps.total ?? 0) >= (steps.start ?? 0) + steps.items.count || steps.total == nil,
                   steps.items.reduce(0, { $0 + $1.transcriptByteCount }) <= AgentSubagentSteps.maxBytes + 64 * 1024,
                   steps.items.allSatisfy({ $0.id.utf8.count <= 1024 }) else { throw .badRequest }
         case .revert(let reply):
-            guard reply.reverted.count + reply.conflicts.count <= 8192,
+            guard reply.reverted.count + reply.conflicts.count + (reply.unchanged?.count ?? 0) <= 8192,
                   (try? WireJSON.encode(reply).count).map({ $0 < AgentLimits.maxFrame - 1024 }) ?? false else { throw .badRequest }
+        case .rewound(let reply):
+            try reply.snapshot?.validate()
+            guard reply.files.reverted.count + reply.files.conflicts.count + (reply.files.unchanged?.count ?? 0) <= 8192,
+                  (try? WireJSON.encode(reply).count).map({ $0 < AgentLimits.maxFrame - 1024 }) ?? false else { throw .badRequest }
+        case .snapshot(let snapshot):
+            try snapshot.validate()
         case .forked(let snapshot):
             try snapshot.validate()
         case .toolOutput(let output):

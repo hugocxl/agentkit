@@ -9,6 +9,9 @@ extension AgentChatRequest {
             try settings?.effort?.validate()
             guard UUID(uuidString: id) != nil else { throw .badRequest }
             try AgentValidation.message(text, limit: 64 * 1024)
+        case .updateQueued(_, let id, let edit, _):
+            guard UUID(uuidString: id) != nil else { throw .badRequest }
+            try edit.validate()
         case .removeQueued(_, let id, _), .deliverQueued(_, let id, _):
             guard UUID(uuidString: id) != nil else { throw .badRequest }
         case .moveQueued(_, let id, let before, _):
@@ -41,6 +44,17 @@ extension AgentChatRequest {
             }
         case .clear(let session, let from, _), .fork(let session, let from, _):
             guard session != from else { throw .badRequest }
+        case .decide(_, let request, let decision, let answers):
+            try AgentValidation.message(request, limit: 1024)
+            try AgentValidation.message(decision, limit: 256)
+            guard (answers?.count ?? 0) <= 12 else { throw .badRequest }
+            for (id, values) in answers ?? [:] {
+                try AgentValidation.message(id, limit: 1024)
+                guard values.count <= 32 else { throw .badRequest }
+                for value in values { try AgentValidation.message(value, limit: 16 * 1024) }
+            }
+        case .retryTurn(_, let turn), .scheduleRetry(_, let turn, _):
+            try AgentValidation.message(turn, limit: 1024)
         case .create, .read, .interrupt, .close, .setAccess, .setPlan:
             break
         }
@@ -81,9 +95,14 @@ extension AgentChatSnapshot {
                   (prompt.error?.utf8.count ?? 0) <= 8192, prompt.attachments.count <= AgentChatAttachment.maxCount else { throw .badRequest }
             for attachment in prompt.attachments { try attachment.validate() }
         }
-        for turn in turns ?? [] { try turn.checkpoint?.validate() }
+        for turn in turns ?? [] {
+            try turn.checkpoint?.validate()
+            try turn.rateLimit?.validate()
+            guard (turn.checkpointStatus?.reason?.utf8.count ?? 0) <= AgentTurnCheckpointStatus.maxReasonBytes else { throw .badRequest }
+        }
         for item in items {
             try item.questionnaire?.validate()
+            try item.interaction?.validate()
             if let context = item.workContext {
                 guard [context.runID, context.providerTurnID, context.itemType, context.sourceStatus, context.toolNonExecutionKind, context.requestKind, context.planStatus]
                     .allSatisfy({ ($0?.utf8.count ?? 0) <= 4096 && $0?.contains("\0") != true }) else { throw .badRequest }
@@ -110,6 +129,7 @@ extension AgentChatItem {
         text.utf8.count + (detail?.utf8.count ?? 0) + (tool?.transcriptByteCount ?? 0)
             + (attachments ?? []).reduce(0) { $0 + $1.transcriptByteCount }
             + (questionnaire?.transcriptByteCount ?? 0)
+            + (interaction?.transcriptByteCount ?? 0)
             + (createdAt == nil ? 0 : 48) + (updatedAt == nil ? 0 : 48)
             + (workContext.map { context in
                 400 + [context.runID, context.providerTurnID, context.itemType, context.sourceStatus, context.toolNonExecutionKind, context.requestKind, context.planStatus]

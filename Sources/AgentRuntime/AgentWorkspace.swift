@@ -22,7 +22,7 @@ public final class AgentWorkspace: @unchecked Sendable {
                 project: ProjectId,
                 executables: [AgentChatProvider: URL] = [:],
                 environment: [String: String] = [:], instructions: String? = nil,
-                tools: AgentToolConfiguration? = nil) throws {
+                tools: AgentToolConfiguration? = nil, retention: AgentConversationRetention = .keepClosed) throws {
         try tools?.validate()
         self.applicationToolsOnly = tools?.applicationOnly == true
         self.project = project
@@ -51,8 +51,15 @@ public final class AgentWorkspace: @unchecked Sendable {
         }
         runtime = try AgentRuntimeService(storageDirectory: storageDirectory.appendingPathComponent("conversations"),
             modelCacheDirectory: storageDirectory.appendingPathComponent("models"), executables: executables,
-            environment: environment, tools: tools, projectDirectory: { URL(fileURLWithPath: try resolve($0)) },
+            environment: environment, tools: tools, retention: retention, projectDirectory: { URL(fileURLWithPath: try resolve($0)) },
             launchContext: { _, _ in .init(instructions: instructions) })
+        // A deleted conversation's draft goes with it.
+        let drafts = self.storageDirectory.appendingPathComponent("drafts", isDirectory: true)
+        runtime.conversationDeleted = { session in
+            try? FileManager.default.removeItem(at: drafts.appendingPathComponent("\(session).json"))
+            // Its stashed drafts too; AgentUI keeps them beside the draft.
+            try? FileManager.default.removeItem(at: drafts.appendingPathComponent("\(session).stash", isDirectory: true))
+        }
     }
 
     /// Creates a connection without starting a CLI. Sending the first prompt starts it.
@@ -65,6 +72,7 @@ public final class AgentWorkspace: @unchecked Sendable {
         connection.draftURL = storageDirectory.appendingPathComponent("drafts/\(session).json")
         connection.conversation = { [runtime] in try await runtime.conversation($0) }
         connection.attachment = { [runtime] in try await runtime.attachment($0) }
+        connection.library = { [runtime] in try await runtime.library($0) }
         if !applicationToolsOnly { connection.checkpoint = { [runtime] in try await runtime.checkpoint($0) } }
         connection.files = { [files] in try await files.handle($0) }
         connection.models = { [runtime, project] provider, refresh in
@@ -79,7 +87,7 @@ public final class AgentWorkspace: @unchecked Sendable {
             try await runtime.composerContext(.init(project: project, provider: provider, forceRefresh: true))
         }
         if applicationToolsOnly {
-            connection.capabilities = [.modelSelection, .attachments, .promptQueue]
+            connection.capabilities = [.modelSelection, .attachments, .promptQueue, .steering]
             // Provider history can contain unrestricted coding sessions with different tools.
             connection.history = nil; connection.importHistory = nil; connection.composerContext = nil
         }

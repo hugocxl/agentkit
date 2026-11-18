@@ -22,7 +22,7 @@ AgentKit does not bundle a model or manage provider accounts.
 Add `https://github.com/hugocxl/agentkit.git` in Xcode's package dependencies, or add:
 
 ```swift
-.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.3.0")
+.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.4.0")
 ```
 
 Select the products your target needs:
@@ -128,7 +128,8 @@ edits through each installed provider.
 - Local file and media previews, including revision-checked ranged reads.
 
 Provider features vary. The adapters retain each provider's behavior rather than
-simulating unsupported operations. `AgentConnection.capabilities` controls optional UI features. Host-specific actions such as opening another
+simulating unsupported operations. `AgentConnection.capabilities` controls optional UI features; `.steering` offers Send Now,
+which hands a draft to the running turn instead of queueing it. Host-specific actions such as opening another
 conversation, launching a terminal, or previewing a pull request require host services.
 
 ## Integrate your app

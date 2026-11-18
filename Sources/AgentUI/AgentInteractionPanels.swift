@@ -290,6 +290,9 @@ private final class AgentQueueRow: NSView {
 @MainActor
 final class AgentQuestionView: ThemedView, NSTextFieldDelegate {
     var onAnswer: ((String, [String: [String]], Bool) -> Void)?
+    /// Answers a form whose request offered decisions, such as an MCP server's: the decision's
+    /// token, with the answers when it submits them.
+    var onDecision: ((String, String, [String: [String]]?) -> Void)?
     var onChange: (() -> Void)?
     private static let inset: CGFloat = 16
     private static let footerHeight: CGFloat = 48
@@ -298,6 +301,8 @@ final class AgentQuestionView: ThemedView, NSTextFieldDelegate {
     private let content = AgentFlippedView()
     private let submit = PillButton("Submit answers", style: .primary)
     private let cancel = PillButton("Cancel", style: .plain)
+    private let decline = PillButton("Decline", style: .plain)
+    private var interaction: AgentApprovalRequest?
     private let error = makeLabel("", font: AppFont.footnote)
     private var blocks: [AgentQuestionBlock] = []
     private var requestID: String?
@@ -319,12 +324,17 @@ final class AgentQuestionView: ThemedView, NSTextFieldDelegate {
         scroll.scrollerStyle = .overlay
         error.lineBreakMode = .byTruncatingTail
         addSubview(card)
-        for view in [scroll, submit, cancel, error] as [NSView] {
+        decline.isHidden = true
+        decline.onPress = { [weak self] in self?.decide(.decline) }
+        for view in [scroll, submit, cancel, decline, error] as [NSView] {
             card.addSubview(view)
             view.translatesAutoresizingMaskIntoConstraints = true
         }
         submit.onPress = { [weak self] in self?.answer(cancelled: false) }
-        cancel.onPress = { [weak self] in self?.answer(cancelled: true) }
+        cancel.onPress = { [weak self] in
+            guard let self else { return }
+            if self.interaction?.only(.cancel) != nil { self.decide(.cancel) } else { self.answer(cancelled: true) }
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
@@ -338,10 +348,16 @@ final class AgentQuestionView: ThemedView, NSTextFieldDelegate {
     func update(_ item: AgentChatItem?, enabled: Bool) {
         submit.isEnabled = enabled
         cancel.isEnabled = enabled
+        decline.isEnabled = enabled
         blocks.forEach { $0.isEnabled = enabled }
         guard requestID != item?.id || form != item?.questionnaire else { return }
         requestID = item?.id
         form = item?.questionnaire
+        interaction = item?.interaction
+        submit.title = interaction?.only(.submit)?.label ?? "Submit answers"
+        decline.isHidden = interaction?.only(.decline) == nil
+        cancel.toolTip = interaction?.only(.cancel)?.consequence
+        decline.toolTip = interaction?.only(.decline)?.consequence
         blocks.forEach { $0.removeFromSuperview() }
         blocks = []
         error.stringValue = ""
@@ -381,7 +397,12 @@ final class AgentQuestionView: ThemedView, NSTextFieldDelegate {
             let buttons = choices[id] ?? []
             buttons.forEach { $0.state = answers.contains($0.title) ? .on : .off }
             let labels = Set(buttons.map(\.title))
-            fields[id]?.stringValue = answers.filter { !labels.contains($0) }.joined(separator: ", ")
+            let written = answers.filter { !labels.contains($0) }.joined(separator: ", ")
+            fields[id]?.stringValue = written
+            // A single choice is either an option or written text, never both.
+            if !written.isEmpty, blocks.first(where: { $0.question.id == id })?.question.multiple == false {
+                buttons.forEach { $0.state = .off }
+            }
         }
     }
 
@@ -396,6 +417,12 @@ final class AgentQuestionView: ThemedView, NSTextFieldDelegate {
     }
 
     func controlTextDidChange(_ obj: Notification) {
+        // A written answer replaces a single choice's selected option, so what shows
+        // selected is always what is sent.
+        if let field = obj.object as? NSTextField, let block = blocks.first(where: { $0.field === field }),
+           !block.question.multiple, !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            block.choices.forEach { $0.state = .off }
+        }
         error.stringValue = ""
         needsLayout = true
         onChange?()
@@ -430,7 +457,16 @@ final class AgentQuestionView: ThemedView, NSTextFieldDelegate {
                                  userInfo: [.announcement: self.error.stringValue, .priority: NSAccessibilityPriorityLevel.high.rawValue])
             return
         }
+        if !cancelled, let submit = interaction?.only(.submit) {
+            onDecision?(requestID, submit.id, answers)
+            return
+        }
         onAnswer?(requestID, cancelled ? [:] : answers, cancelled)
+    }
+
+    private func decide(_ kind: AgentApprovalDecision.Kind) {
+        guard let requestID, let decision = interaction?.only(kind) else { return }
+        onDecision?(requestID, decision.id, nil)
     }
 
     private func contentHeight(width: CGFloat) -> CGFloat {
@@ -448,7 +484,9 @@ final class AgentQuestionView: ThemedView, NSTextFieldDelegate {
         let cancelWidth = ceil(cancel.fittingSize.width)
         submit.frame = NSRect(x: bounds.width - inset - submitWidth, y: buttonY, width: submitWidth, height: 28)
         cancel.frame = NSRect(x: submit.frame.minX - 6 - cancelWidth, y: buttonY, width: cancelWidth, height: 28)
-        error.frame = NSRect(x: inset, y: buttonY + 6, width: max(0, cancel.frame.minX - inset - 8), height: 16)
+        let declineWidth = decline.isHidden ? 0 : ceil(decline.fittingSize.width)
+        decline.frame = NSRect(x: cancel.frame.minX - (declineWidth > 0 ? 6 : 0) - declineWidth, y: buttonY, width: declineWidth, height: 28)
+        error.frame = NSRect(x: inset, y: buttonY + 6, width: max(0, decline.frame.minX - inset - 8), height: 16)
         scroll.frame = NSRect(x: 0, y: inset, width: bounds.width, height: max(0, buttonY - inset - 8))
         var y: CGFloat = 0
         for block in blocks {
@@ -462,6 +500,7 @@ final class AgentQuestionView: ThemedView, NSTextFieldDelegate {
     private func applyColors() {
         error.textColor = theme.danger
         cancel.setTitleColor(theme.fgMuted)
+        decline.setTitleColor(theme.fgMuted)
         blocks.forEach { $0.apply(theme) }
     }
 

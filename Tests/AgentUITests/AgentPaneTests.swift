@@ -109,7 +109,7 @@ final class AgentPaneTests: XCTestCase {
             } else { operation = request }
             requests.append(operation)
             switch operation {
-            case .submit, .editQueued, .moveQueued, .removeQueued, .deliverQueued, .resumeQueue, .answer: break
+            case .submit, .editQueued, .updateQueued, .moveQueued, .removeQueued, .deliverQueued, .resumeQueue, .answer, .decide, .retryTurn, .scheduleRetry: break
             case .create, .fork:
                 if failCreate { throw NSError(domain: "Offline", code: 1) }
             case .send(_, let text, let model, let effort, let provider, _):
@@ -1422,9 +1422,9 @@ final class AgentPaneTests: XCTestCase {
         let backend = Backend()
         let pane = backend.controller()
         defer { pane.dispose() }
-        XCTAssertFalse(pane.attachLongPaste("A short paste"))
+        XCTAssertEqual(pane.attachLongPaste("A short paste"), .inline(nil))
         let long = (1...250).map { "line \($0)" }.joined(separator: "\n")
-        XCTAssertTrue(pane.attachLongPaste(long))
+        XCTAssertEqual(pane.attachLongPaste(long), .attached)
         XCTAssertTrue(pane.surface.composer.string.isEmpty)
     }
 
@@ -1476,5 +1476,283 @@ extension AgentPaneTests {
         XCTAssertTrue(backend.submissions.isEmpty)
         XCTAssertFalse(backend.requests.contains { if case .setPlan = $0 { return true }; return false })
         XCTAssertFalse(backend.requests.contains { if case .fork = $0 { return true }; return false })
+    }
+}
+
+extension AgentPaneTests {
+    /// T6: approval, failure and completion are spoken once each, from the snapshot that
+    /// first shows them, while the keyboard stays in the composer; refreshing, reconnecting,
+    /// hiding and showing the pane again, and streaming text never speak.
+    func testTransitionsAreAnnouncedOnceWithoutMovingFocus() async throws {
+        let backend = Backend()
+        backend.snapshot.items = [AgentChatItem(id: "old", kind: .user, text: "Earlier")]
+        backend.snapshot.turns = [AgentChatTurn(userItemID: "old", startedAt: Date(), completedAt: Date(), status: .idle, outcome: .completed)]
+        backend.snapshot.status = .idle
+        let pane = backend.controller()
+        defer { pane.dispose() }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 600), styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = pane.view
+        var spoken: [String] = []
+        pane.announceTransition = { spoken.append($0.text) }
+        func publish(_ change: (inout AgentChatSnapshot) -> Void) async throws {
+            change(&backend.snapshot)
+            backend.snapshot.revision += 1
+            let revision = backend.snapshot.revision
+            pane.sessionChanged(session: backend.session, revision: revision)
+            try await wait { pane.snapshot?.revision == revision }
+        }
+        pane.refresh()
+        try await wait { pane.snapshot != nil }
+        XCTAssertEqual(spoken, [], "What the pane finds on opening is already known")
+        window.makeFirstResponder(pane.surface.composer)
+
+        try await publish {
+            $0.items.append(AgentChatItem(id: "u1", kind: .user, text: "Run it"))
+            $0.items.append(AgentChatItem(id: "a1", kind: .assistant, text: "Work", isComplete: false))
+            $0.turns?.append(AgentChatTurn(userItemID: "u1", startedAt: Date()))
+            $0.status = .working
+        }
+        for token in 1...5 { try await publish { $0.items[2].text += " token\(token)" } }
+        XCTAssertEqual(spoken, [], "Streaming text is never spoken")
+        try await publish {
+            $0.items.append(AgentChatItem(id: "ap1", kind: .approval, text: "Bash: rm -rf build", isComplete: false))
+            $0.status = .waiting
+        }
+        XCTAssertEqual(spoken, ["Claude Code is asking for approval: Bash: rm -rf build"])
+        pane.refresh()
+        try await publish { _ in }
+        pane.connectionChanged()
+        try await wait { pane.snapshot?.revision == backend.snapshot.revision }
+        try await publish { _ in }
+        XCTAssertEqual(spoken.count, 1, "Refreshing and reconnecting don't repeat it")
+        try await publish {
+            $0.items[3].isComplete = true
+            $0.items[2].isComplete = true
+            $0.status = .idle
+            $0.turns?[1].completedAt = Date(); $0.turns?[1].outcome = .completed
+        }
+        XCTAssertEqual(spoken.last, "Claude Code finished responding.")
+        XCTAssertTrue(window.firstResponder === pane.surface.composer, "Announcements leave the keyboard in the composer")
+        pane.view.isHidden = true
+        try await publish {
+            $0.items.append(AgentChatItem(id: "u2", kind: .user, text: "Again"))
+            $0.items.append(AgentChatItem(id: "n2", kind: .notice, text: "The provider stopped unexpectedly."))
+            $0.turns?.append(AgentChatTurn(userItemID: "u2", startedAt: Date(), completedAt: Date(), status: .failed, outcome: .failed))
+            $0.status = .failed
+        }
+        XCTAssertEqual(spoken.count, 2, "A pane out of sight doesn't speak")
+        pane.view.isHidden = false
+        pane.didShow()
+        window.makeFirstResponder(pane.surface.composer)
+        try await publish { _ in }
+        XCTAssertEqual(spoken.count, 2, "Showing the pane again doesn't replay what happened while hidden")
+        try await publish {
+            $0.items.append(AgentChatItem(id: "u3", kind: .user, text: "Once more"))
+            $0.items.append(AgentChatItem(id: "n3", kind: .notice, text: "Rate limited."))
+            $0.turns?.append(AgentChatTurn(userItemID: "u3", startedAt: Date(), completedAt: Date(), status: .failed, outcome: .failed))
+        }
+        XCTAssertEqual(spoken.last, "Claude Code failed: Rate limited.")
+        XCTAssertEqual(spoken.count, 3)
+        XCTAssertTrue(window.firstResponder === pane.surface.composer, "Announcements leave the keyboard in the composer")
+        window.contentView = nil
+    }
+
+    func testAnnouncementsStartOverAfterAClearAndOldServersStillReportFailures() {
+        var announcer = AgentTransitionAnnouncements()
+        var snapshot = AgentChatSnapshot(session: SessionId(), project: ProjectId(), provider: .codex, status: .working)
+        XCTAssertEqual(announcer.announcements(for: snapshot), [])
+        snapshot.items = [AgentChatItem(id: "n", kind: .notice, text: "Crashed")]
+        snapshot.status = .failed
+        XCTAssertEqual(announcer.announcements(for: snapshot).map(\.text), ["Codex failed: Crashed"], "No turn records: the notice keys it")
+        XCTAssertEqual(announcer.announcements(for: snapshot), [])
+        snapshot.resetID = SessionId()
+        snapshot.items = [AgentChatItem(id: "q", kind: .approval, text: "Pick one", isComplete: false,
+                                        questionnaire: AgentQuestionnaire(questions: []))]
+        XCTAssertEqual(announcer.announcements(for: snapshot), [], "A cleared conversation's first snapshot is taken as known")
+        snapshot.items.append(AgentChatItem(id: "q2", kind: .approval, text: "Pick", isComplete: false,
+                                            questionnaire: AgentQuestionnaire(questions: [])))
+        XCTAssertEqual(announcer.announcements(for: snapshot).map(\.text), ["Codex asked a question."])
+    }
+}
+
+extension AgentPaneTests {
+    /// T2: pages loaded to the beginning stay as the server trims more of the conversation;
+    /// items trimmed unseen across a reconnect, during a page read, are filled in. Nothing is
+    /// shown twice, no loaded page disappears, the loader is never off over a gap, and the
+    /// reader keeps their place and Find match.
+    func testLoadedHistorySurvivesTrimsAndAReconnectDuringAPageRead() async throws {
+        let backend = Backend()
+        func item(_ id: String) -> AgentChatItem { AgentChatItem(id: id, kind: id.hasPrefix("u") ? .user : .assistant, text: "Message \(id)") }
+        var archive = ["a0", "a1", "a2", "a3"].map(item)
+        backend.snapshot.items = ["r0", "r1", "r2", "r3"].map(item)
+        backend.snapshot.omittedItems = 4
+        backend.snapshot.status = .idle
+        let pane = backend.controller()
+        defer { pane.dispose() }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = pane.view
+        var gate: CheckedContinuation<Void, Never>?
+        var gateNext = false
+        var reads: [Int?] = []
+        pane.conversationRequest = { request in
+            guard case .earlier(_, let before, let limit) = request else { throw ErrorReply(code: .unsupported, message: "") }
+            reads.append(before)
+            if gateNext { gateNext = false; await withCheckedContinuation { gate = $0 } }
+            let end = min(before ?? archive.count, archive.count)
+            let start = max(0, end - min(limit, 3))
+            return .earlier(AgentEarlierItems(items: Array(archive[start..<end]), start: start, total: archive.count))
+        }
+        /// The server trims its oldest retained items into the archive.
+        func trim(_ count: Int, appending: [String] = []) {
+            backend.snapshot.items += appending.map(item)
+            let gone = backend.snapshot.items.prefix(count)
+            archive += gone
+            backend.snapshot.items.removeFirst(count)
+            backend.snapshot.omittedItems = (backend.snapshot.omittedItems ?? 0) + count
+            backend.snapshot.revision += 1
+        }
+        pane.refresh()
+        try await wait { pane.snapshot != nil }
+        XCTAssertNotNil(pane.surface.onLoadEarlier)
+        pane.loadEarlier()
+        try await wait { pane.earlierItems.count == 3 }
+        pane.loadEarlier()
+        try await wait { pane.earlierItems.count == 4 }
+        XCTAssertEqual(reads, [nil, 1])
+        XCTAssertNil(pane.surface.onLoadEarlier, "Loaded to the beginning")
+        pane.surface.performFind(.open)
+        pane.surface.findBar?.query = "Message a1"
+        pane.surface.findBar.map { $0.findBar($0.bar, didChangeQuery: "Message a1") }
+        XCTAssertEqual(pane.surface.findModel?.selected?.itemID, "a1")
+        let clip = pane.surface.transcriptScroll.contentView
+        let top = clip.bounds.minY
+
+        // Another turn trims two of the shown items: they stay, once.
+        trim(2, appending: ["u4", "r5"])
+        pane.sessionChanged(session: backend.session, revision: backend.snapshot.revision)
+        try await wait { pane.snapshot?.revision == backend.snapshot.revision }
+        XCTAssertEqual(pane.surface.snapshot?.items.map(\.id), ["a0", "a1", "a2", "a3", "r0", "r1", "r2", "r3", "u4", "r5"])
+        XCTAssertEqual(reads.count, 2, "Trimming what was shown needs no read")
+
+        // Disconnected, the conversation grows and trims items this pane never saw.
+        gateNext = true
+        trim(6, appending: ["u6", "r7", "u8", "r9"])
+        pane.connectionChanged()
+        try await wait { gate != nil }
+        XCTAssertEqual(reads.last, Optional<Int>.none, "The gap is read from the archive's end")
+        XCTAssertEqual(pane.surface.snapshot?.items.map(\.id).prefix(8), ["a0", "a1", "a2", "a3", "r0", "r1", "r2", "r3"],
+                       "Loaded pages stay while the gap is read")
+        // A second reconnect while that read is in flight.
+        pane.connectionChanged()
+        try await wait { pane.snapshot?.revision == backend.snapshot.revision }
+        gate?.resume(); gate = nil
+        try await wait { pane.surface.snapshot?.items.count == 14 }
+        let ids = try XCTUnwrap(pane.surface.snapshot?.items.map(\.id))
+        XCTAssertEqual(ids, ["a0", "a1", "a2", "a3", "r0", "r1", "r2", "r3", "u4", "r5", "u6", "r7", "u8", "r9"])
+        XCTAssertEqual(Set(ids).count, ids.count, "Nothing shows twice")
+        XCTAssertEqual(pane.surface.snapshot?.omittedItems, 0)
+        XCTAssertNil(pane.surface.onLoadEarlier)
+        XCTAssertEqual(pane.surface.findModel?.selected?.itemID, "a1", "Find keeps its match")
+        XCTAssertLessThan(abs(clip.bounds.minY - top), 1, "The reading position holds; nothing jumps to the end")
+        window.contentView = nil
+    }
+
+    func testEarlierTimelineDropsPagesReadForAnotherCursorOrReset() {
+        var timeline = AgentEarlierTimeline()
+        var snapshot = AgentChatSnapshot(session: SessionId(), project: ProjectId(), provider: .claude)
+        snapshot.items = [AgentChatItem(id: "r", kind: .user, text: "Now")]
+        snapshot.omittedItems = 6
+        timeline.observe(snapshot)
+        let page = { (ids: [String], start: Int) in AgentEarlierItems(items: ids.map { AgentChatItem(id: $0, kind: .user, text: $0) }, start: start, total: 6) }
+        XCTAssertTrue(timeline.merge(older: page(["c", "d", "e", "f"], 2), before: nil, resetID: nil, basis: 6))
+        XCTAssertFalse(timeline.merge(older: page(["e", "f"], 4), before: nil, resetID: nil, basis: 6), "A second first page is stale")
+        XCTAssertFalse(timeline.merge(older: page(["a"], 0), before: 1, resetID: nil, basis: 6), "Another cursor is stale")
+        XCTAssertTrue(timeline.canLoadOlder)
+        XCTAssertTrue(timeline.merge(older: page(["a", "b", "c"], 0), before: 2, resetID: nil, basis: 6))
+        XCTAssertEqual(timeline.items.map(\.id), ["a", "b", "c", "d", "e", "f"], "Keyed by identity, nothing twice")
+        XCTAssertFalse(timeline.canLoadOlder)
+        snapshot.resetID = SessionId()
+        timeline.observe(snapshot)
+        XCTAssertEqual(timeline.items, [], "A cleared conversation starts over")
+        XCTAssertFalse(timeline.merge(older: page(["a"], 0), before: nil, resetID: nil, basis: 6), "A page read before the clear is dropped")
+    }
+}
+
+extension AgentPaneTests {
+    /// T3: Find searches the server's archive with Find's own rules, reveals an archived
+    /// tool result by loading its page and opening the row, and says how much of the
+    /// history a stopped, failed or incomplete search covered.
+    func testFindSearchesArchivedHistoryAndDescribesItsScope() async throws {
+        let backend = Backend()
+        backend.snapshot.items = [AgentChatItem(id: "now", kind: .assistant, text: "Latest answer")]
+        backend.snapshot.omittedItems = 260
+        backend.snapshot.status = .idle
+        let archive: [AgentChatItem] = (0..<250).map { index in
+            index == 20 ? AgentChatItem(id: "tool20", kind: .tool, text: "Bash", tool: .init(name: "Bash", category: .command,
+                input: #"{"command":"grep"}"#, output: "found the needle-xyz here", status: .completed))
+                : AgentChatItem(id: "a\(index)", kind: index % 2 == 0 ? .user : .assistant, text: "Archived \(index)")
+        }
+        let pane = backend.controller()
+        defer { pane.dispose() }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 500), styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = pane.view
+        var failAfter: Int?
+        var gate: CheckedContinuation<Void, Never>?
+        var gateAfter: Int?
+        var reads = 0
+        pane.conversationRequest = { request in
+            guard case .earlier(_, let before, let limit) = request else { throw ErrorReply(code: .unsupported, message: "") }
+            reads += 1
+            if let failAfter, reads > failAfter { throw NSError(domain: "Disconnected", code: 1) }
+            if let gateAfter, reads > gateAfter { await withCheckedContinuation { gate = $0 } }
+            let end = min(before ?? archive.count, archive.count), start = max(0, end - limit)
+            return .earlier(AgentEarlierItems(items: Array(archive[start..<end]), start: start, total: archive.count))
+        }
+        pane.refresh()
+        try await wait { pane.snapshot != nil }
+        func find(_ query: String) {
+            pane.surface.performFind(.open)
+            pane.surface.findBar?.query = query
+            pane.surface.findBar.map { $0.findBar($0.bar, didChangeQuery: query) }
+        }
+        find("needle-xyz")
+        try await wait { if case .complete = pane.surface.archiveFind { return true }; return false }
+        XCTAssertEqual(pane.surface.archiveFind.hits, [AgentArchiveFindHit(itemID: "tool20", position: 20, count: 1)])
+        XCTAssertEqual(pane.surface.findBar?.counter,
+                       "None shown · 1 in earlier history · 10 older messages weren't kept and weren't searched")
+        XCTAssertTrue(pane.earlierItems.isEmpty, "Searching reads pages without showing them")
+
+        pane.surface.performFind(.next)
+        try await wait { pane.surface.findModel?.selected?.itemID == "tool20" }
+        XCTAssertEqual(pane.surface.snapshot?.items.first?.id, "a0", "Its page and those after it loaded")
+        XCTAssertEqual(pane.surface.findBar?.counter, "1 of 1 · 10 older messages weren't kept and weren't searched")
+        let row = try XCTUnwrap(pane.surface.transcript.entryID(showing: "tool20"))
+        XCTAssertNotNil(pane.surface.transcript.mountedRow(row), "The match is revealed")
+        pane.surface.performFind(.close)
+        XCTAssertNil(pane.surface.findModel)
+
+        // A search the connection fails partway says how much it covered.
+        let second = backend.controller()
+        defer { second.dispose() }
+        second.conversationRequest = pane.conversationRequest
+        second.refresh()
+        try await wait { second.snapshot != nil }
+        reads = 0; failAfter = 1
+        second.surface.performFind(.open)
+        second.surface.findBar.map { $0.query = "Archived 20"; $0.findBar($0.bar, didChangeQuery: "Archived 20") }
+        try await wait { if case .stopped = second.surface.archiveFind { return true }; return false }
+        XCTAssertEqual(second.surface.findBar?.counter, "None shown · 10 in earlier history · earlier history search failed after 100 of 250 messages")
+
+        // Escape stops a running search; it stays open and says where it stopped.
+        reads = 0; failAfter = nil; gateAfter = 1
+        second.surface.findBar.map { $0.query = "Archived 1"; $0.findBar($0.bar, didChangeQuery: "Archived 1") }
+        try await wait { gate != nil }
+        XCTAssertTrue(second.surface.findBar?.counter.contains("searching earlier history (100 of 250)") == true)
+        second.surface.performFind(.close)
+        gate?.resume(); gate = nil
+        try await wait { if case .stopped = second.surface.archiveFind { return true }; return false }
+        XCTAssertNotNil(second.surface.findModel, "Escape stopped the search, not Find")
+        XCTAssertTrue(second.surface.findBar?.counter.hasSuffix("earlier history search stopped after 100 of 250 messages") == true)
+        window.contentView = nil
     }
 }

@@ -211,4 +211,84 @@ final class AgentStreamingCompletionTests: XCTestCase {
         response.setContent("Literal **stars", theme: theme)
         XCTAssertEqual(response.textViews.first?.string, "Literal **stars")
     }
+
+    // MARK: Fences shared with the parser
+
+    func testFenceRecognitionMatchesMarkerKindAndLength() throws {
+        let tilde = try XCTUnwrap(AgentMarkdownFence.opening("~~~text"))
+        XCTAssertEqual(tilde.marker, "~")
+        XCTAssertFalse(tilde.isClosed(by: "```"), "A backtick run never closes a tilde fence")
+        XCTAssertTrue(tilde.isClosed(by: "~~~~  "))
+        let long = try XCTUnwrap(AgentMarkdownFence.opening("````md"))
+        XCTAssertFalse(long.isClosed(by: "```"), "A shorter run stays code")
+        XCTAssertFalse(long.isClosed(by: "```` trailing"), "A closing fence has nothing after it")
+        XCTAssertTrue(long.isClosed(by: "`````"))
+        XCTAssertNil(AgentMarkdownFence.opening("    ```"), "Four columns of indent is indented code")
+        XCTAssertNil(AgentMarkdownFence.opening("``` a`b"), "A backtick info string can't hold a backtick")
+        XCTAssertEqual(AgentMarkdownFence.open(after: ["````md", "```swift", "```"])?.count, 4)
+        XCTAssertNil(AgentMarkdownFence.open(after: ["~~~", "```", "~~~"]))
+    }
+
+    /// The filter counted only lines starting with three backticks: a tilde fence's `|` line
+    /// was held back as an unfinished table, and a four-backtick fence holding a shorter
+    /// fence read as closed, so later code lines disappeared while streaming.
+    func testStreamedFencesKeepEveryCodeLineVisibleAndEndAsTheFinishedRendering() {
+        let source = """
+        Intro
+
+        ~~~text
+        | not a table |
+        | --- |
+        plain
+        ~~~
+
+        ````md
+        ```swift
+        let x = 1
+        ```
+        | still code |
+        -
+        ````
+
+        Done.
+
+        """
+        func code(_ blocks: [AgentMarkdown.Block]) -> String {
+            blocks.compactMap { block -> String? in
+                if case .code(_, let content, _) = block { return content }
+                return nil
+            }.joined()
+        }
+        let lines = source.components(separatedBy: "\n")
+        let codeLines: Set<Int> = [3, 4, 5, 9, 10, 11, 12, 13]
+        var streamed = ""
+        for (index, line) in lines.enumerated() {
+            var partial = ""
+            for character in line {
+                streamed.append(character)
+                partial.append(character)
+                let shown = code(AgentResponseParser.parse(AgentStreamingCompletion.holdingBackAmbiguousTail(streamed)))
+                for finished in codeLines where finished < index {
+                    XCTAssertTrue(shown.contains(lines[finished]), "Line \(finished) vanished at \(streamed.debugDescription)")
+                }
+                if codeLines.contains(index) {
+                    XCTAssertTrue(shown.contains(partial.trimmingCharacters(in: .whitespaces)),
+                                  "The streaming code line shows as it arrives")
+                }
+            }
+            if index < lines.count - 1 { streamed.append("\n") }
+        }
+        XCTAssertEqual(streamed, source)
+        _ = NSApplication.shared
+        let streaming = AgentResponseView(frame: NSRect(x: 0, y: 0, width: 500, height: 300))
+        streaming.isStreaming = true
+        streaming.setContent(source, theme: theme)
+        streaming.isStreaming = false
+        streaming.setContent(source, theme: theme)
+        let finished = AgentResponseView(frame: NSRect(x: 0, y: 0, width: 500, height: 300))
+        finished.setContent(source, theme: theme)
+        XCTAssertEqual(streaming.textViews.map(\.string), finished.textViews.map(\.string))
+        XCTAssertEqual(code(AgentResponseParser.parse(AgentStreamingCompletion.holdingBackAmbiguousTail(source))),
+                       "| not a table |\n| --- |\nplain\n```swift\nlet x = 1\n```\n| still code |\n-\n")
+    }
 }

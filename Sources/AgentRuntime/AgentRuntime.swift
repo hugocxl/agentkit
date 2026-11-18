@@ -113,6 +113,14 @@ internal final class AgentRuntime: @unchecked Sendable {
     private var questions: [String: (form: AgentQuestionnaire, wire: [String: Any])] = [:]
     private var answeredQuestions: Set<String> = []
     private var completedApprovals: Set<String> = []
+    /// The cards of pending requests that carry offered decisions, by item ID.
+    private var interactions: [String: AgentApprovalRequest] = [:]
+    /// Decisions sent, by item ID, so a repeated decision is answered as already sent.
+    private var decided: [String: String] = [:]
+    /// Child agents' Codex threads, with the transcript row that started each.
+    private var childThreads: [String: String] = [:]
+    /// The latest usage-limit reset Codex reported, for a turn its limit stops.
+    private var codexRateLimitReset: Date?
     private var completedApprovalOrder: [String] = []
     private var threadID: String?
     private var turnID: String?
@@ -605,7 +613,8 @@ internal final class AgentRuntime: @unchecked Sendable {
 
     private func allowPendingAutomatically() throws {
         for id in approvals.keys.sorted() {
-            guard let approval = approvals[id], automaticallyAllows(approval) else { continue }
+            guard let approval = approvals[id], automaticallyAllows(approval),
+                  interactions[id].map({ $0.only(.allowOnce) != nil }) ?? true else { continue }
             try resolveApproval(id, allow: true, automatic: true)
         }
     }
@@ -621,7 +630,8 @@ internal final class AgentRuntime: @unchecked Sendable {
 
     private func automaticallyAllows(_ approval: [String: Any]) -> Bool {
         let tool = approval["tool_name"] as? String
-        guard tool != "AskUserQuestion", tool != "ExitPlanMode" else { return false }
+        // An MCP server's request is the user's to answer, whatever the access mode.
+        guard tool != "AskUserQuestion", tool != "ExitPlanMode", approval["elicitation"] == nil else { return false }
         if provider == .claude, let tool, alwaysAllowedTools.contains(tool) { return true }
         switch accessMode {
         case .ask: return false
@@ -642,6 +652,16 @@ internal final class AgentRuntime: @unchecked Sendable {
             else { response["message"] = reason.isEmpty ? "User declined tool execution." : "User declined tool execution: " + reason }
             if let toolID = approval["tool_use_id"] { response["toolUseID"] = toolID }
             try write(["type": "control_response", "response": ["subtype": "success", "request_id": id, "response": response]])
+        } else if let interaction = interactions[id] {
+            // Plain Allow and Deny, from a client that predates offered decisions or the access
+            // mode, send the provider's own one-time answer only when it was offered.
+            let wanted: [AgentApprovalDecision.Kind] = allow ? [.allowOnce] : [.decline, .cancel]
+            guard let decision = wanted.lazy.compactMap({ interaction.only($0) }).first else {
+                throw AgentRuntimeError("Codex did not offer a one-time \(allow ? "approval" : "rejection"). Choose one of the offered answers or stop the turn.")
+            }
+            try writeCodexDecision(id, approval: approval, decision: decision.id)
+            finishDecision(id, approval: approval, decision: decision, automatic: automatic)
+            return
         } else {
             let available = (approval["availableDecisions"] as? [Any])?.compactMap { $0 as? String }
             let decision = allow ? "accept" : available?.contains("decline") == false ? "cancel" : "decline"
@@ -662,7 +682,14 @@ internal final class AgentRuntime: @unchecked Sendable {
             }
         }
         let text = automatic ? "Automatically approved" : allow ? "Approved" : "Declined"
-        onEvent(.item(AgentChatItem(id: id, kind: .approval, text: text)))
+        if var interaction = interactions.removeValue(forKey: id) {
+            let kind: AgentApprovalDecision.Kind = allow ? .allowOnce : .decline
+            interaction.chosen = interaction.only(kind)?.id ?? (allow ? "allow" : "deny")
+            interaction.outcome = automatic ? .automatic : .decided
+            onEvent(.item(AgentChatItem(id: id, kind: .approval, text: text, interaction: interaction)))
+        } else {
+            onEvent(.item(AgentChatItem(id: id, kind: .approval, text: text)))
+        }
         onEvent(.status(approvals.isEmpty && questions.isEmpty ? (busy ? .working : .idle) : .waiting))
     }
 
@@ -794,6 +821,9 @@ internal final class AgentRuntime: @unchecked Sendable {
         }
     }
 
+    /// Handles one provider line as if its process wrote it; replay tests feed captured shapes.
+    func replay(_ line: String) { queue.sync { receive(Data(line.utf8)) } }
+
     private func receive(_ data: Data) {
         guard !closed, !failed else { return }
         do {
@@ -850,15 +880,21 @@ internal final class AgentRuntime: @unchecked Sendable {
                 try resolveApproval(id, allow: true, automatic: true)
                 return
             }
-            onEvent(.item(AgentChatItem(id: id, kind: .approval, text: request["tool_name"] as? String ?? "Tool approval",
+            let tool = request["tool_name"] as? String ?? "Tool approval"
+            // A subagent's request names the agent; its card says so and offers the same answers.
+            let interaction = (request["agent_id"] as? String).map { agent in
+                claudeInteraction(id: id, tool: tool, origin: AgentRequestOrigin(agentID: agent, name: request["agent_type"] as? String))
+            }
+            if let interaction { interactions[id] = interaction }
+            onEvent(.item(AgentChatItem(id: id, kind: .approval, text: tool,
                                        detail: agentRuntimeJSON(request["input"]), isComplete: false,
-                                       workContext: .init(requestKind: agentClaudeApprovalKind(request["tool_name"] as? String ?? "")))))
+                                       workContext: .init(requestKind: agentClaudeApprovalKind(tool)), interaction: interaction)))
             onEvent(.status(.waiting))
             return
         }
         if type == "control_cancel_request", let id = message["request_id"] as? String {
             if questions.removeValue(forKey: id) != nil || approvals.removeValue(forKey: id) != nil {
-                onEvent(.item(AgentChatItem(id: id, kind: .approval, text: "Cancelled")))
+                settle(id, text: "Cancelled", outcome: .resolvedElsewhere)
                 onEvent(.status(approvals.isEmpty && questions.isEmpty ? .working : .waiting))
             }
             return
@@ -901,7 +937,7 @@ internal final class AgentRuntime: @unchecked Sendable {
             return
         }
         if let method, let wireID = message["id"] {
-            let id = agentRuntimeID(wireID)
+            let id = agentProviderRequestKey(wireID)
             if method == "item/tool/call" {
                 if let thread = params["threadId"] as? String, thread != threadID {
                     try write(["id": wireID, "result": Self.codexApplicationResult(.failure("Tool belongs to another thread."))]); return
@@ -924,19 +960,11 @@ internal final class AgentRuntime: @unchecked Sendable {
                 try presentQuestions(id: id, form: AgentQuestionParser.parse(params, claude: false), wire: wire)
                 return
             }
-            if method == "item/commandExecution/requestApproval" || method == "item/fileChange/requestApproval" {
-                var approval = params
-                approval["wireID"] = wireID
-                approvals[id] = approval
-                if automaticallyAllows(approval) {
-                    try resolveApproval(id, allow: true, automatic: true)
-                    return
-                }
-                onEvent(.item(AgentChatItem(id: id, kind: .approval, text: params["command"] as? String ?? params["reason"] as? String ?? "Approve file changes",
-                                           detail: agentRuntimeJSON(params), isComplete: false,
-                                           workContext: .init(providerTurnID: params["turnId"] as? String,
-                                                              requestKind: method == "item/fileChange/requestApproval" ? "file-change" : "command"))))
-                onEvent(.status(.waiting))
+            if method == "item/commandExecution/requestApproval" || method == "item/fileChange/requestApproval"
+                || method == "item/permissions/requestApproval" {
+                try receiveCodexApproval(method: method, id: id, wireID: wireID, params: params)
+            } else if method == "mcpServer/elicitation/request" {
+                try receiveCodexElicitation(id: id, wireID: wireID, params: params)
             } else {
                 try write(["id": wireID, "error": ["code": -32601, "message": "AgentKit does not support this interaction: \(method)"]])
                 onEvent(.item(AgentChatItem(kind: .notice, text: "Unsupported Codex interaction: \(method)")))
@@ -944,11 +972,15 @@ internal final class AgentRuntime: @unchecked Sendable {
             return
         }
         if method == "serverRequest/resolved", let requestID = params["requestId"] {
-            let id = agentRuntimeID(requestID)
+            let id = agentProviderRequestKey(requestID)
             if questions.removeValue(forKey: id) != nil || approvals.removeValue(forKey: id) != nil {
-                onEvent(.item(AgentChatItem(id: id, kind: .approval, text: "Request resolved or cancelled by the provider")))
+                settle(id, text: "Resolved elsewhere or cancelled by the provider", outcome: .resolvedElsewhere)
                 onEvent(.status(approvals.isEmpty && questions.isEmpty ? (busy ? .working : .idle) : .waiting))
             }
+        }
+        observeCodexChildren(method: method, params: params)
+        if method == "account/rateLimits/updated", let limits = params["rateLimits"] as? [String: Any] {
+            observeCodexRateLimits(limits)
         }
         // Agents Codex starts run in threads of their own; their notifications must not
         // end or fill this conversation's turn.
@@ -966,6 +998,7 @@ internal final class AgentRuntime: @unchecked Sendable {
             let turn = params["turn"] as? [String: Any] ?? [:]
             if turn["status"] as? String == "failed", !interruptRequested {
                 let error = turn["error"] as? [String: Any]
+                reportCodexUsageLimit(error)
                 fail(error?["message"] as? String ?? "Codex turn failed.")
             } else { completeTurn() }
         }
@@ -981,6 +1014,7 @@ internal final class AgentRuntime: @unchecked Sendable {
         }
         if method == "error", params["willRetry"] as? Bool != true, !interruptRequested {
             let error = params["error"] as? [String: Any]
+            reportCodexUsageLimit(error)
             fail(error?["message"] as? String ?? "Codex reported an error.")
         }
     }
@@ -1037,9 +1071,9 @@ internal final class AgentRuntime: @unchecked Sendable {
     }
 
     private func finishApprovals() {
-        for id in questions.keys { onEvent(.item(AgentChatItem(id: id, kind: .approval, text: "Question cancelled — response ended"))) }
+        for id in questions.keys { settle(id, text: "Question cancelled — response ended", outcome: .ended) }
         questions.removeAll()
-        for id in approvals.keys { onEvent(.item(AgentChatItem(id: id, kind: .approval, text: "No longer pending"))) }
+        for id in approvals.keys { settle(id, text: "No longer pending", outcome: .ended) }
         approvals.removeAll()
     }
 
@@ -1098,6 +1132,11 @@ extension AgentRuntime {
                 throw AgentRuntimeError("This question is no longer pending.")
             }
             try pending.form.validate(answers: answers, cancelled: cancelled)
+            if pending.wire["elicitation"] != nil {
+                // A form answered without offered decisions: Submit accepts, Cancel cancels.
+                try self.decideElicitation(id, pending: pending, decision: cancelled ? "cancel" : "accept", answers: answers)
+                return
+            }
             if self.provider == .claude {
                 var response: [String: Any] = ["behavior": cancelled ? "deny" : "allow"]
                 if cancelled { response["message"] = "The user cancelled the questions." }
@@ -1317,5 +1356,433 @@ extension AgentRuntime {
             finishApplicationTool(id, result: .failure("Tool call cancelled; no further work is authorized."), interrupted: true)
         }
         cancellingApplicationTools = false
+    }
+}
+
+/// A server request's key: its transcript item ID and the session's request name. Numbers
+/// keep their decimal spelling, as before; a string that reads as a number, or as such an
+/// escape, is prefixed, so request `7` and request `"7"` never share an item.
+internal func agentProviderRequestKey(_ value: Any) -> String {
+    if let text = value as? String {
+        return Double(text) != nil || text.hasPrefix("str:") ? "str:" + text : text
+    }
+    return agentRuntimeID(value)
+}
+
+/// The request ID exactly as the provider sent it.
+internal func agentProviderRequestValue(_ value: Any) -> AgentJSONValue? {
+    if let text = value as? String { return .string(text) }
+    if let number = value as? NSNumber { return .number(number.doubleValue) }
+    return nil
+}
+
+// MARK: Provider requests with offered decisions
+
+extension AgentRuntime {
+    /// Codex's command, file-change and permission approvals: the provider's own decisions,
+    /// what is asked for, and who asked.
+    fileprivate func receiveCodexApproval(method: String, id: String, wireID: Any, params: [String: Any]) throws {
+        var approval = params
+        approval["wireID"] = wireID
+        approval["method"] = method
+        let permissions = method == "item/permissions/requestApproval"
+        let (decisions, values) = permissions ? Self.permissionDecisions() : Self.codexDecisions(method: method, params: params)
+        guard !decisions.isEmpty else {
+            try write(["id": wireID, "error": ["code": -32602, "message": "AgentKit can't show any of the decisions offered for this request."]])
+            onEvent(.item(AgentChatItem(kind: .notice, text: "Codex asked for an approval with no decision AgentKit can show, so it was refused.")))
+            return
+        }
+        approval["decisionValues"] = values
+        var requested: [String] = []
+        let summary: String
+        let scope: String?
+        switch method {
+        case "item/permissions/requestApproval":
+            requested = Self.describe(permissions: params["permissions"] as? [String: Any] ?? [:])
+            summary = params["reason"] as? String ?? "Allow additional permissions"
+            scope = (params["cwd"] as? String).map { "Working in " + $0 }
+        case "item/fileChange/requestApproval":
+            summary = params["reason"] as? String ?? "Approve file changes"
+            scope = (params["grantRoot"] as? String).map { "Writes under " + $0 }
+        default:
+            summary = params["command"] as? String ?? params["reason"] as? String ?? "Run a command"
+            scope = (params["cwd"] as? String).map { "Runs in " + $0 }
+            if let reason = params["reason"] as? String, params["command"] != nil { requested.append(reason) }
+            if let host = (params["networkApprovalContext"] as? [String: Any])?["host"] as? String { requested.append("Network access to " + host) }
+        }
+        let interaction = AgentApprovalRequest(method: method, providerRequestID: agentProviderRequestValue(wireID), summary: summary,
+            scope: scope, requested: requested.isEmpty ? nil : Array(requested.prefix(64)), decisions: decisions, origin: origin(params))
+        approvals[id] = approval
+        interactions[id] = interaction
+        if automaticallyAllows(approval), let allow = interaction.only(.allowOnce) {
+            try writeCodexDecision(id, approval: approval, decision: allow.id)
+            finishDecision(id, approval: approval, decision: allow, automatic: true)
+            return
+        }
+        let kind = method == "item/fileChange/requestApproval" ? "file-change" : permissions ? "permissions" : "command"
+        onEvent(.item(AgentChatItem(id: id, kind: .approval, text: summary, detail: agentRuntimeJSON(params), isComplete: false,
+                                   workContext: .init(providerTurnID: params["turnId"] as? String, requestKind: kind),
+                                   interaction: interaction)))
+        onEvent(.status(.waiting))
+    }
+
+    /// The decisions Codex offers for a command or file change: `availableDecisions` in its
+    /// order when sent, else the four its schema defines. Unknown ones are left out.
+    static func codexDecisions(method: String, params: [String: Any]) -> ([AgentApprovalDecision], [String: Any]) {
+        let offered: [Any] = params["availableDecisions"] as? [Any] ?? ["accept", "acceptForSession", "decline", "cancel"]
+        let command = method == "item/commandExecution/requestApproval"
+        var decisions: [AgentApprovalDecision] = [], values: [String: Any] = [:]
+        for value in offered {
+            let decision: AgentApprovalDecision?
+            if let token = value as? String {
+                switch token {
+                case "accept": decision = .init(id: token, kind: .allowOnce, label: "Allow once",
+                    consequence: command ? "Runs this command only." : "Applies these changes only.")
+                case "acceptForSession": decision = .init(id: token, kind: .allowSession, label: "Allow for session",
+                    consequence: command ? "Runs it, and matching commands without asking until Codex restarts." : "Applies them, and later changes to the same files without asking until Codex restarts.")
+                case "decline": decision = .init(id: token, kind: .decline, label: "Decline", consequence: "Refuses it; the agent carries on without it.")
+                case "cancel": decision = .init(id: token, kind: .cancel, label: "Decline and stop", consequence: "Refuses it and stops the turn.")
+                default: decision = nil
+                }
+            } else if let object = value as? [String: Any], object.count == 1, let key = object.keys.first {
+                let body = object[key] as? [String: Any] ?? [:]
+                switch key {
+                case "acceptWithExecpolicyAmendment":
+                    let prefix = (body["execpolicy_amendment"] as? [String])?.joined(separator: " ") ?? ""
+                    decision = .init(id: key, kind: .allowAlways, label: prefix.isEmpty ? "Always allow" : "Always allow “\(prefix.prefix(60))”",
+                                     consequence: "Runs it, and adds a rule so commands starting with it run without asking.")
+                case "applyNetworkPolicyAmendment":
+                    let amendment = body["network_policy_amendment"] as? [String: Any] ?? [:]
+                    let host = amendment["host"] as? String ?? "this host"
+                    let allow = amendment["action"] as? String == "allow"
+                    decision = .init(id: key, kind: allow ? .allowAlways : .decline,
+                                     label: (allow ? "Always allow " : "Always block ") + String(host.prefix(60)),
+                                     consequence: allow ? "Adds a rule allowing connections to \(host)." : "Adds a rule refusing connections to \(host).")
+                default: decision = nil
+                }
+            } else { decision = nil }
+            guard let decision, values[decision.id] == nil else { continue }
+            decisions.append(decision)
+            values[decision.id] = value
+        }
+        return (decisions, values)
+    }
+
+    /// A permission grant reaches this turn or the whole session; declining grants nothing.
+    static func permissionDecisions() -> ([AgentApprovalDecision], [String: Any]) {
+        ([.init(id: "turn", kind: .allowOnce, label: "Allow for this turn", consequence: "Grants the permissions until this turn ends."),
+          .init(id: "session", kind: .allowSession, label: "Allow for session", consequence: "Grants the permissions until Codex restarts."),
+          .init(id: "decline", kind: .decline, label: "Decline", consequence: "Grants nothing; the agent carries on without them.")],
+         ["turn": "turn", "session": "session", "decline": "decline"])
+    }
+
+    /// The requested permission profile, a line per path or capability.
+    static func describe(permissions: [String: Any]) -> [String] {
+        var lines: [String] = []
+        let files = permissions["fileSystem"] as? [String: Any] ?? [:]
+        for path in files["read"] as? [String] ?? [] { lines.append("Read " + path) }
+        for path in files["write"] as? [String] ?? [] { lines.append("Write " + path) }
+        for entry in files["entries"] as? [[String: Any]] ?? [] {
+            let access = (entry["access"] as? String).map { $0.prefix(1).uppercased() + $0.dropFirst() } ?? "Access"
+            let path = entry["path"] as? [String: Any] ?? [:]
+            let target = path["path"] as? String ?? path["pattern"] as? String
+                ?? ((path["value"] as? [String: Any])?["kind"] as? String).map { "special: " + $0 } ?? "a path"
+            lines.append(access + " " + target)
+        }
+        if let network = permissions["network"] as? [String: Any], network["enabled"] as? Bool == true { lines.append("Network access") }
+        return lines.isEmpty ? ["No specific access listed"] : lines
+    }
+
+    /// Who asked: a child agent's thread, named by the row that started it.
+    fileprivate func origin(_ params: [String: Any]) -> AgentRequestOrigin? {
+        guard let thread = params["threadId"] as? String, let threadID, thread != threadID else { return nil }
+        return AgentRequestOrigin(threadID: thread, agentID: thread, toolUseID: childThreads[thread])
+    }
+
+    fileprivate func claudeInteraction(id: String, tool: String, origin: AgentRequestOrigin) -> AgentApprovalRequest {
+        var decisions: [AgentApprovalDecision] = [.init(id: "allow", kind: .allowOnce, label: "Allow")]
+        if AgentApprovalScope.canAlwaysAllow(tool) {
+            decisions.append(.init(id: "allowAlways", kind: .allowSession, label: "Always Allow",
+                                   consequence: "Lets \(tool) run without asking for the rest of this conversation."))
+        }
+        decisions.append(.init(id: "deny", kind: .decline, label: "Deny"))
+        return AgentApprovalRequest(method: "can_use_tool", providerRequestID: .string(id), summary: tool, decisions: decisions, origin: origin)
+    }
+
+    /// An MCP server's elicitation: a form of primitive fields becomes the native question
+    /// card, an empty form an approval; anything else is refused explicitly.
+    fileprivate func receiveCodexElicitation(id: String, wireID: Any, params: [String: Any]) throws {
+        let server = params["serverName"] as? String ?? "An MCP server"
+        let message = params["message"] as? String ?? "\(server) asks for input"
+        let parsed: Result<(AgentQuestionnaire?, [String: [String: Any]]), AgentRuntimeError>
+        if params["mode"] as? String == "form", let schema = params["requestedSchema"] as? [String: Any] {
+            parsed = Self.elicitationForm(schema)
+        } else {
+            parsed = .failure(AgentRuntimeError("its \(params["mode"] as? String ?? "unknown") mode isn't supported"))
+        }
+        switch parsed {
+        case .failure(let reason):
+            try write(["id": wireID, "error": ["code": -32602, "message": "AgentKit can't show this MCP request: \(reason.message)."]])
+            onEvent(.item(AgentChatItem(kind: .notice, text: "\(server) asked for input AgentKit can't show (\(reason.message)), so the request was refused.")))
+        case .success(let (form, fields)):
+            var wire = params
+            wire["wireID"] = wireID
+            wire["elicitation"] = true
+            wire["fields"] = fields
+            let decisions: [AgentApprovalDecision] = [
+                .init(id: "accept", kind: form == nil ? .allowOnce : .submit, label: form == nil ? "Allow" : "Submit",
+                      consequence: form == nil ? "Tells \(server) to go ahead." : "Sends your answers to \(server)."),
+                .init(id: "decline", kind: .decline, label: "Decline", consequence: "Tells \(server) you declined."),
+                .init(id: "cancel", kind: .cancel, label: "Cancel", consequence: "Dismisses the request without an answer.")]
+            let interaction = AgentApprovalRequest(method: "mcpServer/elicitation/request", providerRequestID: agentProviderRequestValue(wireID),
+                summary: message, scope: "MCP server " + server, decisions: decisions, origin: origin(params))
+            interactions[id] = interaction
+            if let form {
+                guard questions.count < 12 else { throw AgentRuntimeError("Too many pending question forms.") }
+                questions[id] = (form, wire)
+            } else {
+                approvals[id] = wire
+            }
+            onEvent(.item(AgentChatItem(id: id, kind: .approval, text: message, isComplete: false,
+                                       workContext: .init(providerTurnID: params["turnId"] as? String, requestKind: "elicitation"),
+                                       questionnaire: form, interaction: interaction)))
+            onEvent(.status(.waiting))
+        }
+    }
+
+    /// The form's questions and, per field, how an answer becomes its typed value.
+    static func elicitationForm(_ schema: [String: Any]) -> Result<(AgentQuestionnaire?, [String: [String: Any]]), AgentRuntimeError> {
+        guard schema["type"] as? String == "object", let properties = schema["properties"] as? [String: Any] else {
+            return .failure(AgentRuntimeError("its form isn't an object schema"))
+        }
+        guard !properties.isEmpty else { return .success((nil, [:])) }
+        guard properties.count <= 12 else { return .failure(AgentRuntimeError("it has more than 12 fields")) }
+        let required = Set(schema["required"] as? [String] ?? [])
+        var questions: [AgentQuestionnaire.Question] = [], fields: [String: [String: Any]] = [:]
+        for name in properties.keys.sorted() {
+            guard let field = properties[name] as? [String: Any], let type = field["type"] as? String else {
+                return .failure(AgentRuntimeError("field \(name) has no type"))
+            }
+            var title = field["title"] as? String ?? name
+            if let description = field["description"] as? String, !description.isEmpty { title += " — " + description }
+            var options: [(label: String, value: String)] = []
+            var multiple = false
+            switch type {
+            case "string":
+                if let values = field["enum"] as? [String] {
+                    let names = field["enumNames"] as? [String]
+                    options = values.enumerated().map { (names?.indices.contains($0.offset) == true ? names?[$0.offset] ?? $0.element : $0.element, $0.element) }
+                } else if let choices = field["oneOf"] as? [[String: Any]] {
+                    options = choices.compactMap { choice in (choice["const"] as? String).map { (choice["title"] as? String ?? $0, $0) } }
+                }
+            case "array":
+                multiple = true
+                let items = field["items"] as? [String: Any] ?? [:]
+                if let values = items["enum"] as? [String] { options = values.map { ($0, $0) } }
+                else if let choices = items["anyOf"] as? [[String: Any]] {
+                    options = choices.compactMap { choice in (choice["const"] as? String).map { (choice["title"] as? String ?? $0, $0) } }
+                }
+                guard !options.isEmpty else { return .failure(AgentRuntimeError("list field \(name) offers no choices")) }
+            case "boolean": options = [("Yes", "true"), ("No", "false")]
+            case "number", "integer": break
+            default: return .failure(AgentRuntimeError("field \(name) has unsupported type \(type)"))
+            }
+            guard Set(options.map(\.label)).count == options.count else { return .failure(AgentRuntimeError("field \(name) repeats a choice")) }
+            questions.append(.init(id: name, title: title, options: options.map { .init(label: $0.label) }, multiple: multiple,
+                                   required: required.contains(name)))
+            fields[name] = ["type": type, "choices": Dictionary(options.map { ($0.label, $0.value) }, uniquingKeysWith: { first, _ in first }),
+                            "closed": !options.isEmpty]
+        }
+        let form = AgentQuestionnaire(questions: questions)
+        do { try form.validate() } catch { return .failure(AgentRuntimeError("its form is too large")) }
+        return .success((form, fields))
+    }
+
+    /// Answers a request with one of its offered decisions.
+    func decide(request id: String, decision: String, answers: [String: [String]]?) async throws {
+        try await perform {
+            if self.decided[id] == decision { return }
+            if let pending = self.questions[id] {
+                guard pending.wire["elicitation"] != nil else { throw AgentRuntimeError("Answer this form with its questions.") }
+                try self.decideElicitation(id, pending: pending, decision: decision, answers: answers ?? [:])
+                return
+            }
+            guard let approval = self.approvals[id], let interaction = self.interactions[id],
+                  let chosen = interaction.decision(decision) else {
+                throw AgentRuntimeError(self.decided[id] != nil ? "This request was already answered." : "This request is no longer pending.")
+            }
+            if self.provider == .claude {
+                if decision == "allowAlways", let tool = approval["tool_name"] as? String {
+                    self.alwaysAllowedTools.insert(tool)
+                }
+                try self.resolveClaude(id, approval: approval, allow: chosen.kind.allows)
+            } else {
+                try self.writeCodexDecision(id, approval: approval, decision: decision)
+            }
+            self.finishDecision(id, approval: approval, decision: chosen, automatic: false)
+            if self.provider == .claude, decision == "allowAlways" { try self.allowPendingAutomatically() }
+        }
+    }
+
+    private func resolveClaude(_ id: String, approval: [String: Any], allow: Bool) throws {
+        var response: [String: Any] = ["behavior": allow ? "allow" : "deny"]
+        if allow { response["updatedInput"] = approval["input"] as? [String: Any] ?? [:] }
+        else { response["message"] = "User declined tool execution." }
+        if let toolID = approval["tool_use_id"] { response["toolUseID"] = toolID }
+        try write(["type": "control_response", "response": ["subtype": "success", "request_id": id, "response": response]])
+    }
+
+    fileprivate func decideElicitation(_ id: String, pending: (form: AgentQuestionnaire, wire: [String: Any]), decision: String,
+                                       answers: [String: [String]]) throws {
+        guard ["accept", "decline", "cancel"].contains(decision) else { throw AgentRuntimeError("The MCP server didn't offer that answer.") }
+        var result: [String: Any] = ["action": decision]
+        if decision == "accept" {
+            try pending.form.validate(answers: answers, cancelled: false)
+            let fields = pending.wire["fields"] as? [String: [String: Any]] ?? [:]
+            var content: [String: Any] = [:]
+            for question in pending.form.questions {
+                guard let values = answers[question.id], !values.isEmpty, let field = fields[question.id] else { continue }
+                content[question.id] = try Self.typed(values, field: field, title: question.title)
+            }
+            result["content"] = content
+        } else { result["content"] = NSNull() }
+        try write(["id": pending.wire["wireID"] ?? id, "result": result])
+        questions.removeValue(forKey: id)
+        answeredQuestions.insert(id)
+        var interaction = interactions.removeValue(forKey: id)
+        interaction?.chosen = decision
+        interaction?.outcome = .decided
+        decided[id] = decision
+        let summary = decision != "accept" ? nil : pending.form.questions.map { question in
+            question.title + ": " + (answers[question.id] ?? []).joined(separator: ", ")
+        }.joined(separator: "\n")
+        let label = interaction?.decision(decision)?.label ?? decision
+        onEvent(.item(AgentChatItem(id: id, kind: .approval, text: decision == "accept" ? "Submitted" : label == "Cancel" ? "Cancelled" : "Declined",
+                                   detail: summary, interaction: interaction)))
+        onEvent(.status(approvals.isEmpty && questions.isEmpty ? (busy ? .working : .idle) : .waiting))
+    }
+
+    /// An answer as the field's schema type: a number, a boolean, a choice's value or a list.
+    static func typed(_ values: [String], field: [String: Any], title: String) throws -> Any {
+        let choices = field["choices"] as? [String: String] ?? [:]
+        let closed = field["closed"] as? Bool == true
+        let mapped = try values.map { value -> String in
+            if let choice = choices[value] { return choice }
+            guard !closed else { throw AgentRuntimeError("Choose one of the offered answers for “\(title)”.") }
+            return value
+        }
+        switch field["type"] as? String {
+        case "array": return mapped
+        case "boolean": return mapped.first == "true"
+        case "integer":
+            guard let first = mapped.first, let number = Int(first.trimmingCharacters(in: .whitespaces)) else {
+                throw AgentRuntimeError("“\(title)” needs a whole number.")
+            }
+            return number
+        case "number":
+            guard let first = mapped.first, let number = Double(first.trimmingCharacters(in: .whitespaces)), number.isFinite else {
+                throw AgentRuntimeError("“\(title)” needs a number.")
+            }
+            return number
+        default: return mapped.first ?? ""
+        }
+    }
+
+    fileprivate func writeCodexDecision(_ id: String, approval: [String: Any], decision: String) throws {
+        let wireID = approval["wireID"] ?? id
+        if approval["elicitation"] != nil {
+            guard ["accept", "decline", "cancel"].contains(decision) else { throw AgentRuntimeError("The MCP server didn't offer that answer.") }
+            try write(["id": wireID, "result": ["action": decision, "content": decision == "accept" ? [String: Any]() as Any : NSNull() as Any]])
+            return
+        }
+        let values = approval["decisionValues"] as? [String: Any] ?? [:]
+        guard let value = values[decision] else { throw AgentRuntimeError("Codex didn't offer that decision.") }
+        if approval["method"] as? String == "item/permissions/requestApproval" {
+            let granted: Any = decision == "decline" ? [String: Any]() : approval["permissions"] ?? [String: Any]()
+            try write(["id": wireID, "result": ["permissions": granted, "scope": decision == "session" ? "session" : "turn"]])
+        } else {
+            try write(["id": wireID, "result": ["decision": value]])
+        }
+    }
+
+    /// Records a decision sent, on the card and in its history.
+    fileprivate func finishDecision(_ id: String, approval: [String: Any], decision: AgentApprovalDecision, automatic: Bool) {
+        approvals.removeValue(forKey: id)
+        decided[id] = decision.id
+        if decided.count > 512 { decided = [id: decision.id] }
+        if id.utf8.count <= 1024, completedApprovals.insert(id).inserted {
+            completedApprovalOrder.append(id)
+            if completedApprovalOrder.count > 512 { completedApprovals.remove(completedApprovalOrder.removeFirst()) }
+        }
+        var interaction = interactions.removeValue(forKey: id)
+        interaction?.chosen = decision.id
+        interaction?.outcome = automatic ? .automatic : .decided
+        let text = automatic ? "Automatically approved" : Self.recorded(decision)
+        onEvent(.item(AgentChatItem(id: id, kind: .approval, text: text, interaction: interaction)))
+        onEvent(.status(approvals.isEmpty && questions.isEmpty ? (busy ? .working : .idle) : .waiting))
+    }
+
+    /// The history's words for a decision sent, matching its kind.
+    static func recorded(_ decision: AgentApprovalDecision) -> String {
+        switch decision.kind {
+        case .allowOnce: "Approved"
+        case .allowSession: "Approved for the session"
+        case .allowAlways: "Approved: " + decision.label
+        case .decline: decision.id == "decline" || decision.id == "deny" ? "Declined" : "Declined: " + decision.label
+        case .cancel: "Declined and stopped"
+        case .submit: "Submitted"
+        default: decision.label
+        }
+    }
+
+    /// Ends a pending request nobody answered, keeping its card with how it ended.
+    fileprivate func settle(_ id: String, text: String, outcome: AgentApprovalRequest.Outcome) {
+        var interaction = interactions.removeValue(forKey: id)
+        interaction?.outcome = outcome
+        onEvent(.item(AgentChatItem(id: id, kind: .approval, text: text, interaction: interaction)))
+    }
+
+    /// Follows Codex's child agents: which row started each thread, and when one ends, its
+    /// unanswered requests expire, since nothing is waiting for their answer.
+    fileprivate func observeCodexChildren(method: String?, params: [String: Any]) {
+        if method == "item/started" || method == "item/completed",
+           let item = params["item"] as? [String: Any], item["type"] as? String == "collabAgentToolCall", let row = item["id"] as? String {
+            for thread in item["receiverThreadIds"] as? [String] ?? [] where childThreads[thread] == nil || childThreads.count < 256 {
+                childThreads[thread] = childThreads[thread] ?? row
+            }
+            for (thread, state) in item["agentsStates"] as? [String: [String: Any]] ?? [:]
+                where ["completed", "errored", "shutdown", "interrupted", "notFound"].contains(state["status"] as? String ?? "") {
+                expireRequests(from: thread)
+            }
+        }
+        if method == "thread/closed", let thread = params["threadId"] as? String, thread != threadID { expireRequests(from: thread) }
+    }
+
+    fileprivate func expireRequests(from thread: String) {
+        let expired = interactions.filter { $0.value.origin?.threadID == thread }.map(\.key)
+        guard !expired.isEmpty else { return }
+        for id in expired {
+            approvals.removeValue(forKey: id)
+            questions.removeValue(forKey: id)
+            settle(id, text: "Expired: the agent that asked has ended", outcome: .expired)
+        }
+        onEvent(.status(approvals.isEmpty && questions.isEmpty ? (busy ? .working : .idle) : .waiting))
+    }
+
+    /// Codex's rolling limits: a reached limit is shown with the latest reset it names.
+    fileprivate func observeCodexRateLimits(_ limits: [String: Any]) {
+        let resets = ["primary", "secondary"].compactMap { (limits[$0] as? [String: Any])?["resetsAt"] as? NSNumber }
+            .map { Date(timeIntervalSince1970: $0.doubleValue) }
+        if let latest = resets.max() { codexRateLimitReset = latest }
+        guard let reached = limits["rateLimitReachedType"] as? String else { return }
+        onEvent(.activity(AgentChatActivity(kind: .rateLimited, resumesAt: resets.max(),
+            message: reached == "rate_limit_reached" ? "Usage limit reached" : reached.replacingOccurrences(of: "_", with: " ").capitalized)))
+    }
+
+    /// A turn Codex ends at a usage limit is marked so before it fails.
+    fileprivate func reportCodexUsageLimit(_ error: [String: Any]?) {
+        guard let info = error?["codexErrorInfo"] as? String, info == "usageLimitExceeded" || info == "rateLimitExceeded" else { return }
+        onEvent(.activity(AgentChatActivity(kind: .rateLimited, resumesAt: codexRateLimitReset,
+                                            message: error?["message"] as? String ?? "Usage limit reached")))
     }
 }

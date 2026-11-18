@@ -48,6 +48,9 @@ public final class AgentRuntimeService: @unchecked Sendable {
         set { sessions.activityChanged = newValue }
     }
     public var changed: @Sendable (SessionId, UInt64) -> Void = { _, _ in }
+    /// Told once a conversation was permanently deleted, by a confirmed delete or the
+    /// retention rule, so the host can drop what it keeps for it, such as its draft.
+    public var conversationDeleted: @Sendable (SessionId) -> Void = { _ in }
     /// Rejects new conversations in folders the host is removing or locking.
     public var checkDirectory: @Sendable (String) throws -> Void {
         get { sessions.checkDirectory }
@@ -60,22 +63,26 @@ public final class AgentRuntimeService: @unchecked Sendable {
     /// passes `hostOwnsStore`: a lock it can't make, as in a read-only store, is then
     /// logged and the store served. Pass an existing
     /// conversation store directly to retain its transcripts, queues and resources.
+    /// `retention` says how long closed conversations are kept; see `AgentConversationRetention`.
     public convenience init(storageDirectory: URL, modelCacheDirectory: URL? = nil,
                             home: URL = FileManager.default.homeDirectoryForCurrentUser,
                             executables: [AgentChatProvider: URL] = [:], environment: [String: String] = [:],
                             tools: AgentToolConfiguration? = nil, hostOwnsStore: Bool = false,
+                            retention: AgentConversationRetention = .keepClosed,
                             projectDirectory: @escaping @Sendable (ProjectId) throws -> URL,
                             launchContext: @escaping @Sendable (SessionId, ProjectId) -> AgentLaunchContext = { _, _ in .init() }) throws {
         try self.init(storageDirectory: storageDirectory, modelCacheDirectory: modelCacheDirectory, home: home,
                       executables: executables, environment: environment, tools: tools, hostOwnsStore: hostOwnsStore,
-                      checkpoints: AgentCheckpointStore(), projectDirectory: projectDirectory, launchContext: launchContext)
+                      retention: retention, checkpoints: AgentCheckpointStore(), projectDirectory: projectDirectory, launchContext: launchContext)
     }
 
     /// `checkpoints` takes and removes the store's checkpoints; tests stand in another Git.
     init(storageDirectory: URL, modelCacheDirectory: URL? = nil,
          home: URL = FileManager.default.homeDirectoryForCurrentUser,
          executables: [AgentChatProvider: URL] = [:], environment: [String: String] = [:],
-         tools: AgentToolConfiguration? = nil, hostOwnsStore: Bool = false, checkpoints: AgentCheckpointStore,
+         tools: AgentToolConfiguration? = nil, hostOwnsStore: Bool = false,
+         retention: AgentConversationRetention = .keepClosed, now: @escaping @Sendable () -> Date = { Date() },
+         checkpoints: AgentCheckpointStore,
          projectDirectory: @escaping @Sendable (ProjectId) throws -> URL,
          launchContext: @escaping @Sendable (SessionId, ProjectId) -> AgentLaunchContext = { _, _ in .init() }) throws {
         try tools?.validate()
@@ -114,7 +121,7 @@ public final class AgentRuntimeService: @unchecked Sendable {
             return String(decoding: try encoder.encode(tools.definitions.sorted { $0.name < $1.name }), as: UTF8.self)
         }
         sessions = try AgentSessions(root: storageDirectory, projectDirectory: { try projectDirectory($0).path },
-            checkpoints: checkpoints, factory: { provider, directory, resume, callback in
+            retention: retention, now: now, checkpoints: checkpoints, factory: { provider, directory, resume, callback in
                 AgentRuntime(provider: provider, directory: directory, resumeSession: resume,
                              executable: executables[provider], tools: tools, onEvent: callback)
             })
@@ -131,6 +138,7 @@ public final class AgentRuntimeService: @unchecked Sendable {
         }
         let composer = self.composer
         sessions.composerCatalog = { try await composer.catalog($0) }
+        sessions.conversationDeleted = { [weak self] session in self?.conversationDeleted(session) }
         sessions.changed = { [weak self] session, revision in
             guard let self else { return }
             self.observations.publish(.init(session: session, revision: revision))
@@ -148,8 +156,18 @@ public final class AgentRuntimeService: @unchecked Sendable {
         return try await sessions.handle(request)
     }
     public func conversation(_ request: AgentConversationRequest) async throws -> AgentConversationReply {
-        if applicationToolsOnly, case .revert = request { throw ModelError("Use the application's undo tools to revert an edit.") }
+        if applicationToolsOnly {
+            switch request {
+            case .revert, .rewind(_, _, _, _, true, _): throw ModelError("Use the application's undo tools to revert an edit.")
+            case .retryCheckpoint: throw ServiceError(.unsupported, "Checkpoints are unavailable for application tools.")
+            default: break
+            }
+        }
         return try await sessions.conversation(request)
+    }
+    /// Lists, archives, reopens and permanently deletes kept conversations.
+    public func library(_ request: AgentConversationLibraryRequest) async throws -> AgentConversationLibraryReply {
+        try await sessions.library(request)
     }
     public func attachment(_ request: AgentAttachmentRequest) async throws -> AgentAttachmentReply { try await sessions.attachment(request) }
     public func checkpoint(_ request: AgentCheckpointRequest) async throws -> AgentCheckpointReply {

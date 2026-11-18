@@ -20,9 +20,9 @@ enum AgentStreamingCompletion {
         if endsLine { lines.removeLast() }
         guard let last = lines.last else { return source }
         let trimmed = last.trimmingCharacters(in: .whitespaces)
-        // Inside an open code fence, nothing is structure.
-        let fences = lines.dropLast().filter { $0.trimmingCharacters(in: .whitespaces).hasPrefix("```") }.count
-        guard fences % 2 == 0 else { return source }
+        // Inside an open code fence, nothing is structure. The parser's own fence rules
+        // decide: a tilde fence ignores backticks, a longer fence ignores shorter runs.
+        guard AgentMarkdownFence.open(after: lines.dropLast()) == nil else { return source }
         if isTableLine(trimmed) {
             var start = lines.count - 1
             while start > 0, isTableLine(lines[start - 1].trimmingCharacters(in: .whitespaces)) { start -= 1 }

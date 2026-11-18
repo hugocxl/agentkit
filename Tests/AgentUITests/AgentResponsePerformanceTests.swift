@@ -171,4 +171,191 @@ final class AgentResponsePerformanceTests: XCTestCase {
         AgentTextScale.set(AgentTextScale.steps.last ?? 1)
         XCTAssertFalse(AgentTextScale.step(larger: true), "The scale stops at its largest step")
     }
+
+    /// T7's workload: a long answer of headings, formatted paragraphs with reference links,
+    /// lists, code and tables, whose reference definitions arrive last, streamed in 120
+    /// even chunks. Each update is timed as a full parse (the parser before checkpoints),
+    /// as the resumed parse the streaming view runs, and as the view's own setContent,
+    /// layout and drawing of the visible end. The figures print with the workload.
+    func testStreamedResponseParsingCostsLessThanLayoutAndDrawing() throws {
+        _ = NSApplication.shared
+        let theme = AgentTheme(systemIsDark: true)
+        let source = Self.longStreamedResponse()
+        let chunks = 120
+        let response = AgentResponseView(frame: .zero)
+        response.isStreaming = true
+        var full: [Double] = [], resumed: [Double] = [], set: [Double] = [], layout: [Double] = [], draw: [Double] = []
+        var checkpoint: AgentResponseParser.Checkpoint?
+        let clock = ContinuousClock()
+        func ms(_ duration: Duration) -> Double {
+            Double(duration.components.seconds) * 1000 + Double(duration.components.attoseconds) / 1e15
+        }
+        func parse(_ prefix: String, resuming: Bool) {
+            let held = AgentStreamingCompletion.holdingBackAmbiguousTail(prefix)
+            let parsed = resuming ? AgentResponseParser.parse(held, resuming: &checkpoint) : AgentResponseParser.parse(held)
+            let blocks = AgentStreamingCompletion.completingLastBlock(parsed)
+            _ = AgentMarkdownReferences.collect(blocks, parseRawHTML: true)
+            _ = AgentMarkdownFootnotes.prepare(blocks, parseRawHTML: true)
+        }
+        for chunk in 1...chunks {
+            let end = source.index(source.startIndex, offsetBy: source.count * chunk / chunks)
+            let prefix = String(source[..<end])
+            full.append(ms(clock.measure { parse(prefix, resuming: false) }))
+            resumed.append(ms(clock.measure { parse(prefix, resuming: true) }))
+            set.append(ms(clock.measure { response.setContent(prefix, theme: theme) }))
+            var height: CGFloat = 0
+            layout.append(ms(clock.measure {
+                height = response.height(for: 640)
+                response.frame = NSRect(x: 0, y: 0, width: 640, height: height)
+                response.layoutSubtreeIfNeeded()
+            }))
+            let visible = NSRect(x: 0, y: max(0, height - 900), width: 640, height: min(900, height))
+            draw.append(ms(clock.measure {
+                guard let bitmap = response.bitmapImageRepForCachingDisplay(in: visible) else { return }
+                response.cacheDisplay(in: visible, to: bitmap)
+            }))
+        }
+        func median(_ values: [Double]) -> Double { values.suffix(30).sorted()[15] }
+        func summary(_ values: [Double]) -> String {
+            String(format: "total %.0f ms, last-30 median %.2f ms, max %.2f ms", values.reduce(0, +), median(values), values.max() ?? 0)
+        }
+        print("T7 workload: \(source.utf8.count) bytes, \(source.split(separator: "\n", omittingEmptySubsequences: false).count) lines, \(chunks) streamed updates")
+        print("T7 full parse:    " + summary(full))
+        print("T7 resumed parse: " + summary(resumed))
+        print("T7 setContent:    " + summary(set))
+        print("T7 layout:        " + summary(layout))
+        print("T7 draw:          " + summary(draw))
+        XCTAssertLessThan(median(resumed), median(full) / 2, "Resuming must skip the finished blocks")
+        XCTAssertLessThan(median(resumed), median(layout) + median(draw), "Parsing outweighs rendering the update")
+        // The streamed result matches parsing the finished answer whole.
+        response.isStreaming = false
+        response.setContent(source, theme: theme)
+        let fresh = AgentResponseView(frame: .zero)
+        fresh.setContent(source, theme: theme)
+        for view in [response, fresh] {
+            view.frame = NSRect(x: 0, y: 0, width: 640, height: view.height(for: 640))
+            view.layoutSubtreeIfNeeded()
+        }
+        XCTAssertEqual(response.textViews.count, fresh.textViews.count)
+        let tables = Set(response.sectionViews.compactMap { ($0 as? AgentResponseTable)?.text }.map(ObjectIdentifier.init))
+        for (streamed, whole) in zip(response.textViews, fresh.textViews) {
+            // Table cells carry paragraph styles from their measured column widths.
+            if tables.contains(ObjectIdentifier(streamed)) {
+                XCTAssertEqual(streamed.string, whole.string)
+            } else {
+                XCTAssertTrue(streamed.attributedString().isEqual(to: whole.attributedString()),
+                              "Streamed text differs: \(streamed.string.prefix(80))")
+            }
+        }
+    }
+
+    /// The streaming parser resumes from its last block boundary. Every streamed prefix
+    /// must parse to exactly the blocks a full parse gives, including reference definitions
+    /// that arrive after the links using them, lists that turn loose, fences, `<details>`,
+    /// unclosed display math and HTML that a later line could still close.
+    func testResumedParsingMatchesFullParsingForEveryStreamedPrefix() throws {
+        let tricky = """
+        Intro with a [late][r1] link and [another][R2].
+
+        - one
+        - two
+
+        - three, after a blank, makes the list loose
+
+        Paragraph between lists.
+
+        $$
+        x = 1
+
+        Text after an unclosed math opener.
+
+        <details>
+        <summary>More</summary>
+
+        Inside details
+
+        </details>
+
+        | a | b |
+        | - | - |
+        | 1 | 2 |
+
+        Setext
+        ===
+
+        1. first
+
+           continued, indented
+
+        2. second
+
+        <pre>
+        code
+
+        </pre>
+
+        ~~~
+        tilde
+
+        ```
+        ~~~
+
+        [^1]: A footnote
+            continued
+
+            more
+
+        Back to text.[^1]
+
+        [r1]: https://example.com/late
+        [R2]: <https://example.com/second> "Title"
+
+        """
+        for rawHTML in [true, false] {
+            var checkpoint: AgentResponseParser.Checkpoint?
+            var prefix = ""
+            for character in tricky {
+                prefix.append(character)
+                let held = AgentStreamingCompletion.holdingBackAmbiguousTail(prefix)
+                let resumed = AgentResponseParser.parse(held, parseRawHTML: rawHTML, resuming: &checkpoint)
+                let full = AgentResponseParser.parse(held, parseRawHTML: rawHTML)
+                guard resumed == full else {
+                    return XCTFail("Resumed parse differs at \(prefix.count) characters (raw HTML \(rawHTML)): \(held.suffix(60).debugDescription)")
+                }
+            }
+            XCTAssertEqual(AgentMarkdownReferences.collect(AgentResponseParser.parse(tricky, parseRawHTML: rawHTML, resuming: &checkpoint), parseRawHTML: rawHTML),
+                           AgentMarkdownReferences.collect(AgentResponseParser.parse(tricky, parseRawHTML: rawHTML), parseRawHTML: rawHTML))
+        }
+        let long = Self.longStreamedResponse()
+        var checkpoint: AgentResponseParser.Checkpoint?
+        var offset = 0
+        let characters = Array(long)
+        while offset < characters.count {
+            offset = min(characters.count, offset + 97)
+            let held = AgentStreamingCompletion.holdingBackAmbiguousTail(String(characters[..<offset]))
+            XCTAssertEqual(AgentResponseParser.parse(held, resuming: &checkpoint), AgentResponseParser.parse(held))
+        }
+        XCTAssertGreaterThan(try XCTUnwrap(checkpoint).reusedLines, 1400, "The finished blocks are reused")
+        // An edit before the boundary, not an append, parses everything again.
+        let edited = "Changed start.\n\n" + long
+        XCTAssertEqual(AgentResponseParser.parse(edited, resuming: &checkpoint), AgentResponseParser.parse(edited))
+    }
+
+    /// About 64 KB of mixed Markdown whose link reference definitions come at the end.
+    static func longStreamedResponse() -> String {
+        var parts: [String] = []
+        for section in 1...120 {
+            parts.append("## Section \(section)")
+            parts.append("This paragraph explains **step \(section)** with _emphasis_, `inline code`, and a [reference link][ref\(section % 12)] that resolves only once the definitions at the end arrive.")
+            parts.append((1...4).map { "- Item \($0) of section \(section), with a `token` and a [link](https://example.com/\(section)/\($0))" }.joined(separator: "\n"))
+            if section % 5 == 0 {
+                parts.append("```swift\n" + (1...8).map { "let value\($0) = compute(\(section), \($0)) // line \($0)" }.joined(separator: "\n") + "\n```")
+            }
+            if section % 7 == 0 {
+                parts.append("| Name | Value | Note |\n| --- | ---: | --- |\n" + (1...5).map { "| row \($0) | \($0 * section) | **ok** |" }.joined(separator: "\n"))
+            }
+        }
+        parts.append((0..<12).map { "[ref\($0)]: https://example.com/reference/\($0)" }.joined(separator: "\n"))
+        return parts.joined(separator: "\n\n")
+    }
 }

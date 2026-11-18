@@ -42,7 +42,9 @@ public struct AgentConnection: Sendable {
     public var capabilities: AgentCapabilities = .all
     /// The local working folder, when the backend runs on this computer.
     public var workingDirectory: URL?
-    /// Optional per-conversation draft storage owned by the embedding application.
+    /// Optional per-conversation draft storage owned by the embedding application. The
+    /// conversation's stash of set-aside drafts is kept beside it, in a folder with the
+    /// same name and the `stash` extension.
     public var draftURL: URL?
     /// What to say when the backend predates a service.
     public var backendAdvice = AgentBackendAdvice()
@@ -56,6 +58,8 @@ public struct AgentConnection: Sendable {
     public var history: (@Sendable () async throws -> AgentHistoryReply)?
     public var importHistory: (@Sendable (AgentHistoryEntry, SessionId) async throws -> AgentChatSnapshot)?
     public var composerContext: (@Sendable (AgentChatProvider) async throws -> AgentComposerContextReply)?
+    /// Kept conversations: archive, reopen and confirmed permanent deletion.
+    public var library: (@Sendable (AgentConversationLibraryRequest) async throws -> AgentConversationLibraryReply)?
 
     /// Creates a connection. Supply optional services only when the backend supports them.
     public init(session: SessionId = SessionId(), project: ProjectId, provider: AgentChatProvider,

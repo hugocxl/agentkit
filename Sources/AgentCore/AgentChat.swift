@@ -90,12 +90,17 @@ public struct AgentChatItem: Codable, Hashable, Sendable, Identifiable {
     public var createdAt: Date?
     public var updatedAt: Date?
     public var workContext: AgentChatWorkContext?
+    /// An approval's provider request: its offered decisions, origin and outcome. Absent on
+    /// approvals from backends that predate it, which answer with plain Allow and Deny.
+    public var interaction: AgentApprovalRequest?
 
     public init(id: String = UUID().uuidString, kind: Kind, text: String,
                 detail: String? = nil, isComplete: Bool = true, tool: AgentToolActivity? = nil,
                 attachments: [AgentChatAttachmentDescriptor]? = nil, createdAt: Date? = nil,
-                updatedAt: Date? = nil, workContext: AgentChatWorkContext? = nil, questionnaire: AgentQuestionnaire? = nil) {
+                updatedAt: Date? = nil, workContext: AgentChatWorkContext? = nil, questionnaire: AgentQuestionnaire? = nil,
+                interaction: AgentApprovalRequest? = nil) {
         self.questionnaire = questionnaire
+        self.interaction = interaction
         self.id = id
         self.kind = kind
         self.text = text
@@ -244,11 +249,24 @@ public enum AgentChatRequest: Codable, Hashable, Sendable {
     case clear(session: SessionId, archive: SessionId, expectedRevision: UInt64)
     case submit(session: SessionId, prompt: AgentPrompt)
     case editQueued(session: SessionId, id: String, text: String, expectedRevision: UInt64, settings: AgentQueuedSettings? = nil)
+    /// Replaces a queued prompt's text, settings and attachments together, or changes nothing,
+    /// when its revision still matches. A server that predates it answers `unsupported`.
+    case updateQueued(session: SessionId, id: String, edit: AgentQueuedEdit, expectedRevision: UInt64)
     case removeQueued(session: SessionId, id: String, expectedRevision: UInt64)
     case deliverQueued(session: SessionId, id: String, expectedRevision: UInt64)
     case moveQueued(session: SessionId, id: String, beforeID: String, expectedRevision: UInt64)
     case resumeQueue(session: SessionId)
     case answer(session: SessionId, request: String, answers: [String: [String]], cancelled: Bool)
+    /// Answers a request carrying `AgentApprovalRequest` with one of its offered decisions,
+    /// by the provider's own token, and a form's answers when the decision submits one.
+    /// Idempotent for the decision already sent; a backend that predates it replies unsupported.
+    case decide(session: SessionId, request: String, decision: String, answers: [String: [String]]? = nil)
+    /// Sends the prompt of a turn a usage limit stopped again, under the identity recorded
+    /// on the turn, so a manual and a scheduled retry deliver it at most once.
+    case retryTurn(session: SessionId, turn: String)
+    /// Persists, or with `enabled` false cancels, the owning backend's retry of a turn a
+    /// usage limit stopped, at the limit's known reset time.
+    case scheduleRetry(session: SessionId, turn: String, enabled: Bool)
 
     /// Nil model/effort explicitly restore provider defaults; nil provider keeps the current provider.
     case send(session: SessionId, text: String, model: String?, reasoningEffort: AgentReasoningEffort? = nil,

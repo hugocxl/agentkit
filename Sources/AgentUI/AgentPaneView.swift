@@ -22,6 +22,10 @@ final class AgentPaneView: ThemedView {
     var citationThreadId: String?
     let send = AgentRoundButton(kind: .send)
     let stop = AgentRoundButton(kind: .stop)
+    /// Hands the draft to the running turn rather than queueing it, where the backend can steer.
+    let sendNow = PillButton("Send Now", style: .plain)
+    /// Whether Send Now applies: the agent works and its backend can take a follow-up.
+    var sendNowAvailable = false { didSet { if sendNowAvailable != oldValue { updatePrimaryAction(); needsLayout = true } } }
     let contextIndicator = AgentContextIndicator(frame: .zero)
     /// Dictation shares the send and stop slot: it shows while the draft is empty and idle.
     let microphone = AgentRoundButton(kind: .dictate)
@@ -49,6 +53,14 @@ final class AgentPaneView: ThemedView {
     var findBar: AgentConversationFindBar?
     /// Find's matches while the bar is open; nil when closed, so the transcript does no Find work.
     var findModel: AgentConversationFindModel?
+    /// Find's search of archived items not loaded yet.
+    var archiveFind = AgentArchiveFindState.idle
+    /// The query after each change, empty once Find closes, for the archive search.
+    var onFindQuery: ((String) -> Void)?
+    /// Loads an archived match's item and selects its first or last occurrence.
+    var onRevealArchived: ((AgentArchiveFindHit, Bool) -> Void)?
+    /// Stops the archive search where it is.
+    var onStopArchiveSearch: (() -> Void)?
     let findHighlighter = AgentConversationFindHighlighter()
     /// Off-screen renders of unmounted messages, so Find counts what the transcript shows.
     let findTexts = AgentConversationFindTextCache()
@@ -128,6 +140,8 @@ final class AgentPaneView: ThemedView {
     var onForkPrompt: ((AgentChatItem) -> Void)? { didSet { transcript.onForkPrompt = onForkPrompt } }
     /// Reverts a turn's changed files, all or some.
     var onRevert: ((AgentTurnCheckpoint, [String]?) -> Void)? { didSet { transcript.onRevert = onRevert } }
+    /// Records a turn's file changes again after recording them failed.
+    var onRetryCheckpoint: ((String) -> Void)? { didSet { transcript.onRetryCheckpoint = onRetryCheckpoint } }
     var onShowFullOutput: ((String) -> Void)? { didSet { transcript.onShowFullOutput = onShowFullOutput } }
     /// Copies the whole conversation as Markdown.
     var onCopyConversation: (() -> Void)? { didSet { transcript.conversationMenu = { [weak self] in self?.conversationMenuItems() ?? [] } } }
@@ -135,6 +149,8 @@ final class AgentPaneView: ThemedView {
     let newConversation = PillButton("New Conversation", style: .plain)
     /// Submits the failed or stopped turn's prompt again as a new prompt.
     let retryTurn = PillButton("Retry", style: .plain)
+    /// Asks the owning backend to send a usage-limited turn's prompt again at the reset time, or cancels that.
+    let resumeAtReset = PillButton("Resume at Reset", style: .plain)
     static let readableWidth: CGFloat = 896
 
     override init(frame frameRect: NSRect) {
@@ -205,12 +221,16 @@ final class AgentPaneView: ThemedView {
         // The pop-ups keep the menus and selection; the combined picker presents them.
         model.isHidden = true
         effort.isHidden = true
-        for child in [composerScroll, attachmentStrip, attach, plan, model, effort, modelPicker, contextIndicator, microphone, send, stop] {
+        for child in [composerScroll, attachmentStrip, attach, plan, model, effort, modelPicker, contextIndicator, microphone, send, stop, sendNow] {
             composerCard.addSubview(child)
             // This surface uses measured frames: controls must not bring their own size constraints.
             child.translatesAutoresizingMaskIntoConstraints = true
         }
         stop.isHidden = true
+        sendNow.isHidden = true
+        sendNow.font = AppFont.small
+        sendNow.toolTip = "Send this message into the current response instead of queueing it"
+        sendNow.setAccessibilityLabel("Send now")
         model.toolTip = "Choose the provider and model for the next message"
         effort.toolTip = "Choose the reasoning effort for the next message"
         activityLabel.setAccessibilityLabel("Agent activity")
@@ -225,7 +245,7 @@ final class AgentPaneView: ThemedView {
         feedback.isSelectable = true
         feedback.maximumNumberOfLines = 2
         feedback.lineBreakMode = .byTruncatingTail
-        for child in [feedback, retry, retryTurn, newConversation, dismissNotice] as [NSView] {
+        for child in [feedback, retry, retryTurn, resumeAtReset, newConversation, dismissNotice] as [NSView] {
             notice.addSubview(child)
             child.translatesAutoresizingMaskIntoConstraints = true
         }
@@ -261,6 +281,7 @@ final class AgentPaneView: ThemedView {
         }
         retry.isHidden = true
         retryTurn.isHidden = true
+        resumeAtReset.isHidden = true
         newConversation.isHidden = true
         dismissNotice.isHidden = true
         suggestions.isHidden = true
@@ -333,8 +354,9 @@ final class AgentPaneView: ThemedView {
             // One action at a time: Refresh for errors, else Retry for a failed turn.
             let action = !retry.isHidden ? retry : !retryTurn.isHidden ? retryTurn : newConversation
             let retryWidth = action.isHidden ? 0 : ceil(action.fittingSize.width)
+            let scheduleWidth = resumeAtReset.isHidden || action !== retryTurn ? 0 : ceil(resumeAtReset.fittingSize.width)
             let dismissWidth: CGFloat = dismissNotice.isHidden ? 0 : 24
-            let trailing = (retryWidth > 0 ? retryWidth + 8 : 0) + (dismissWidth > 0 ? dismissWidth + 4 : 0)
+            let trailing = (retryWidth > 0 ? retryWidth + 8 : 0) + (scheduleWidth > 0 ? scheduleWidth + 4 : 0) + (dismissWidth > 0 ? dismissWidth + 4 : 0)
             let textWidth = max(1, width - 28 - trailing)
             let textHeight = min(32, ceil((noticeText as NSString).boundingRect(
                 with: NSSize(width: textWidth, height: .greatestFiniteMagnitude),
@@ -346,6 +368,7 @@ final class AgentPaneView: ThemedView {
             dismissNotice.frame = NSRect(x: width - 8 - dismissWidth, y: floor((height - 24) / 2), width: dismissWidth, height: 24)
             let retryRight = width - 8 - (dismissWidth > 0 ? dismissWidth + 4 : 0)
             action.frame = NSRect(x: retryRight - retryWidth, y: floor((height - 24) / 2), width: retryWidth, height: 24)
+            resumeAtReset.frame = NSRect(x: action.frame.minX - 4 - scheduleWidth, y: action.frame.minY, width: scheduleWidth, height: 24)
         }
         let activityHeight: CGFloat = activity.isHidden ? 0 : 26
         let panelBudget = max(0, top - activityHeight - 64)
@@ -409,6 +432,7 @@ final class AgentPaneView: ThemedView {
         let showStop = busy && !dictating
         send.isHidden = !showSend
         stop.isHidden = !showStop
+        sendNow.isHidden = !(showSend && sendNowAvailable)
         microphone.isHidden = showSend || showStop
     }
 
@@ -422,6 +446,12 @@ final class AgentPaneView: ThemedView {
         if !send.isHidden && !stop.isHidden {
             right -= size
             stop.frame = NSRect(x: right, y: top, width: size, height: size)
+            right -= gap
+        }
+        if !sendNow.isHidden {
+            let pill = ceil(sendNow.fittingSize.width)
+            right -= pill
+            sendNow.frame = NSRect(x: right, y: top + 2, width: pill, height: 28)
             right -= gap
         }
         // Usage stays out of the way until the context window is half full.
@@ -776,6 +806,8 @@ final class AgentPaneView: ThemedView {
         microphone.chatTheme = theme
         retry.setTitleColor(theme.fg)
         retryTurn.setTitleColor(theme.fg)
+        resumeAtReset.setTitleColor(theme.fg)
+        sendNow.setTitleColor(theme.fg)
         newConversation.setTitleColor(theme.fg)
         dismissNotice.chatTheme = theme
         notice.theme = theme

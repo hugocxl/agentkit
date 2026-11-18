@@ -27,7 +27,9 @@ command catalog with available descriptions and argument hints.
 | `/export` | Save the same complete transcript to a Markdown file. |
 | `/attach [draft text]` | Open the attachment picker; preserve the remaining draft if cancelled. |
 | `/stop` | Stop active work or pause queued work; explain when nothing is running. |
-| `/clear-draft` | Remove draft text and attachments. |
+| `/clear-draft` | Remove draft text and attachments, and drop attachments still being prepared for that draft. Unlike `/clear`, the conversation is untouched. |
+| `/stash [draft text]` | Set the draft aside in the conversation's stash, with its quotations, attachments, review comments and settings. |
+| `/stashes` | Choose a stashed draft to restore. An occupied composer asks to merge or replace; replacing stashes the current draft first. Nothing is sent. |
 | `/outline` | Search loaded prompts, with an explanation when older messages remain unloaded. |
 | `/previous-prompt`, `/next-prompt` | Navigate prompts; explain boundaries and load older history when needed. |
 

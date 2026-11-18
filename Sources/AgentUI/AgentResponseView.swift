@@ -100,6 +100,9 @@ final class AgentResponseView: NSView, NSTextViewDelegate {
     var sectionUpdateCount: Int { retiredUpdateCount + sections.reduce(0) { $0 + $1.updateCount } }
     var sectionMeasurementCount: Int { retiredMeasurementCount + sections.reduce(0) { $0 + $1.measurementCount } }
 
+    /// Where the streaming source's next parse resumes.
+    private(set) var parseCheckpoint: AgentResponseParser.Checkpoint?
+
     func setContent(_ source: String, theme: AgentTheme) {
         let themeChanged = renderedTheme !== theme || palette != theme.palette || scheme != theme.scheme || scale != AgentTextScale.factor
         guard self.source != source || themeChanged || renderedCardHosts != cardHosts else { return }
@@ -110,7 +113,14 @@ final class AgentResponseView: NSView, NSTextViewDelegate {
         palette = theme.palette
         scheme = theme.scheme
         let parsedSource = isStreaming ? AgentStreamingCompletion.holdingBackAmbiguousTail(source) : source
-        var blocks = AgentResponseParser.parse(parsedSource, parseRawHTML: parseRawHTML)
+        var blocks: [AgentMarkdown.Block]
+        if isStreaming {
+            // A streaming answer parses from its last finished block boundary on.
+            blocks = AgentResponseParser.parse(parsedSource, parseRawHTML: parseRawHTML, resuming: &parseCheckpoint)
+        } else {
+            parseCheckpoint = nil
+            blocks = AgentResponseParser.parse(parsedSource, parseRawHTML: parseRawHTML)
+        }
         completedStreamingTail = false
         if isStreaming {
             let completed = AgentStreamingCompletion.completingLastBlock(blocks)

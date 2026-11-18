@@ -99,3 +99,42 @@ public struct AgentQueuedSettings: Codable, Hashable, Sendable {
         self.model = model; self.effort = effort; self.planMode = planMode
     }
 }
+
+/// The whole new content of a queued prompt. Attachments are listed in their new order:
+/// kept ones by the ID the queue shows, new ones with their bytes.
+public struct AgentQueuedEdit: Codable, Hashable, Sendable {
+    public enum Attachment: Codable, Hashable, Sendable {
+        /// One of the prompt's current attachments.
+        case keep(id: String)
+        /// A new attachment, sent with its bytes.
+        case add(AgentChatAttachment)
+    }
+    public var text: String
+    /// Nil keeps the prompt's model, reasoning effort and plan mode.
+    public var settings: AgentQueuedSettings?
+    public var attachments: [Attachment]
+    public init(text: String, settings: AgentQueuedSettings? = nil, attachments: [Attachment]) {
+        self.text = text; self.settings = settings; self.attachments = attachments
+    }
+
+    /// Checks what can be checked without the queued prompt: sizes, identities and that
+    /// the prompt keeps text or an attachment.
+    public func validate() throws(ErrorCode) {
+        guard attachments.count <= AgentChatAttachment.maxCount, text.utf8.count <= 64 * 1024 else { throw .badRequest }
+        let ids = attachments.map { attachment -> String in
+            switch attachment {
+            case .keep(let id): return id
+            case .add(let added): return added.id
+            }
+        }
+        guard Set(ids).count == ids.count, ids.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 128 }) else { throw .badRequest }
+        let added = attachments.compactMap { attachment -> AgentChatAttachment? in
+            if case .add(let added) = attachment { return added }
+            return nil
+        }
+        try AgentChatAttachment.validate(added)
+        if attachments.isEmpty { try AgentValidation.message(text, limit: 64 * 1024) }
+        if let model = settings?.model { try AgentValidation.message(model, limit: 256) }
+        try settings?.effort?.validate()
+    }
+}

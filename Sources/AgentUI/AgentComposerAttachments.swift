@@ -10,14 +10,32 @@ struct AgentDraftAttachment: Identifiable, @unchecked Sendable {
     let mimeType: String
     let data: Data
     let thumbnail: NSImage?
+    /// The size shown for it: its bytes, or a queued prompt's attachment the server holds.
+    let byteCount: Int
 
-    init(id: String = UUID().uuidString, name: String, mimeType: String, data: Data, thumbnail: NSImage? = nil) {
+    init(id: String = UUID().uuidString, name: String, mimeType: String, data: Data, thumbnail: NSImage? = nil, byteCount: Int? = nil) {
         self.id = id
         self.name = name
         self.mimeType = mimeType
         self.data = data
         self.thumbnail = thumbnail
+        self.byteCount = byteCount ?? data.count
     }
+}
+
+/// What an import found: attachments ready for the draft, and images too large for the
+/// transport budget that an optimized copy might fit.
+struct AgentAttachmentIntake: Sendable {
+    var attachments: [AgentDraftAttachment] = []
+    var oversizedImages: [AgentOversizedImage] = []
+}
+
+/// An image over the attachment budget, kept by reference until the user chooses to optimize it.
+struct AgentOversizedImage: Sendable, Equatable {
+    enum Source: Sendable, Equatable { case file(URL), data(Data) }
+    var name: String
+    var source: Source
+    var byteCount: Int
 }
 
 enum AgentAttachmentImportError: LocalizedError {
@@ -41,10 +59,18 @@ enum AgentAttachmentImporter {
 
     /// Atomic import, bounded even if a file grows after its metadata was checked.
     static func load(urls: [URL], maximumFileSize: Int = maximumFileSize) async throws -> [AgentDraftAttachment] {
+        try await intake(urls: urls, maximumFileSize: maximumFileSize, deferOversizedImages: false).attachments
+    }
+
+    /// Like `load`, but an image whose file is over the size limit is set aside, unread,
+    /// for the user to choose an optimized copy instead of failing the whole import.
+    static func intake(urls: [URL], maximumFileSize: Int = maximumFileSize,
+                       deferOversizedImages: Bool = true) async throws -> AgentAttachmentIntake {
         guard urls.count <= maximumFileCount else { throw AgentAttachmentImportError.tooManyFiles }
         guard maximumFileSize > 0 else { throw AgentAttachmentImportError.batchTooLarge }
         let worker = Task.detached(priority: .userInitiated) {
             var attachments: [AgentDraftAttachment] = []
+            var oversized: [AgentOversizedImage] = []
             var total = 0
             for url in urls {
                 try Task.checkCancellation()
@@ -55,6 +81,11 @@ enum AgentAttachmentImporter {
                 let info = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey, .contentTypeKey])
                 guard info.isRegularFile == true, info.isSymbolicLink != true else {
                     throw AgentAttachmentImportError.notRegularFile(name)
+                }
+                let declaredType = info.contentType ?? UTType(filenameExtension: url.pathExtension)
+                if (info.fileSize ?? 0) > maximumFileSize, deferOversizedImages, declaredType?.conforms(to: .image) == true {
+                    oversized.append(AgentOversizedImage(name: name, source: .file(url), byteCount: info.fileSize ?? 0))
+                    continue
                 }
                 guard (info.fileSize ?? 0) <= maximumFileSize else { throw AgentAttachmentImportError.tooLarge(name) }
                 let handle = try FileHandle(forReadingFrom: url)
@@ -73,7 +104,7 @@ enum AgentAttachmentImporter {
                 guard total <= maximumBatchSize else { throw AgentAttachmentImportError.batchTooLarge }
                 attachments.append(attachment)
             }
-            return attachments
+            return AgentAttachmentIntake(attachments: attachments, oversizedImages: oversized)
         }
         return try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { worker.cancel() })
     }
@@ -217,6 +248,8 @@ enum AgentAttachmentPasteboard {
 final class AgentAttachmentStrip: NSView {
     var onRemove: ((String) -> Void)?
     var onPreview: ((String) -> Void)? { didSet { rebuild() } }
+    /// Offers Replace… on each attachment, as a queued prompt's editor does.
+    var onReplace: ((String) -> Void)? { didSet { rebuild() } }
     private(set) var hasAttachments = false
     private var chatTheme: AgentTheme = .shared
     private let scroll = NSScrollView()
@@ -267,6 +300,7 @@ final class AgentAttachmentStrip: NSView {
             chip.chatTheme = chatTheme
             chip.onRemove = { [weak self] in self?.onRemove?(attachment.id) }
             if onPreview != nil { chip.onPreview = { [weak self] in self?.onPreview?(attachment.id) } }
+            if onReplace != nil { chip.onReplace = { [weak self] in self?.onReplace?(attachment.id) } }
             content.addSubview(chip)
             return chip
         }
@@ -290,7 +324,9 @@ final class AgentAttachmentStrip: NSView {
 private final class AgentAttachmentChip: NSView {
     var onRemove: (() -> Void)?
     var onPreview: (() -> Void)? { didSet { preview.isEnabled = onPreview != nil } }
+    var onReplace: (() -> Void)? { didSet { updateMenu() } }
     var chatTheme: AgentTheme = .shared { didSet { applyTheme() } }
+    private let attachmentName: String
     private let image = NSImageView()
     private let name = NSTextField(labelWithString: "")
     private let size = NSTextField(labelWithString: "")
@@ -299,6 +335,7 @@ private final class AgentAttachmentChip: NSView {
     override var isFlipped: Bool { true }
 
     init(attachment: AgentDraftAttachment) {
+        attachmentName = attachment.name
         super.init(frame: .zero)
         wantsLayer = true
         layer?.cornerRadius = 8
@@ -308,7 +345,7 @@ private final class AgentAttachmentChip: NSView {
         name.stringValue = attachment.name
         name.font = AppFont.small
         name.lineBreakMode = .byTruncatingMiddle
-        size.stringValue = ByteCountFormatter.string(fromByteCount: Int64(attachment.data.count), countStyle: .file)
+        size.stringValue = ByteCountFormatter.string(fromByteCount: Int64(attachment.byteCount), countStyle: .file)
         size.font = AppFont.system(10)
         remove.image = AppIcon.close.image(size: 12, scale: AppIcon.inlineScale)
         remove.isBordered = false
@@ -349,4 +386,17 @@ private final class AgentAttachmentChip: NSView {
     }
     @objc private func removePressed() { onRemove?() }
     @objc private func previewPressed() { onPreview?() }
+    @objc private func replacePressed() { onReplace?() }
+
+    /// Replace… and Remove, from the context menu and as VoiceOver actions.
+    private func updateMenu() {
+        guard onReplace != nil else { menu = nil; setAccessibilityCustomActions(nil); return }
+        let menu = NSMenu()
+        menu.addItem(withTitle: "Replace \(attachmentName)…", action: #selector(replacePressed), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Remove \(attachmentName)", action: #selector(removePressed), keyEquivalent: "").target = self
+        self.menu = menu
+        setAccessibilityCustomActions([
+            NSAccessibilityCustomAction(name: "Replace \(attachmentName)") { [weak self] in self?.onReplace?(); return true },
+        ])
+    }
 }

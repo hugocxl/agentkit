@@ -2,7 +2,7 @@ import AgentCore
 import AppKit
 
 struct AgentSavedDraft: Codable, Sendable {
-    struct Span: Codable, Sendable { var location: Int; var length: Int; var values: [String: String] }
+    struct Span: Codable, Sendable, Equatable { var location: Int; var length: Int; var values: [String: String] }
     var text: String
     var spans: [Span]
     var attachments: [AgentChatAttachment]
@@ -24,7 +24,11 @@ struct AgentSavedDraft: Codable, Sendable {
         }
     }
     @MainActor
-    func attributed(theme: AgentTheme) -> NSAttributedString {
+    func attributed(theme: AgentTheme) -> NSAttributedString { Self.attributed(text: text, spans: spans, theme: theme) }
+
+    /// Draft text with its quotation and thread-mention spans, as the composer shows it.
+    @MainActor
+    static func attributed(text: String, spans: [Span], theme: AgentTheme) -> NSAttributedString {
         let value = NSMutableAttributedString(string: text, attributes: [.font: AppFont.system(14, weight: .light), .foregroundColor: theme.fg])
         let allowed = Set([NSAttributedString.Key.agentAssistantCitation, .agentAssistantCitationIdentity, .agentThreadMention].map(\.rawValue))
         for span in spans where span.location >= 0 && span.length >= 0 && span.location <= value.length && span.length <= value.length - span.location {

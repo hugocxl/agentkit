@@ -147,6 +147,14 @@ struct AgentConversationFindModel {
         selectedIndex = min(previousIndex ?? 0, matches.count - 1)
     }
 
+    /// Selects the first or last occurrence in `itemID`; false when it holds none.
+    mutating func select(itemID: String, last: Bool) -> Bool {
+        let indices = matches.indices.filter { matches[$0].itemID == itemID }
+        guard let index = last ? indices.last : indices.first else { return false }
+        selectedIndex = index
+        return true
+    }
+
     /// Moves to the next match, wrapping from the last to the first.
     mutating func selectNext() {
         guard !matches.isEmpty else { return }

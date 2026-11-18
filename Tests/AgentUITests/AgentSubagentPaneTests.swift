@@ -73,7 +73,8 @@ final class AgentSubagentPaneTests: XCTestCase {
         let pane = AgentPaneController(session: session, project: project, provider: .claude) { _ in snapshot }
         defer { pane.dispose() }
         pane.conversationRequest = { request in
-            guard case .subagentSteps(_, let id) = request else { throw ModelError("unexpected") }
+            // A server without incremental reads: snapshots come whole.
+            guard case .subagentSteps(_, let id) = request else { throw ErrorReply(code: .unsupported, message: "") }
             reads += 1
             return .subagentSteps(AgentSubagentSteps(toolUseID: id, items: steps))
         }
@@ -299,5 +300,137 @@ final class AgentDiffEditorTests: XCTestCase {
         }
         XCTAssertEqual(opened?.0, "a.swift")
         XCTAssertEqual(opened?.1, 10)
+    }
+
+}
+
+extension AgentSubagentPaneTests {
+    /// T1: the window reads again on a new steps revision even at the same count, on the
+    /// agent ending, and as the server's window of steps rolls over; reads due while one is
+    /// in flight become one read after it. T5: earlier steps page in above, steps the server
+    /// dropped are counted, and an agent whose steps weren't saved says so.
+    func testStepsWindowFollowsRevisionsCoalescesReadsAndPagesEarlierSteps() async throws {
+        _ = NSApplication.shared
+        let session = SessionId(), project = ProjectId()
+        var agent = AgentSubagent(id: "a", toolUseID: "tool", description: "Audit", steps: 1, stepsRevision: 1)
+        var snapshot = AgentChatSnapshot(session: session, project: project, provider: .claude, providerSession: "p",
+                                         status: .working, revision: 2)
+        snapshot.subagents = [agent]
+        let running = AgentChatItem(id: "t1", kind: .tool, text: "Bash", isComplete: false,
+                                    tool: .init(name: "Bash", category: .command, input: #"{"command":"swift test"}"#, status: .running))
+        var newest = AgentSubagentSteps(toolUseID: "tool", items: [running], revision: 1, start: 0, total: 1, omitted: 0)
+        var allSteps: [AgentChatItem] = [running]
+        var gate: CheckedContinuation<Void, Never>?
+        var gateNext = false
+        var pages: [Int] = []
+        let pane = AgentPaneController(session: session, project: project, provider: .claude) { _ in snapshot }
+        defer { pane.dispose() }
+        pane.conversationRequest = { request in
+            switch request {
+            case .subagentSteps:
+                // A reply holds the steps as they were when the server read them.
+                let reply = newest
+                if gateNext { gateNext = false; await withCheckedContinuation { gate = $0 } }
+                return .subagentSteps(reply)
+            case .subagentStepsPage(_, _, let before, _):
+                pages.append(before)
+                let items = Array(allSteps.prefix(before))
+                return .subagentSteps(AgentSubagentSteps(toolUseID: "tool", items: items, revision: newest.revision,
+                                                         start: 0, total: newest.total, omitted: 0))
+            default: throw ErrorReply(code: .unsupported, message: "")
+            }
+        }
+        func publish(_ change: () -> Void) async throws {
+            change()
+            snapshot.subagents = [agent]
+            snapshot.revision += 1
+            let revision = snapshot.revision
+            pane.sessionChanged(session: session, revision: revision)
+            try await self.wait { pane.snapshot?.revision == revision }
+        }
+        pane.refresh()
+        try await wait { pane.snapshot != nil }
+        pane.openSubagentSteps(agent)
+        let window = try XCTUnwrap(pane.subagentWindows["tool"])
+        try await wait { window.items.count == 1 }
+        XCTAssertEqual(window.readCount, 1, "Opening reads once")
+
+        // The running tool completes in place: same count, new revision.
+        var completed = running
+        completed.isComplete = true
+        completed.tool?.status = .completed
+        completed.tool?.output = "All tests passed"
+        gateNext = true
+        try await publish {
+            allSteps = [completed]
+            newest = AgentSubagentSteps(toolUseID: "tool", items: allSteps, revision: 2, start: 0, total: 1, omitted: 0)
+            agent.stepsRevision = 2
+        }
+        try await wait { gate != nil }
+        XCTAssertEqual(window.readCount, 2)
+        // Two more revisions arrive while that read is in flight.
+        for revision in [3, 4] as [UInt64] {
+            try await publish {
+                allSteps = [completed, AgentChatItem(id: "r\(revision)", kind: .assistant, text: "Revision \(revision)")]
+                newest = AgentSubagentSteps(toolUseID: "tool", items: allSteps, revision: revision, start: 0, total: 2, omitted: 0)
+                agent.stepsRevision = revision
+                agent.steps = 2
+            }
+        }
+        gate?.resume(); gate = nil
+        try await wait { window.loadedRevision == 4 }
+        XCTAssertEqual(window.readCount, 3, "Reads due during a read become one")
+        XCTAssertEqual(window.items.first?.tool?.output, "All tests passed")
+        XCTAssertEqual(window.items.first?.isComplete, true)
+
+        // The server's window of 200 rolls over at the same size.
+        try await publish {
+            allSteps = [completed] + (0..<200).map { AgentChatItem(id: "s\($0)", kind: .assistant, text: "Step \($0)") }
+            newest = AgentSubagentSteps(toolUseID: "tool", items: Array(allSteps.suffix(200)), revision: 5, start: 1, total: 201, omitted: 0)
+            agent.stepsRevision = 5
+            agent.steps = 201
+        }
+        try await wait { window.loadedRevision == 5 }
+        XCTAssertEqual(window.items.first?.id, "s0")
+        try await publish {
+            allSteps.append(AgentChatItem(id: "s200", kind: .assistant, text: "Step 200"))
+            newest = AgentSubagentSteps(toolUseID: "tool", items: Array(allSteps.suffix(200)), revision: 6, start: 2, total: 202, omitted: 0)
+            agent.stepsRevision = 6
+            agent.steps = 202
+        }
+        try await wait { window.loadedRevision == 6 }
+        XCTAssertEqual(window.items.count, 200)
+        XCTAssertEqual(window.items.last?.id, "s200")
+        let reads = window.readCount
+        // Ending reads once more even when the revision didn't move.
+        try await publish { agent.status = .completed }
+        try await wait { window.readCount == reads + 1 }
+
+        // Earlier steps load above the newest page.
+        XCTAssertNotNil(window.transcript.onEarlier)
+        window.loadEarlier()
+        try await wait { window.earlierStart == 0 }
+        XCTAssertEqual(pages, [2])
+        XCTAssertEqual(window.items.prefix(2).map(\.id), ["t1", "s0"])
+        XCTAssertEqual(window.items.count, 202)
+        XCTAssertNil(window.transcript.onEarlier, "The first step is shown")
+        window.close()
+
+        // Steps the server dropped are counted; there is nothing to load for them.
+        newest = AgentSubagentSteps(toolUseID: "tool", items: [completed], revision: 9, start: 30, total: 31, omitted: 30)
+        pane.openSubagentSteps(agent)
+        let trimmed = try XCTUnwrap(pane.subagentWindows["tool"])
+        try await wait { trimmed.loadedRevision == 9 }
+        XCTAssertNil(trimmed.transcript.onEarlier)
+        let labels = all(try XCTUnwrap(trimmed.window?.contentView)).compactMap { ($0 as? NSTextField)?.stringValue }
+        XCTAssertTrue(labels.contains("30 earlier steps weren't kept by the server."), "\(labels)")
+        trimmed.close()
+
+        // A child the server never saved, as after an older server's restart.
+        newest = AgentSubagentSteps(toolUseID: "tool", items: [], unavailable: true)
+        pane.openSubagentSteps(agent)
+        let unsaved = try XCTUnwrap(pane.subagentWindows["tool"])
+        try await wait { unsaved.message.stringValue == "This agent's steps weren't saved, so they can't be shown." }
+        unsaved.close()
     }
 }

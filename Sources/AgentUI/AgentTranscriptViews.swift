@@ -25,6 +25,8 @@ class AgentTimelineRow: ThemedView {
     var onForkPrompt: ((AgentChatItem) -> Void)? { didSet { editPromptHandlerDidChange() } }
     /// Reverts a turn's changes: all of its files, or the given paths.
     var onRevert: ((AgentTurnCheckpoint, [String]?) -> Void)? { didSet { revertHandlerDidChange() } }
+    /// Records a turn's file changes again after recording failed, by its user message ID.
+    var onRetryCheckpoint: ((String) -> Void)? { didSet { revertHandlerDidChange() } }
     /// Shows a tool's whole output, by its item ID.
     var onShowFullOutput: ((String) -> Void)?
     func revertHandlerDidChange() {}
@@ -97,9 +99,18 @@ final class AgentMessageRow: AgentTimelineRow, NSTextViewDelegate {
     var checkpoint: AgentTurnCheckpoint? {
         didSet {
             changes.checkpoint = checkpoint
-            changes.isHidden = (checkpoint?.totalFiles ?? 0) == 0
+            changes.isHidden = !checkpointPhase.showsCard
         }
     }
+    /// The answered turn's recording state, shown in its changes card.
+    var checkpointPhase: AgentChatTurn.CheckpointPhase = .unknown {
+        didSet {
+            changes.phase = checkpointPhase
+            changes.isHidden = !checkpointPhase.showsCard
+        }
+    }
+    /// The answered turn's user message, for retrying its recording.
+    var turnID: String? { didSet { changes.turnID = turnID } }
     private let copy = PillButton("Copy", style: .plain)
     /// Puts this message's text in the composer; it starts a new prompt, nothing is rewound.
     private let editPrompt = PillButton("", style: .plain)
@@ -128,6 +139,9 @@ final class AgentMessageRow: AgentTimelineRow, NSTextViewDelegate {
     private let deny = PillButton("Deny", style: .normal)
     private let allow = PillButton("Allow", style: .primary)
     private let allowAlways = PillButton("Always Allow", style: .normal)
+    /// The provider's offered decisions for a request carrying them, in its order.
+    private var decisionButtons: [PillButton] = []
+    private var decisionsHeight: CGFloat = 0
     /// Whether this approval's tool may be allowed for the rest of the conversation.
     var alwaysAllowable = false { didSet { if oldValue != alwaysAllowable { renderText() } } }
     private var bubbleWidth: CGFloat = 0
@@ -175,8 +189,8 @@ final class AgentMessageRow: AgentTimelineRow, NSTextViewDelegate {
         }
         editPrompt.translatesAutoresizingMaskIntoConstraints = true
         editPrompt.font = AppFont.footnote
-        editPrompt.toolTip = "Edit as new prompt"
-        editPrompt.setAccessibilityLabel("Edit as new prompt")
+        editPrompt.toolTip = "Edit as a new prompt, or edit from here"
+        editPrompt.setAccessibilityLabel("Edit message")
         editPrompt.imagePosition = .imageOnly
         editPrompt.isHidden = true
         addSubview(editPrompt)
@@ -259,6 +273,12 @@ final class AgentMessageRow: AgentTimelineRow, NSTextViewDelegate {
     override func menu(for event: NSEvent) -> NSMenu? {
         guard let item = pendingApproval else { return super.menu(for: event) }
         let menu = NSMenu()
+        if let interaction = item.interaction {
+            for decision in interaction.decisions {
+                menu.addItem(ClosureMenuItem(decision.label) { [weak self] in self?.onApprovalChoice?(item.id, .decision(decision.id)) })
+            }
+            return menu
+        }
         menu.addItem(ClosureMenuItem("Allow") { [weak self] in self?.onApproval?(item.id, true) })
         if canAlwaysAllow {
             menu.addItem(ClosureMenuItem("Always Allow \(item.text) in This Conversation") { [weak self] in
@@ -290,7 +310,10 @@ final class AgentMessageRow: AgentTimelineRow, NSTextViewDelegate {
     }
 
     override func editPromptHandlerDidChange() { renderText() }
-    override func revertHandlerDidChange() { changes.onRevert = onRevert }
+    override func revertHandlerDidChange() {
+        changes.onRevert = onRevert
+        changes.onRetryCheckpoint = onRetryCheckpoint
+    }
 
     override func linkServicesDidChange() { renderText() }
 
@@ -329,7 +352,7 @@ final class AgentMessageRow: AgentTimelineRow, NSTextViewDelegate {
         copy.title = ""
         copy.image = AppIcon.copy.image(size: 12, scale: AppIcon.inlineScale)
         copy.imagePosition = .imageOnly
-        editPrompt.isHidden = item.kind != .user || item.text.isEmpty || !item.isComplete || onEditPrompt == nil
+        editPrompt.isHidden = item.kind != .user || (item.text.isEmpty && (item.attachments ?? []).isEmpty) || !item.isComplete || onEditPrompt == nil
         editPrompt.image = AppIcon.pencil.image(size: 12, scale: AppIcon.inlineScale)
         editPrompt.setTitleColor(theme.fgDim)
         forkPrompt.isHidden = item.kind != .user || !item.isComplete || onForkPrompt == nil || !forkable
@@ -343,7 +366,7 @@ final class AgentMessageRow: AgentTimelineRow, NSTextViewDelegate {
             response.linkServices = item.kind == .assistant ? linkServices : nil
             response.setContent(text, theme: theme)
         }
-        else { body.setContent(AgentMarkdown.plain(text, theme: theme, muted: item.kind == .notice)) }
+        else { body.setContent(AgentMarkdown.plain(item.kind == .approval ? Self.requestText(item) : text, theme: theme, muted: item.kind == .notice)) }
         detail.setContent(AgentMarkdown.plain(Self.bounded(item.detail ?? ""), theme: theme, muted: true, monospaced: true))
         body.selectedTextAttributes = [.backgroundColor: theme.accent.withAlphaComponent(0.22)]
         detail.selectedTextAttributes = body.selectedTextAttributes
@@ -351,10 +374,14 @@ final class AgentMessageRow: AgentTimelineRow, NSTextViewDelegate {
         media.joinsTextBubble = !bubble.isHidden
         let pending = item.kind == .approval && !item.isComplete
         permissionTitle.isHidden = item.kind != .approval
-        permissionTitle.stringValue = item.questionnaire != nil && pending ? "Answer in the form below" : pending ? "Approval needed" : "Decision recorded"
+        permissionTitle.stringValue = item.questionnaire != nil && pending ? "Answer in the form below"
+            : pending ? (item.interaction?.origin?.isChild == true ? "Approval needed · asked by a child agent" : "Approval needed")
+            : Self.settledTitle(item.interaction)
         permissionTitle.textColor = pending ? theme.accent : theme.fgDim
-        allow.isHidden = !pending || item.questionnaire != nil
-        deny.isHidden = !pending || item.questionnaire != nil
+        let offered = pending && item.questionnaire == nil ? item.interaction?.decisions ?? [] : []
+        updateDecisionButtons(offered, item: item)
+        allow.isHidden = !pending || item.questionnaire != nil || item.interaction != nil
+        deny.isHidden = !pending || item.questionnaire != nil || item.interaction != nil
         allowAlways.isHidden = allow.isHidden || !canAlwaysAllow
         allowAlways.toolTip = "Let \(item.text) run without asking for the rest of this conversation"
         deny.toolTip = canGiveReason ? "Deny. Right-click to tell the agent why." : nil
@@ -383,7 +410,9 @@ final class AgentMessageRow: AgentTimelineRow, NSTextViewDelegate {
         bodyHeight = item.kind == .assistant ? response.height(for: width) : body.height(for: width)
         detailHeight = detail.isHidden ? 0 : detail.height(for: max(1, width - 24))
         if item.kind == .approval {
-            return 24 + bodyHeight + (detail.isHidden ? 0 : detailHeight + 14) + (item.isComplete || item.questionnaire != nil ? 0 : 42)
+            decisionsHeight = decisionButtons.isEmpty ? 0 : placeDecisions(width: width, apply: false) + 16
+            let actions: CGFloat = item.isComplete || item.questionnaire != nil ? 0 : item.interaction != nil ? decisionsHeight : 42
+            return 24 + bodyHeight + (detail.isHidden ? 0 : detailHeight + 14) + actions
         }
         changesHeight = item.kind == .assistant && !changes.isHidden ? changes.preferredHeight(for: width) : 0
         return bodyHeight + (changesHeight > 0 ? 16 + changesHeight : 0) + (copy.isHidden ? 0 : 28)
@@ -435,6 +464,8 @@ final class AgentMessageRow: AgentTimelineRow, NSTextViewDelegate {
             deny.frame = NSRect(x: 0, y: actionsY, width: 62, height: 26)
             allowAlways.frame = NSRect(x: 70, y: actionsY, width: allowAlways.isHidden ? 0 : 108, height: 26)
             allow.frame = NSRect(x: allowAlways.isHidden ? 70 : allowAlways.frame.maxX + 8, y: actionsY, width: 66, height: 26)
+            decisionsTop = actionsY
+            _ = placeDecisions(width: width, apply: true)
         } else if item.kind == .assistant {
             response.frame = NSRect(x: 0, y: 0, width: width, height: bodyHeight)
             response.layoutSubtreeIfNeeded()
@@ -485,6 +516,69 @@ final class AgentMessageRow: AgentTimelineRow, NSTextViewDelegate {
         let pending = item?.kind == .approval && item?.isComplete == false
         allow.isEnabled = enabled && pending
         deny.isEnabled = enabled && pending
+        decisionsEnabled = enabled
+        decisionButtons.forEach { $0.isEnabled = enabled && pending }
+    }
+
+    private var decisionsEnabled = true
+    private var decisionsTop: CGFloat = 0
+
+    /// The offered decisions as buttons, in the provider's order, with their consequences as help.
+    private func updateDecisionButtons(_ decisions: [AgentApprovalDecision], item: AgentChatItem) {
+        let titles = decisions.map(\.label)
+        if decisionButtons.map(\.title) != titles {
+            decisionButtons.forEach { $0.removeFromSuperview() }
+            let primary = decisions.firstIndex { $0.kind.allows }
+            decisionButtons = decisions.enumerated().map { index, decision in
+                let button = PillButton(decision.label, style: index == primary ? .primary : decision.kind == .cancel ? .destructive : .normal)
+                button.translatesAutoresizingMaskIntoConstraints = true
+                addSubview(button)
+                return button
+            }
+        }
+        for (button, decision) in zip(decisionButtons, decisions) {
+            button.toolTip = decision.consequence
+            button.setAccessibilityHelp(decision.consequence)
+            button.isEnabled = decisionsEnabled
+            button.onPress = { [weak self] in self?.onApprovalChoice?(item.id, .decision(decision.id)) }
+        }
+    }
+
+    /// Lays the decision buttons out in rows that fit `width`; returns their height.
+    private func placeDecisions(width: CGFloat, apply: Bool) -> CGFloat {
+        guard !decisionButtons.isEmpty else { return 0 }
+        var x: CGFloat = 0, y: CGFloat = 0
+        for button in decisionButtons {
+            let buttonWidth = min(width, ceil(button.fittingSize.width) + 8)
+            if x > 0, x + buttonWidth > width { x = 0; y += 34 }
+            if apply { button.frame = NSRect(x: x, y: decisionsTop + y, width: buttonWidth, height: 26) }
+            x += buttonWidth + 8
+        }
+        return y + 26
+    }
+
+    /// A request's text with what it asks for, how far an allowance reaches and who asked.
+    static func requestText(_ item: AgentChatItem) -> String {
+        guard let interaction = item.interaction else { return item.text }
+        var lines = [item.text]
+        if let summary = interaction.summary, summary != item.text, !item.isComplete { lines.append(summary) }
+        if let scope = interaction.scope { lines.append(scope) }
+        lines += (interaction.requested ?? []).map { "• " + $0 }
+        if let origin = interaction.origin, origin.isChild {
+            lines.append("Asked by " + (origin.name.map { "agent " + $0 } ?? "a child agent") + (origin.agentID.map { " (\($0.prefix(40)))" } ?? ""))
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// How a request ended, for its settled card.
+    static func settledTitle(_ interaction: AgentApprovalRequest?) -> String {
+        switch interaction?.outcome {
+        case .expired?: "Expired"
+        case .resolvedElsewhere?: "Resolved elsewhere"
+        case .ended?: "Ended without an answer"
+        case .automatic?: "Answered automatically"
+        default: "Decision recorded"
+        }
     }
 
     override func setTimestamp(_ date: Date?) {
@@ -760,6 +854,8 @@ enum AgentTurnTime {
 
 /// An answer to an approval beyond a plain Allow or Deny.
 enum AgentApprovalChoice: Equatable {
+    /// One of the decisions the provider offered, by its token.
+    case decision(String)
     /// Allow it, and the same tool for the rest of the conversation.
     case allowAlways
     /// Deny it and tell the agent why.

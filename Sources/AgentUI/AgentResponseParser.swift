@@ -5,7 +5,39 @@ import Foundation
 /// visible during streaming; completed block indices stay stable as the last block grows.
 @MainActor
 enum AgentResponseParser {
+    /// The parse of a streaming source up to a top-level block boundary, so the next,
+    /// longer source parses only from there. A boundary is the start of a finished line
+    /// after a blank one, outside every paragraph, list, fence and block, with nothing
+    /// before it that later text could still turn into another block (an unclosed `$$`,
+    /// `\[` or HTML tag). The source up to it, and through its line, must be unchanged.
+    struct Checkpoint {
+        fileprivate let prefix: String
+        fileprivate let line: Int
+        fileprivate let parseRawHTML: Bool
+        fileprivate let listAncestors: [Bool]
+        fileprivate let result: [AgentMarkdown.Block]
+        fileprivate let looseLists: Set<Int>
+        fileprivate let lastNumbers: [Int: Int]
+        fileprivate let blankBefore: Bool
+
+        /// Lines the next parse skips.
+        var reusedLines: Int { line }
+    }
+
     static func parse(_ source: String, parseRawHTML: Bool = true, listAncestors: [Bool] = []) -> [AgentMarkdown.Block] {
+        var none: Checkpoint?
+        return parse(source, parseRawHTML: parseRawHTML, listAncestors: listAncestors, checkpoint: &none, records: false)
+    }
+
+    /// Parses `source` from `checkpoint` when it still applies, and leaves in it the latest
+    /// boundary of this parse. The blocks are those `parse(_:)` returns for the same source.
+    static func parse(_ source: String, parseRawHTML: Bool = true, listAncestors: [Bool] = [],
+                      resuming checkpoint: inout Checkpoint?) -> [AgentMarkdown.Block] {
+        parse(source, parseRawHTML: parseRawHTML, listAncestors: listAncestors, checkpoint: &checkpoint, records: true)
+    }
+
+    private static func parse(_ source: String, parseRawHTML: Bool, listAncestors: [Bool],
+                              checkpoint: inout Checkpoint?, records: Bool) -> [AgentMarkdown.Block] {
         let input = AgentMarkdownSource(source)
         let lines = input.lines
         var result: [AgentMarkdown.Block] = []
@@ -16,6 +48,15 @@ enum AgentResponseParser {
         var lastNumbers: [Int: Int] = [:]
         var blankBefore = false
         var i = 0
+        if records, let saved = checkpoint, saved.parseRawHTML == parseRawHTML, saved.listAncestors == listAncestors,
+           saved.line < lines.count, source.hasPrefix(saved.prefix) {
+            result = saved.result; looseLists = saved.looseLists; lastNumbers = saved.lastNumbers
+            blankBefore = saved.blankBefore; i = saved.line
+        } else {
+            checkpoint = nil
+        }
+        var resumable = records
+        var boundary: (line: Int, count: Int, looseLists: Set<Int>, lastNumbers: [Int: Int], blankBefore: Bool)?
         func flush() {
             if !paragraph.isEmpty { result.append(.paragraph(input.join(paragraph, startingAt: paragraphStart))) }
             paragraph.removeAll(keepingCapacity: true)
@@ -25,6 +66,10 @@ enum AgentResponseParser {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.isEmpty { flush(); blankBefore = true; i += 1; continue }
             if list(line) == nil { listContexts.removeAll(keepingCapacity: true) }
+            if resumable, i > 0, i + 1 < lines.count, (checkpoint?.line ?? 0) < i, paragraph.isEmpty, listContexts.isEmpty,
+               lines[i - 1].trimmingCharacters(in: .whitespaces).isEmpty {
+                boundary = (i, result.count, looseLists, lastNumbers, blankBefore)
+            }
             if paragraph.isEmpty, indentation(line) >= 4, listContexts.isEmpty || list(line) == nil {
                 let start = i
                 var code: [String] = []
@@ -252,10 +297,18 @@ enum AgentResponseParser {
             } else {
                 if paragraph.isEmpty { listContexts.removeAll(keepingCapacity: true); paragraphStart = i }
                 paragraph.append(line)
+                // A later line could still close this into a block: parse it again each time.
+                if trimmed.hasPrefix("<") || trimmed.hasPrefix("$$") || trimmed.hasPrefix("\\[") { resumable = false }
             }
             i += 1
         }
         flush()
+        if let boundary {
+            checkpoint = Checkpoint(prefix: input.join(Array(lines[...boundary.line]), startingAt: 0) + input.ending(after: boundary.line),
+                                    line: boundary.line, parseRawHTML: parseRawHTML, listAncestors: listAncestors,
+                                    result: Array(result[..<boundary.count]), looseLists: boundary.looseLists,
+                                    lastNumbers: boundary.lastNumbers, blankBefore: boundary.blankBefore)
+        }
         return result.map { block in
             guard var structure = block.listStructure else { return block }
             structure.isLoose = looseLists.contains(structure.id)
@@ -272,31 +325,11 @@ enum AgentResponseParser {
         (try? NSRegularExpression(pattern: expression))?.numberOfMatches(in: source, range: NSRange(source.startIndex..., in: source)) ?? 0
     }
 
-    private struct Fence {
-        let marker: Character
-        let count: Int
-        let info: String
-        let indent: Int
-    }
+    private typealias Fence = AgentMarkdownFence
 
-    private static func openingFence(_ line: String) -> Fence? {
-        let indent = indentation(line)
-        guard indent < 4 else { return nil }
-        let text = line.drop { $0 == " " || $0 == "\t" }
-        guard let first = text.first, first == "`" || first == "~" else { return nil }
-        let count = text.prefix { $0 == first }.count
-        guard count >= 3 else { return nil }
-        let info = String(text.dropFirst(count)).trimmingCharacters(in: CharacterSet(charactersIn: " \t"))
-        guard first != "`" || !info.contains("`") else { return nil }
-        return Fence(marker: first, count: count, info: info, indent: indent)
-    }
+    private static func openingFence(_ line: String) -> Fence? { Fence.opening(line) }
 
-    private static func closesFence(_ line: String, fence: Fence) -> Bool {
-        guard indentation(line) < 4 else { return false }
-        let text = line.drop { $0 == " " || $0 == "\t" }
-        let count = text.prefix { $0 == fence.marker }.count
-        return count >= fence.count && text.dropFirst(count).allSatisfy { $0 == " " || $0 == "\t" }
-    }
+    private static func closesFence(_ line: String, fence: Fence) -> Bool { fence.isClosed(by: line) }
 
     private static func removingIndent(_ line: String, columns: Int) -> String {
         var column = 0
@@ -308,9 +341,7 @@ enum AgentResponseParser {
         return String(repeating: " ", count: max(0, column - columns)) + line[index...]
     }
 
-    private static func indentation(_ line: String) -> Int {
-        line.prefix { $0 == " " || $0 == "\t" }.reduce(0) { $0 + ($1 == "\t" ? 4 - $0 % 4 : 1) }
-    }
+    private static func indentation(_ line: String) -> Int { AgentMarkdownFence.indentation(line) }
 
     private struct ListContext {
         let id: Int
