@@ -1,0 +1,65 @@
+{{head title="AgentKit" canonical="" description="AgentKit is a Swift package that embeds a native AI conversation in macOS apps, backed by the Claude Code or Codex CLI installed on the Mac."}}
+</head>
+<body class="p9" data-layout="plain">
+{{masthead}}
+  <main>
+    <article class="p9-column p9-opening">
+      <h1 class="p9-statement">A native AI conversation, inside <span class="p9-accent">your Mac app.</span></h1>
+      <ul class="p9-meta">
+        <li class="p9-label"><span class="p9-dot" aria-hidden="true"></span>Version {{version}}</li>
+        <li class="p9-label">Swift package</li>
+        <li class="p9-label">macOS 14 or later</li>
+      </ul>
+      <section class="p9-section">
+        <p>AgentKit puts a full AI conversation inside your macOS app, powered by the Claude Code or Codex CLI already installed on the Mac. <span class="p9-muted">It is the conversation from Tab, with its interface, runtime and saved sessions, made into a package any app can use.</span></p>
+      </section>
+      <ul class="p9-grid p9-wide" data-columns="3">
+        <li>
+          <span class="p9-label">Fig 0.1</span>
+          {{vector ai-assistant}}
+          <h3>Native conversation</h3>
+          <p>Drawn in AppKit, with a SwiftUI wrapper.</p>
+        </li>
+        <li>
+          <span class="p9-label">Fig 0.2</span>
+          {{vector plugins}}
+          <h3>Your app's tools</h3>
+          <p>Defined once, called by either provider.</p>
+        </li>
+        <li>
+          <span class="p9-label">Fig 0.3</span>
+          {{vector cli-tooling}}
+          <h3>Local CLIs</h3>
+          <p>Claude Code or Codex, as installed on the Mac.</p>
+        </li>
+      </ul>
+      <section class="p9-section" id="ai-first">
+        <h2>Built for AI-first apps</h2>
+        <p>Your app describes what it can do, and the agent does it through your own tools. <span class="p9-muted">AgentKit brings the conversation, streaming, model selection, tool results and sessions, and the same tools work with both providers.</span></p>
+      </section>
+      <section class="p9-section" id="conversation">
+        <h2>Everything a conversation needs</h2>
+        <p>Streaming replies with Markdown, code, tables, math and diagrams. A composer with attachments, model and reasoning choices, approvals, questions and a prompt queue. <span class="p9-muted">Conversations and drafts are saved, so people pick up where they left off after a relaunch.</span></p>
+      </section>
+      <section class="p9-section" id="in-charge">
+        <h2>Your app stays in charge</h2>
+        <p>When your app hands the agent its own tools, the provider's built-in tools are switched off or kept read-only. <span class="p9-muted">Your app checks every request and makes each change through its own editing and undo. When it quits, AgentKit saves the conversation and stops the agent.</span></p>
+      </section>
+      <section class="p9-section" id="local">
+        <h2>Runs on what is already there</h2>
+        <p>AgentKit talks to the Claude Code or Codex CLI installed on the Mac, with the account people already use. <span class="p9-muted">It bundles no model and manages no accounts, and its example app runs an offline demo with no account at all.</span></p>
+      </section>
+      <section class="p9-section" id="in-use">
+        <h2>At work in Tab and Filmatte</h2>
+        <p><a href="https://hugocxl.github.io/tab/">Tab</a> runs its agent panes on AgentKit, and Filmatte, a native video editor, lets an agent add text and cut the timeline through the editor's own tools. <span class="p9-muted">Both connect the same package in different ways, as the <a href="docs.html">docs</a> show.</span></p>
+      </section>
+      <section class="p9-section" id="license">
+        <h2>Free to use</h2>
+        <p>AgentKit is open source under the MIT license. <span class="p9-muted">Code and artwork adapted from other projects keep their own licenses, listed in the <a href="https://github.com/hugocxl/agentkit/blob/main/THIRD_PARTY_NOTICES.md">third-party notices</a>.</span></p>
+      </section>
+      <a class="p9-button" href="docs.html">{{icon book-open}}Read the docs</a>
+    </article>
+  </main>
+{{footer}}
+</body>
+</html>

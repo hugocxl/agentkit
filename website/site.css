@@ -1,0 +1,10 @@
+/* AgentKit site additions to the design system. Only --p9-* properties and
+   the documented spacing tokens are used here: no new colors, fonts, sizes,
+   weights, radii, shadows or gradients. */
+
+/* The single filled action keeps section spacing above it. */
+.p9-opening > .p9-button { margin-top: var(--p9-space-7) }
+
+
+/* Docs: long inline identifiers and URLs wrap instead of widening a phone screen. */
+.p9-section :where(p, li) > code { overflow-wrap: anywhere }

@@ -1,0 +1,17 @@
+{
+  "name": "agentkit-website",
+  "private": true,
+  "description": "Builds and checks the AgentKit website. The Swift package itself needs no Node.",
+  "scripts": {
+    "build:site": "node scripts/build-site.mjs",
+    "check:site": "node scripts/check-site.mjs",
+    "sync:design-system": "node scripts/sync-design-system.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "26.1.0",
+    "marked": "^15.0.12"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

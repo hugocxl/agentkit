@@ -2,3 +2,7 @@
 .swiftpm/
 build/
 .DS_Store
+
+# Website
+node_modules/
+_site/
