@@ -18,14 +18,14 @@ One Swift package, three library products:
 | `AgentRuntime` | Running local CLI providers and persisting conversations. No AppKit dependency. |
 | `AgentUI` | The native AppKit transcript and composer, with an optional SwiftUI wrapper. No runtime dependency. |
 
-[Icons](https://github.com/hugocxl/icons) is the package's only external Swift dependency. Rendering uses AppKit rather than a web transcript.
+[@hugocxl/icons](https://github.com/hugocxl/icons) is the package's only external Swift dependency. Rendering uses AppKit rather than a web transcript.
 
 ## Install
 
 Add `https://github.com/hugocxl/agentkit.git` in Xcode's package dependencies, or add:
 
 ```swift
-.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.4.0")
+.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.4.1")
 ```
 
 Select the products your target needs:

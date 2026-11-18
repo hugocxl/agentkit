@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.1 - 2026-11-18
+
+### Changed
+
+- Refer to the icon library by its package name, @hugocxl/icons.
+
 ## 1.4.0 - 2026-11-18
 
 ### Added
