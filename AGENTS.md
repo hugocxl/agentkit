@@ -16,5 +16,5 @@ library products: AgentCore, AgentRuntime, and AgentUI.
 - A change is finished only when scripts/validate.sh passes.
 - Keep AgentKitVersion, example bundle version, changelog, install snippet in docs/INTEGRATION.md, and release tags in agreement.
 - The README stays product-facing; integration detail lives in docs/INTEGRATION.md, which the website renders.
-- The website in website/ uses only the vendored @hugocxl/design-system (scripts/sync-design-system.mjs). Check it with `npm run build:site && npm run check:site`.
+- The website in website/ uses only @hugocxl/design-system, with icons from @hugocxl/icons and figures from @hugocxl/vectors, all npm dev dependencies the build reads from node_modules. Check it with `npm run build:site && npm run check:site`.
 - Commit or publish only when requested.

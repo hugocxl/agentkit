@@ -1,7 +1,9 @@
 // Build the GitHub Pages site from website/ into _site/.
-// Pages follow the design system vendored in website/system (see scripts/sync-design-system.mjs).
+// Pages follow @hugocxl/design-system, with icons from @hugocxl/icons and figures from @hugocxl/vectors (npm dev dependencies).
 // The docs page is docs/INTEGRATION.md rendered into design-system sections.
 import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import { marked } from "marked";
 
 const out = "_site";
@@ -22,13 +24,15 @@ const facts = {
 };
 
 // ─── Artwork: Stroke icons from @hugocxl/icons, figures from @hugocxl/vectors ─
-const icon = (name) =>
-  read(`website/art/icons/${name}.svg`)
+const designSystem = dirname(createRequire(import.meta.url).resolve("@hugocxl/design-system/package.json"));
+const svg = async (specifier) => String(Object.values(await import(specifier))[0]);
+const icon = async (name) =>
+  (await svg(`@hugocxl/icons/js/stroke/${name}`))
     .trim()
     .replace(/^<svg[^>]*>/, `<svg class="ds-icon" data-icon="${name}" viewBox="0 0 16 16" fill="none" aria-hidden="true">`)
     .replace(/\s*\n\s*/g, "");
-const vector = (name) =>
-  read(`website/art/vectors/${name}.svg`)
+const vector = async (name) =>
+  (await svg(`@hugocxl/vectors/js/${name}`))
     .trim()
     .replace(/^<svg([^>]*)>/, (_, attributes) =>
       `<svg class="ds-vector" data-vector="${name}"${attributes.replace(/\s+xmlns="[^"]*"/, "").replace(/\s+color="[^"]*"/, "")}>`,
@@ -77,17 +81,22 @@ const docs = groups
 
 // ─── Templates ──────────────────────────────────────────────────────────
 const partial = (name) => read(`website/partials/${name}.html`).replace(/\n$/, "");
-function render(template, values) {
-  const html = template
+// Inline artwork after the partials go in, since the masthead carries an icon.
+const replaceAsync = async (text, pattern, replace) => {
+  const parts = await Promise.all([...text.matchAll(pattern)].map((match) => replace(...match)));
+  return text.replace(pattern, () => parts.shift());
+};
+async function render(template, values) {
+  let html = template
     .replace(/\{\{head ([^}]*)\}\}/, (_, args) => {
       const attributes = Object.fromEntries([...args.matchAll(/(\w+)="([^"]*)"/g)].map((m) => [m[1], m[2]]));
       return partial("head").replace(/\{\{(\w+)\}\}/g, (__, key) => attributes[key] ?? "");
     })
     .replace("{{masthead}}", partial("masthead"))
-    .replace("{{footer}}", partial("footer"))
-    .replace(/\{\{icon ([\w-]+)\}\}/g, (_, name) => icon(name))
-    .replace(/\{\{vector ([\w-]+)\}\}/g, (_, name) => vector(name))
-    .replace(/\{\{([\w-]+)\}\}/g, (match, key) => (key in values ? values[key] : match));
+    .replace("{{footer}}", partial("footer"));
+  html = await replaceAsync(html, /\{\{icon ([\w-]+)\}\}/g, (_, name) => icon(name));
+  html = await replaceAsync(html, /\{\{vector ([\w-]+)\}\}/g, (_, name) => vector(name));
+  html = html.replace(/\{\{([\w-]+)\}\}/g, (match, key) => (key in values ? values[key] : match));
   const unknown = html.match(/\{\{[^}]*\}\}/);
   if (unknown) throw new Error(`Unknown template value ${unknown[0]}`);
   return html;
@@ -95,12 +104,12 @@ function render(template, values) {
 
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
-cpSync("website/system", `${out}/system`, { recursive: true, filter: (path) => !path.endsWith(".DS_Store") });
+cpSync(join(designSystem, "system"), `${out}/system`, { recursive: true, filter: (path) => !path.endsWith(".DS_Store") });
 cpSync("website/site.css", `${out}/site.css`);
 
 const values = { ...facts, docs, "docs-title": escape(docsTitle) };
 for (const page of ["index.html", "docs.html"]) {
-  writeFileSync(`${out}/${page}`, render(read(`website/${page}`), values));
+  writeFileSync(`${out}/${page}`, await render(read(`website/${page}`), values));
 }
 writeFileSync(`${out}/.nojekyll`, "");
 console.log(`Built the AgentKit ${version} site.`);

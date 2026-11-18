@@ -1,5 +1,7 @@
 // Check the built site in _site/: links, anchors, assets and the design-system page contract.
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import assert from "node:assert/strict";
 import { JSDOM } from "jsdom";
 
@@ -9,6 +11,29 @@ const docs = new Map(pages.map((name) => [name, new JSDOM(readFileSync(`${site}/
 const version = readFileSync("Sources/AgentCore/AgentKitVersion.swift", "utf8").match(/current = "([^"]+)"/)[1];
 const local = (href) => !/^(https?:|mailto:|data:)/.test(href);
 let links = 0;
+
+// _site/system is the published @hugocxl/design-system system/ folder, byte for byte.
+const system = join(dirname(createRequire(import.meta.url).resolve("@hugocxl/design-system/package.json")), "system");
+const files = (root) =>
+  readdirSync(root, { recursive: true })
+    .map(String)
+    .filter((path) => statSync(join(root, path)).isFile() && !path.endsWith(".DS_Store"))
+    .sort();
+assert.deepEqual(files(`${site}/system`), files(system), "system: files differ from @hugocxl/design-system");
+for (const path of files(system)) {
+  assert.ok(readFileSync(join(system, path)).equals(readFileSync(join(`${site}/system`, path))), `system: ${path} differs from @hugocxl/design-system`);
+}
+
+// Inline artwork matches the packages: same viewBox and drawing as the Stroke icon or vector of that name.
+const parse = (markup) => JSDOM.fragment(markup.trim()).firstElementChild;
+const artwork = async (specifier) => parse(String(Object.values(await import(specifier))[0]));
+const packaged = new Map();
+const original = (svg) => {
+  const key = svg.matches(".ds-icon") ? `@hugocxl/icons/js/stroke/${svg.dataset.icon}` : `@hugocxl/vectors/js/${svg.dataset.vector}`;
+  if (!packaged.has(key)) packaged.set(key, artwork(key).catch(() => null));
+  return packaged.get(key);
+};
+const drawing = (svg) => svg.innerHTML.replace(/\s*\n\s*/g, "");
 
 for (const [name, doc] of docs) {
   for (const a of doc.querySelectorAll("a[href]")) {
@@ -65,8 +90,12 @@ for (const name of pages) {
     assert.ok(!svg.hasAttribute("xmlns") && !svg.hasAttribute("color"), `${name}: vector attributes`);
     if (svg.matches(".ds-vector")) assert.ok(svg.querySelector("title")?.textContent.trim(), `${name}: vector title`);
   }
-  for (const icon of doc.querySelectorAll(".ds-icon")) {
-    assert.ok(existsSync(`website/art/icons/${icon.dataset.icon}.svg`), `${name}: unknown icon ${icon.dataset.icon}`);
+  for (const svg of doc.querySelectorAll(".ds-icon, .ds-vector")) {
+    const label = svg.dataset.icon ?? svg.dataset.vector;
+    const source = await original(svg);
+    assert.ok(source, `${name}: ${label} is not in the package`);
+    assert.equal(svg.getAttribute("viewBox"), source.getAttribute("viewBox"), `${name}: ${label} viewBox`);
+    assert.equal(drawing(svg), drawing(source), `${name}: ${label} differs from the package`);
   }
   for (const img of doc.querySelectorAll("img")) assert.ok(img.getAttribute("alt"), `${name}: img alt`);
   for (const table of doc.querySelectorAll("table")) {
