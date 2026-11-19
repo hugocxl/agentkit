@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.2 - 2026-11-19
+
+### Changed
+
+- Tag each release `vX.Y.Z` on GitHub and publish it with its changelog notes once validation passes, so Swift Package Manager can resolve every version.
+
 ## 1.4.1 - 2026-11-18
 
 ### Changed

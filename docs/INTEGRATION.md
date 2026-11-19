@@ -25,7 +25,7 @@ One Swift package, three library products:
 Add `https://github.com/hugocxl/agentkit.git` in Xcode's package dependencies, or add:
 
 ```swift
-.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.4.1")
+.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.4.2")
 ```
 
 Select the products your target needs:
