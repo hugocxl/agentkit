@@ -56,9 +56,13 @@ jobs:
           NEW="$(scripts/release-tags.sh tag "$GITHUB_SHA")"
           [ -n "$NEW" ] || { echo 'No new version to release'; exit 0; }
           mapfile -t TAGS <<< "$NEW"
-          git push origin "${TAGS[@]}"
+          # One push per tag: GitHub refuses this token a tag on a commit whose
+          # workflows differ from main's, and that mustn't hold back the others.
+          FAILED=0
           for TAG in "${TAGS[@]}"; do
+            git push origin "refs/tags/$TAG" || { FAILED=1; continue; }
             if gh release view "$TAG" > /dev/null 2>&1; then continue; fi
             scripts/release-tags.sh notes "${TAG#v}" > "$RUNNER_TEMP/notes.md"
             gh release create "$TAG" --verify-tag --title "AgentKit ${TAG#v}" --notes-file "$RUNNER_TEMP/notes.md"
           done
+          exit "$FAILED"
