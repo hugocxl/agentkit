@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.3 - 2026-11-19
+
+### Changed
+
+- Take `Icons` from the `hugocxlStack` Swift package in the hugocxl/stack monorepo (`https://github.com/hugocxl/stack.git`, 0.1.4), which replaces the hugocxl/icons repository.
+
 ## 1.4.2 - 2026-11-19
 
 ### Changed
