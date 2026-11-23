@@ -29,6 +29,8 @@ final class AgentCommandDiscovery: @unchecked Sendable {
 
     static func discover(provider: AgentChatProvider, directory: String, environment: [String: String], executable: URL? = nil,
                          processes: AgentProcessTracker) async -> Result {
+        // ACP agents list their commands in the session itself, with `available_commands_update`.
+        guard provider.spec.wire != .acp else { return Result() }
         let discovery = AgentCommandDiscovery()
         discovery.provider = provider; discovery.directory = directory
         return await withCheckedContinuation { continuation in

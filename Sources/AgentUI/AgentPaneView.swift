@@ -10,7 +10,8 @@ final class AgentPaneView: ThemedView {
     let composer = AgentComposerTextView()
     let promptQueue = AgentQueueView(frame: .zero)
     let subagents = AgentSubagentsView(frame: .zero)
-    let taskProgressButton = PillButton("", style: .plain)
+    /// The agent's task list: how much is done and the step it is on; pressing it shows the list.
+    let taskProgressLine = AgentPanelLine(accessibilityLabel: "Task progress")
     private var taskProgress = AgentTaskProgress()
     let panelScroll = NSScrollView()
     private let panelDocument = AgentPanelDocument()
@@ -46,6 +47,10 @@ final class AgentPaneView: ThemedView {
     /// Closes a composer notice; errors offer Refresh instead.
     let dismissNotice = AgentIconButton(icon: .close, label: "Dismiss message", iconSize: 12)
     let feedback = NSTextField(wrappingLabelWithString: "")
+    /// How the notice card reads: its icon and how strongly its text shows.
+    enum NoticeTone: Equatable { case info, progress, warning, danger }
+    var noticeTone: NoticeTone = .info { didSet { if noticeTone != oldValue { applyNoticeTone() } } }
+    private let noticeIcon = NoticeIcon()
     let transcriptScroll = NSScrollView()
     let composerScroll = NSScrollView()
     let transcript = AgentTranscriptDocument()
@@ -96,9 +101,9 @@ final class AgentPaneView: ThemedView {
     private let notice = AgentSurfaceCard(style: .agentPanel)
     private let emptyTitle = makeLabel("What can I help with?", font: AppFont.system(21, weight: .medium))
     private let emptyDetail = makeLabel("Ask a question or make something new.", font: AppFont.body)
-    private let activity = AgentSurfaceCard(style: .agentActivity)
+    /// What the agent waits for; pressing it scrolls to the request.
+    private let activity = AgentPanelLine(accessibilityLabel: "Agent activity")
     private var busy = false
-    private let activityLabel = makeLabel("", font: AppFont.small)
     private var activityStatus: AgentChatStatus = .idle
     private var submitting = false
     private var renderedItems: [AgentChatItem] = []
@@ -109,6 +114,10 @@ final class AgentPaneView: ThemedView {
     private var scrollMutationDepth = 0
     private var boundsObserver: NSObjectProtocol?
     private let endButton = AgentEndButton()
+    private var paneDropActive = false
+    private var composerDropActive = false
+    private(set) var isHighlightingAttachmentDrop = false
+    var onDropHighlightChange: ((Bool) -> Void)?
     var onApproval: ((String, Bool) -> Void)?
     var onApprovalChoice: ((String, AgentApprovalChoice) -> Void)? {
         didSet { transcript.onApprovalChoice = { [weak self] id, choice in self?.onApprovalChoice?(id, choice) } }
@@ -208,6 +217,11 @@ final class AgentPaneView: ThemedView {
         composer.onEdit = { [weak self] in self?.refreshComposer() }
         composer.onOpenCitation = { [weak self] citation in self?.openCitation(citation) }
         composer.onPasteContext = { [weak self] pasteboard in self?.pasteContextFragment(from: pasteboard) ?? false }
+        composer.onAttachmentDropHighlightChange = { [weak self] active in
+            guard let self else { return }
+            self.composerDropActive = active
+            self.updateAttachmentDropHighlight()
+        }
         composerScroll.documentView = composer
         composerScroll.drawsBackground = false
         composerScroll.hasVerticalScroller = true
@@ -216,8 +230,7 @@ final class AgentPaneView: ThemedView {
         plan.isHidden = true
         plan.setAccessibilityLabel("Disable plan mode")
         plan.toolTip = "Plan mode · Shift-Tab to toggle"
-        attach.toolTip = "Attach files or drop them into the message box"
-        attach.filled = true
+        attach.toolTip = "Attach files or drop them anywhere in the pane"
         // The pop-ups keep the menus and selection; the combined picker presents them.
         model.isHidden = true
         effort.isHidden = true
@@ -233,19 +246,16 @@ final class AgentPaneView: ThemedView {
         sendNow.setAccessibilityLabel("Send now")
         model.toolTip = "Choose the provider and model for the next message"
         effort.toolTip = "Choose the reasoning effort for the next message"
-        activityLabel.setAccessibilityLabel("Agent activity")
-        activity.addSubview(activityLabel)
-        activityLabel.translatesAutoresizingMaskIntoConstraints = true
-        activity.isHidden = true
-        activity.toolTip = "Show what the agent is waiting for"
-        activity.setAccessibilityRole(.button)
-        activity.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(activityPressed)))
+        activity.onPress = { [weak self] in self?.revealPendingRequest() }
         NotificationCenter.default.addObserver(self, selector: #selector(textScaleDidChange), name: .agentTextScaleDidChange, object: nil)
-        feedback.font = AppFont.small
+        feedback.font = AppFont.body
         feedback.isSelectable = true
-        feedback.maximumNumberOfLines = 2
-        feedback.lineBreakMode = .byTruncatingTail
-        for child in [feedback, retry, retryTurn, resumeAtReset, newConversation, dismissNotice] as [NSView] {
+        // Wraps, then truncates its last line; the tooltip keeps the whole message.
+        feedback.maximumNumberOfLines = Self.noticeMaximumLines
+        feedback.lineBreakMode = .byWordWrapping
+        feedback.cell?.truncatesLastVisibleLine = true
+        noticeIcon.glyphSize = AgentPanelMetrics.glyphSize
+        for child in [noticeIcon, feedback, retry, retryTurn, resumeAtReset, newConversation, dismissNotice] as [NSView] {
             notice.addSubview(child)
             child.translatesAutoresizingMaskIntoConstraints = true
         }
@@ -267,15 +277,11 @@ final class AgentPaneView: ThemedView {
         panelScroll.hasVerticalScroller = true
         panelScroll.autohidesScrollers = true
         panelScroll.scrollerStyle = .overlay
-        for panel in [subagents, promptQueue, questions, taskProgressButton] as [NSView] {
+        for panel in [subagents, promptQueue, questions, taskProgressLine] as [NSView] {
             panel.translatesAutoresizingMaskIntoConstraints = true
             panelDocument.addSubview(panel)
         }
-        taskProgressButton.font = AppFont.small
-        taskProgressButton.alignment = .left
-        taskProgressButton.lineBreakMode = .byTruncatingTail
-        taskProgressButton.isHidden = true
-        taskProgressButton.onPress = { [weak self] in
+        taskProgressLine.onPress = { [weak self] in
             guard let self, let id = self.taskProgress.target else { return }
             self.reveal(.item(id))
         }
@@ -289,7 +295,7 @@ final class AgentPaneView: ThemedView {
         selectionToolbar.onCite = { [weak self] in self?.citeSelection() }
         selectionToolbar.onCopy = { [weak self] in self?.copySelection() }
         addSubview(selectionToolbar)
-        registerForDraggedTypes([.fileURL, .png, .tiff])
+        registerForDraggedTypes(AgentAttachmentPasteboard.types)
         endButton.onPress = { [weak self] in self?.scrollToEnd() }
         endButton.isHidden = true
         retry.translatesAutoresizingMaskIntoConstraints = true
@@ -344,37 +350,21 @@ final class AgentPaneView: ThemedView {
         emptyTitle.frame = NSRect(x: left, y: emptyDetail.frame.minY - 34, width: width, height: 28)
 
         // Glass cards stack above the composer, each the composer's width: a notice,
-        // then questions, then the queue, then running agents, then the activity capsule.
-        let gap: CGFloat = 8
+        // then questions, then the queue, then running agents, then task progress, then
+        // what the agent waits for.
+        let gap = AgentPanelMetrics.gap
         var top = composerCard.frame.minY
         let noticeText = feedback.stringValue
         notice.isHidden = noticeText.isEmpty && retry.isHidden && retryTurn.isHidden && newConversation.isHidden
-        feedback.isHidden = notice.isHidden
         if !notice.isHidden {
-            // One action at a time: Refresh for errors, else Retry for a failed turn.
-            let action = !retry.isHidden ? retry : !retryTurn.isHidden ? retryTurn : newConversation
-            let retryWidth = action.isHidden ? 0 : ceil(action.fittingSize.width)
-            let scheduleWidth = resumeAtReset.isHidden || action !== retryTurn ? 0 : ceil(resumeAtReset.fittingSize.width)
-            let dismissWidth: CGFloat = dismissNotice.isHidden ? 0 : 24
-            let trailing = (retryWidth > 0 ? retryWidth + 8 : 0) + (scheduleWidth > 0 ? scheduleWidth + 4 : 0) + (dismissWidth > 0 ? dismissWidth + 4 : 0)
-            let textWidth = max(1, width - 28 - trailing)
-            let textHeight = min(32, ceil((noticeText as NSString).boundingRect(
-                with: NSSize(width: textWidth, height: .greatestFiniteMagnitude),
-                options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: [.font: AppFont.small]).height))
-            let height = max(36, textHeight + 18)
-            top -= gap + height
-            notice.frame = NSRect(x: left, y: top, width: width, height: height)
-            feedback.frame = NSRect(x: 14, y: floor((height - textHeight) / 2), width: textWidth, height: textHeight)
-            dismissNotice.frame = NSRect(x: width - 8 - dismissWidth, y: floor((height - 24) / 2), width: dismissWidth, height: 24)
-            let retryRight = width - 8 - (dismissWidth > 0 ? dismissWidth + 4 : 0)
-            action.frame = NSRect(x: retryRight - retryWidth, y: floor((height - 24) / 2), width: retryWidth, height: 24)
-            resumeAtReset.frame = NSRect(x: action.frame.minX - 4 - scheduleWidth, y: action.frame.minY, width: scheduleWidth, height: 24)
+            top -= gap + layoutNotice(text: noticeText, width: width)
+            notice.frame.origin = NSPoint(x: left, y: top)
         }
-        let activityHeight: CGFloat = activity.isHidden ? 0 : 26
+        let activityHeight: CGFloat = activity.isHidden ? 0 : AgentPanelMetrics.compactHeight
         let panelBudget = max(0, top - activityHeight - 64)
         let questionHeight = questions.isHidden ? 0 : min(questions.preferredHeight(for: width), max(160, panelBudget))
         let panels: [(NSView, CGFloat)] = [
-            (taskProgressButton, taskProgressButton.isHidden ? 0 : 28),
+            (taskProgressLine, taskProgressLine.isHidden ? 0 : AgentPanelMetrics.compactHeight),
             (subagents, subagents.isHidden ? 0 : subagents.preferredHeight),
             (promptQueue, promptQueue.isHidden ? 0 : promptQueue.preferredHeight),
             (questions, questionHeight)
@@ -392,10 +382,8 @@ final class AgentPaneView: ThemedView {
         panelScroll.frame = NSRect(x: left, y: top, width: width, height: panelHeight)
         panelDocument.frame = NSRect(x: 0, y: 0, width: width, height: panelY)
         if activityHeight > 0 {
-            let labelWidth = ceil((activityLabel.stringValue as NSString).size(withAttributes: [.font: AppFont.small]).width) + 4
             top -= gap + activityHeight
-            activity.frame = NSRect(x: left, y: top, width: labelWidth + 24, height: activityHeight)
-            activityLabel.frame = NSRect(x: 12, y: floor((activityHeight - 16) / 2), width: labelWidth, height: 16)
+            activity.frame = NSRect(x: left, y: top, width: width, height: activityHeight)
         }
         // The conversation runs under the floating cards and ends where the composer does;
         // its last row can scroll clear of the topmost card.
@@ -418,6 +406,91 @@ final class AgentPaneView: ThemedView {
     }
 
     private static let controlSize: CGFloat = 32
+    /// The notice wraps to this many lines before truncating; its tooltip keeps the rest.
+    private static let noticeMaximumLines = 3
+    private static let noticeMinimumHeight = AgentPanelMetrics.compactHeight
+    private static let noticeIconSide = AgentPanelMetrics.iconSide
+    /// The notice's icon sits in the other panels' icon column.
+    private static let noticeInset = AgentPanelMetrics.inset + AgentPanelMetrics.iconX
+    private static let noticeControlHeight: CGFloat = 24
+    /// The height of one line of the notice's text, as its label lays it out.
+    private static let noticeLineHeight = ceil(NSLayoutManager().defaultLineHeight(for: AppFont.body))
+
+    /// Lays out the notice card's contents for `width`, sizes the card and returns its height.
+    /// The icon sits on the first line; the buttons stay centered however many lines wrap.
+    private func layoutNotice(text: String, width: CGFloat) -> CGFloat {
+        // One action at a time: Refresh for errors, else Retry for a failed turn, else New Conversation.
+        let action = !retry.isHidden ? retry : !retryTurn.isHidden ? retryTurn : newConversation
+        let resumes = action === retryTurn && !action.isHidden && !resumeAtReset.isHidden
+        let controlGap: CGFloat = 6
+        var controls: [(view: NSView, width: CGFloat)] = []
+        if !dismissNotice.isHidden { controls.append((dismissNotice, Self.noticeControlHeight)) }
+        if !action.isHidden { controls.append((action, ceil(action.fittingSize.width))) }
+        // Resume at Reset is the one optional button: it goes when it would push past the card.
+        let resumeWidth = resumes ? ceil(resumeAtReset.fittingSize.width) : 0
+        let required = controls.reduce(8 + Self.noticeInset) { $0 + $1.width + controlGap }
+        if resumes, required + resumeWidth + controlGap <= width { controls.append((resumeAtReset, resumeWidth)) }
+        else { resumeAtReset.frame = .zero }
+        // Buttons line up from the trailing edge; text keeps a wider gap from them than
+        // they keep from each other, and the card's own inset when nothing follows it.
+        var trailing = width - 8
+        for control in controls {
+            trailing -= control.width
+            control.view.frame = NSRect(x: trailing, y: 0, width: control.width, height: Self.noticeControlHeight)
+            trailing -= controlGap
+        }
+        let textRight = controls.isEmpty ? width - Self.noticeInset : trailing + controlGap - 12
+        let font = AppFont.body
+        let lineHeight = Self.noticeLineHeight
+        let textX = AgentPanelMetrics.inset + AgentPanelMetrics.textX
+        let textWidth = max(0, textRight - textX)
+        var lines = 0
+        if !text.isEmpty, textWidth >= 24 {
+            let measured = (text as NSString).boundingRect(
+                with: NSSize(width: textWidth, height: .greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: [.font: font]).height
+            lines = min(Self.noticeMaximumLines, max(1, Int((measured / lineHeight).rounded())))
+        }
+        // Too narrow for any text, the card keeps its buttons and the tooltip keeps the message.
+        feedback.isHidden = lines == 0
+        noticeIcon.isHidden = lines == 0
+        let textHeight = CGFloat(max(lines, 1)) * lineHeight
+        let height = max(Self.noticeMinimumHeight, textHeight + 24)
+        notice.frame.size = NSSize(width: width, height: height)
+        let textY = floor((height - textHeight) / 2)
+        // A label's cell insets its text by 2 points on each side, as the other panels'
+        // labels do, so the text lines up with theirs; the frame keeps the measured width.
+        feedback.frame = NSRect(x: textX, y: textY, width: textWidth + 4, height: textHeight)
+        // The card is flipped, so the first line is the top one.
+        let firstLineMid = textY + lineHeight / 2
+        noticeIcon.frame = NSRect(x: Self.noticeInset, y: round(firstLineMid - Self.noticeIconSide / 2),
+                                  width: Self.noticeIconSide, height: Self.noticeIconSide)
+        // On one line the buttons center with the icon; once the text wraps, on the card.
+        let controlMid = lines > 1 ? height / 2 : firstLineMid
+        for control in controls {
+            control.view.frame.origin.y = round(controlMid - Self.noticeControlHeight / 2)
+        }
+        return height
+    }
+
+    /// The notice's icon and text color follow its tone: errors and warnings read at full strength.
+    private func applyNoticeTone() {
+        switch noticeTone {
+        case .info:
+            noticeIcon.icon = .icon(.info)
+            noticeIcon.color = theme.fgDim
+        case .progress:
+            noticeIcon.icon = .spinner
+            noticeIcon.color = theme.fgDim
+        case .warning:
+            noticeIcon.icon = .icon(.triangleAlert)
+            noticeIcon.color = theme.warning
+        case .danger:
+            noticeIcon.icon = .icon(.circleAlert)
+            noticeIcon.color = theme.danger
+        }
+        feedback.textColor = noticeTone == .warning || noticeTone == .danger ? theme.fg : theme.fgMuted
+    }
 
     /// Nothing sent, queued or running yet: the composer sits centered under a greeting.
     private var isEmptyConversation: Bool {
@@ -480,31 +553,48 @@ final class AgentPaneView: ThemedView {
         modelPicker.refresh()
     }
 
+    private func updateAttachmentDropHighlight() {
+        let active = paneDropActive || composerDropActive
+        guard active != isHighlightingAttachmentDrop else { return }
+        isHighlightingAttachmentDrop = active
+        onDropHighlightChange?(active)
+    }
+
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         // Anywhere in the pane takes a drop, not just the composer.
-        guard sender.draggingSourceOperationMask.contains(.copy),
-              sender.draggingPasteboard.availableType(from: [.fileURL, .png, .tiff]) != nil else { return [] }
-        composerCard.highlighted = true
+        guard canAcceptDrop(sender) else {
+            paneDropActive = false
+            updateAttachmentDropHighlight()
+            return []
+        }
+        paneDropActive = true
+        updateAttachmentDropHighlight()
         return .copy
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        let operation = draggingEntered(sender)
-        if operation.isEmpty { draggingExited(sender) }
-        return operation
+        draggingEntered(sender)
     }
 
     override func draggingExited(_ sender: NSDraggingInfo?) {
-        composerCard.highlighted = false
+        paneDropActive = false
+        updateAttachmentDropHighlight()
     }
 
-    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { !draggingEntered(sender).isEmpty }
+    override func draggingEnded(_ sender: NSDraggingInfo) {
+        paneDropActive = false
+        updateAttachmentDropHighlight()
+    }
+
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { canAcceptDrop(sender) }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        defer { draggingExited(sender) }
-        guard !draggingEntered(sender).isEmpty else { return false }
-        return AgentAttachmentPasteboard.receive(sender.draggingPasteboard, onFiles: composer.onAttachFiles,
-                                                 onImage: composer.onAttachImage)
+        defer {
+            paneDropActive = false
+            updateAttachmentDropHighlight()
+        }
+        guard canAcceptDrop(sender) else { return false }
+        return performDrop(sender)
     }
 
     /// The controller owns enabled states and actions; the surface presents honest activity.
@@ -516,13 +606,14 @@ final class AgentPaneView: ThemedView {
         let busy = submitting || status == .working || status == .waiting || snapshot?.hasActiveQueue == true
         self.busy = busy
         updatePrimaryAction()
-        // Only a wait on the user earns a capsule; sending and working show in the
-        // conversation and the stop button, so a send never flashes a card.
-        activity.isHidden = status != .waiting
-        activityLabel.stringValue = status != .waiting ? ""
-            : snapshot?.items.contains { $0.questionnaire != nil && !$0.isComplete } == true ? "Waiting for your answers" : "Waiting for approval"
-        activityLabel.setAccessibilityValue(activityLabel.stringValue)
-        guard changed else { return }
+        // Only a wait on the user earns a card; sending and working show in the
+        // conversation and the stop button, so a send never flashes one.
+        let hidden = activity.isHidden
+        let answering = snapshot?.items.contains { $0.questionnaire != nil && !$0.isComplete } == true
+        activity.show(status != .waiting ? nil : answering ? "Waiting for your answers" : "Waiting for approval",
+                      detail: status != .waiting ? nil : answering ? "The questions are below" : "Click to see the request",
+                      icon: .icon(.hand), tone: .accent)
+        guard changed || hidden != activity.isHidden else { return }
         needsLayout = true
     }
 
@@ -584,18 +675,16 @@ final class AgentPaneView: ThemedView {
     }
 
     /// `itemsUnchanged` says the items are those last rendered, as an incremental read
-    /// that changed no item reports, so the transcript skips comparing them.
-    func render(_ snapshot: AgentChatSnapshot, itemsUnchanged: Bool = false) {
+    /// that changed no item reports, so the transcript skips comparing them, and
+    /// `unchangedLead` says how many leading items are, so it compares only the rest.
+    func render(_ snapshot: AgentChatSnapshot, itemsUnchanged: Bool = false, unchangedLead: Int = 0) {
         if self.snapshot?.session != snapshot.session { navigationPromptID = nil }
         self.snapshot = snapshot
         taskProgress.update(snapshot)
-        if taskProgressButton.title != taskProgress.title {
-            taskProgressButton.title = taskProgress.title
-            taskProgressButton.setTitleColor(theme.fgDim)
-            taskProgressButton.toolTip = taskProgress.title
-            taskProgressButton.setAccessibilityLabel(taskProgress.title)
-        }
-        taskProgressButton.isHidden = taskProgress.target == nil
+        let progressHidden = taskProgressLine.isHidden
+        taskProgressLine.show(taskProgress.target == nil ? nil : taskProgress.title, detail: taskProgress.step,
+                              icon: .progress(taskProgress.fraction), tone: taskProgress.paused ? .muted : .accent)
+        if progressHidden != taskProgressLine.isHidden { needsLayout = true }
         updateOutline()
         preserveScroll {
             // Keep every retained entry as lightweight data. Native row views are
@@ -606,8 +695,11 @@ final class AgentPaneView: ThemedView {
             let omitted = snapshot.omittedItems ?? 0
             let activityChanged = self.transcript.providerActivity != snapshot.activity
             self.transcript.providerActivity = snapshot.activity
-            if (!itemsUnchanged && visible != self.renderedItems) || turns != self.renderedTurns || omitted != self.renderedOmitted || activityChanged {
-                self.transcript.update(visible, omittedCount: omitted, turns: turns)
+            let lead = min(unchangedLead, visible.count, self.renderedItems.count)
+            let itemsChanged = !itemsUnchanged && (visible.count != self.renderedItems.count
+                || visible[lead...] != self.renderedItems[lead...])
+            if itemsChanged || turns != self.renderedTurns || omitted != self.renderedOmitted || activityChanged {
+                self.transcript.update(visible, omittedCount: omitted, turns: turns, unchangedLead: lead)
                 self.renderedItems = visible
                 self.renderedTurns = turns
                 self.renderedOmitted = omitted
@@ -664,8 +756,6 @@ final class AgentPaneView: ThemedView {
             } catch { self.onActionError?(error.localizedDescription) }
         }
     }
-
-    @objc private func activityPressed() { revealPendingRequest() }
 
     var composerHasFocus: Bool { window?.firstResponder === composer }
 
@@ -799,7 +889,7 @@ final class AgentPaneView: ThemedView {
     }
 
     override func themeDidChange() {
-        taskProgressButton.setTitleColor(theme.fgDim)
+        taskProgressLine.theme = theme
         appearance = theme.nsAppearance
         attach.chatTheme = theme
         modelPicker.chatTheme = theme
@@ -825,10 +915,10 @@ final class AgentPaneView: ThemedView {
         composer.placeholderColor = theme.fgDim
         plan.chatTheme = theme
         composer.selectedTextAttributes = [.backgroundColor: theme.accent.withAlphaComponent(0.25)]
-        activityLabel.textColor = theme.fgMuted
         emptyTitle.textColor = theme.fg
         emptyDetail.textColor = theme.fgDim
-        feedback.textColor = theme.fgMuted
+        noticeIcon.theme = theme
+        applyNoticeTone()
         for control in [model, effort] { control.chatTheme = theme }
         contextIndicator.chatTheme = theme
         send.chatTheme = theme
@@ -840,6 +930,21 @@ final class AgentPaneView: ThemedView {
         selectionToolbar.theme = theme
         selectionToolbar.themeDidChange()
         composer.needsDisplay = true
+    }
+}
+
+@MainActor
+extension AgentPaneView {
+    var dropDraggedTypes: [NSPasteboard.PasteboardType] { AgentAttachmentPasteboard.types }
+
+    func canAcceptDrop(_ sender: NSDraggingInfo) -> Bool {
+        sender.draggingSourceOperationMask.contains(.copy)
+            && AgentAttachmentPasteboard.canRead(sender.draggingPasteboard)
+    }
+
+    func performDrop(_ sender: NSDraggingInfo) -> Bool {
+        AgentAttachmentPasteboard.receive(sender.draggingPasteboard, onFiles: composer.onAttachFiles,
+                                          onImage: composer.onAttachImage)
     }
 }
 

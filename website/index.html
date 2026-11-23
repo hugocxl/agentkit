@@ -1,4 +1,4 @@
-{{head title="AgentKit" canonical="" description="AgentKit is a Swift package that embeds a native AI conversation in macOS apps, backed by the Claude Code or Codex CLI installed on the Mac."}}
+{{head title="AgentKit" canonical="" description="AgentKit is a Swift package that embeds a native AI conversation in macOS apps, backed by the Claude Code, Codex or other agent CLI installed on the Mac."}}
 </head>
 <body class="ds" data-layout="plain">
 {{masthead}}
@@ -11,7 +11,7 @@
         <li class="ds-label">macOS 14 or later</li>
       </ul>
       <section class="ds-section">
-        <p>AgentKit puts a full AI conversation inside your macOS app, powered by the Claude Code or Codex CLI already installed on the Mac. <span class="ds-muted">It is the conversation from Tab, with its interface, runtime and saved sessions, made into a package any app can use.</span></p>
+        <p>AgentKit puts a full AI conversation inside your macOS app, powered by the Claude Code, Codex or other agent CLI already installed on the Mac. <span class="ds-muted">It is the conversation from Tab, with its interface, runtime and saved sessions, made into a package any app can use.</span></p>
       </section>
       <ul class="ds-grid ds-wide" data-columns="3">
         <li>
@@ -24,22 +24,22 @@
           <span class="ds-label">Fig 0.2</span>
           {{vector plugins}}
           <h3>Your app's tools</h3>
-          <p>Defined once, called by either provider.</p>
+          <p>Defined once, called by Claude Code or Codex.</p>
         </li>
         <li>
           <span class="ds-label">Fig 0.3</span>
           {{vector cli-tooling}}
           <h3>Local CLIs</h3>
-          <p>Claude Code or Codex, as installed on the Mac.</p>
+          <p>Claude Code, Codex, Gemini CLI and other ACP agents, as installed on the Mac.</p>
         </li>
       </ul>
       <section class="ds-section" id="ai-first">
         <h2>Built for AI-first apps</h2>
-        <p>Your app describes what it can do, and the agent does it through your own tools. <span class="ds-muted">AgentKit brings the conversation, streaming, model selection, tool results and sessions, and the same tools work with both providers.</span></p>
+        <p>Your app describes what it can do, and the agent does it through your own tools. <span class="ds-muted">AgentKit brings the conversation, streaming, model selection, tool results and sessions, and the same tools work with Claude Code and Codex.</span></p>
       </section>
       <section class="ds-section" id="conversation">
         <h2>Everything a conversation needs</h2>
-        <p>Streaming replies with Markdown, code, tables, math and diagrams. A composer with attachments, model and reasoning choices, approvals, questions and a prompt queue. <span class="ds-muted">Conversations and drafts are saved, so people pick up where they left off after a relaunch.</span></p>
+        <p>Streaming replies with Markdown, code, tables, math and diagrams. A composer with attachments, model and reasoning choices, approvals, questions and a prompt queue. <span class="ds-muted">Replies stream in as they are written, and long conversations load their earlier messages as people scroll back. Conversations and drafts are saved, so people pick up where they left off after a relaunch.</span></p>
       </section>
       <section class="ds-section" id="in-charge">
         <h2>Your app stays in charge</h2>
@@ -47,7 +47,11 @@
       </section>
       <section class="ds-section" id="local">
         <h2>Runs on what is already there</h2>
-        <p>AgentKit talks to the Claude Code or Codex CLI installed on the Mac, with the account people already use. <span class="ds-muted">It bundles no model and manages no accounts, and its example app runs an offline demo with no account at all.</span></p>
+        <p>AgentKit talks to the agent CLIs installed on the Mac, with the accounts people already use. <span class="ds-muted">It bundles no model and leaves sign-in to each CLI, and its example app runs an offline demo with no account at all.</span></p>
+      </section>
+      <section class="ds-section" id="providers">
+        <h2>Every agent, every account</h2>
+        <p>Run Claude Code, Codex, Antigravity, Gemini CLI, OpenCode, Grok, Kiro or any Agent Client Protocol agent, and more than one account of each. <span class="ds-muted">AgentKit checks that each CLI is installed and signed in, installs or updates it, says why one can't run, and reads Claude and Codex plan limits.</span></p>
       </section>
       <section class="ds-section" id="in-use">
         <h2>At work in Tab and Filmatte</h2>

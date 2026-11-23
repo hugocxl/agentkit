@@ -45,7 +45,7 @@ final class AgentComposerCoordinator {
             .init(id: "model", title: "/model", subtitle: "Choose a model · [model-name | default]", icon: .cpu, kind: .action),
             .init(id: "effort", title: "/effort", subtitle: "Choose reasoning effort · [level | auto]", icon: .brain, kind: .action),
             .init(id: "attach", title: "/attach", subtitle: "Attach files or images", icon: .paperclip, kind: .action),
-            .init(id: "stop", title: "/stop", subtitle: "Stop the current response", icon: .stop, kind: .action),
+            .init(id: "stop", title: "/stop", subtitle: "Stop the current response", icon: .square, kind: .action),
             .init(id: "clear", title: "/clear-draft", subtitle: "Clear the current draft and attachments", icon: .eraser, kind: .action),
             .init(id: "stash", title: "/stash", subtitle: "Set this draft aside to restore later", icon: .layers, kind: .action),
             .init(id: "stashes", title: "/stashes", subtitle: "Restore a stashed draft", icon: .layers, kind: .action)

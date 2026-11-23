@@ -14,4 +14,13 @@ enum AgentValidation {
         if isBlank(text) || text.utf8.count > limit || hasNul(text) { throw .badRequest }
     }
 
+    static func environment(_ environment: [String: String]) throws(ErrorCode) {
+        guard environment.count <= AgentLimits.maxEnvironmentVariables else { throw .badRequest }
+        var total = 0
+        for (key, value) in environment {
+            if key.isEmpty || key.contains("=") || hasNul(key) || hasNul(value) { throw .badRequest }
+            total += key.utf8.count + value.utf8.count
+        }
+        if total > AgentLimits.maxEnvironmentBytes { throw .badRequest }
+    }
 }

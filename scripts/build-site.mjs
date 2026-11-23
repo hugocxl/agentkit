@@ -1,6 +1,6 @@
 // Build the GitHub Pages site from website/ into _site/.
 // Pages follow @hugocxl/design-system, with icons from @hugocxl/icons and figures from @hugocxl/vectors (npm dev dependencies).
-// The docs page is docs/INTEGRATION.md rendered into design-system sections.
+// The docs, commands, validation and changelog pages are their Markdown files rendered into design-system sections.
 import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
@@ -39,9 +39,18 @@ const vector = async (name) =>
     )
     .replace(/\s*\n\s*/g, "");
 
-// ─── Docs: docs/INTEGRATION.md rendered into sections ───────────────────
+// ─── Docs: Markdown files rendered into sections ────────────────────────
 const slug = (text) => text.toLowerCase().replace(/[^\w\s-]/g, "").trim().replace(/\s+/g, "-");
 const github = "https://github.com/hugocxl/agentkit/blob/main/";
+// Markdown files with a page of their own; links to them stay on the site.
+const pages = {
+  "docs/INTEGRATION.md": "docs.html",
+  "docs/commands.md": "commands.html",
+  "docs/VALIDATION.md": "validation.html",
+  "CHANGELOG.md": "changelog.html",
+};
+// A link from a file in docs/: `../X.md` is at the root, `X.md` beside it.
+const pageFor = (href) => (href.startsWith("../") ? pages[href.slice(3)] : pages[`docs/${href}`]);
 const renderer = new marked.Renderer();
 renderer.code = ({ text }) =>
   `<div class="ds-code"><pre tabindex="0"><code>${escape(text)}</code></pre><button type="button">Copy</button></div>\n`;
@@ -51,33 +60,45 @@ renderer.table = (token) =>
 const baseTableHeader = renderer.tablecell.bind(renderer);
 renderer.tablecell = (token) => baseTableHeader(token).replace(/^<th>/, '<th scope="col">');
 renderer.link = function ({ href, title, tokens }) {
-  const target = href
-    .replace(/^https:\/\/hugocxl\.github\.io\/agentkit\/docs\.html$/, "docs.html")
-    .replace(/^\.\.\/(.+)$/, `${github}$1`)
-    .replace(/^([\w-]+\.md)$/, `${github}docs/$1`);
+  const [path, hash] = href.split("#");
+  const target = href.startsWith("https://hugocxl.github.io/agentkit/docs.html")
+    ? "docs.html"
+    : pageFor(path) ? pageFor(path) + (hash ? `#${hash}` : "")
+    : href.replace(/^\.\.\/(.+)$/, `${github}$1`).replace(/^([\w-]+\.md)$/, `${github}docs/$1`);
   return `<a href="${escape(target)}"${title ? ` title="${escape(title)}"` : ""}>${this.parser.parseInline(tokens)}</a>`;
 };
 
-const tokens = marked.lexer(read("docs/INTEGRATION.md"));
-let docsTitle = "Docs";
-const groups = [{ id: null, heading: null, tokens: [] }];
-for (const token of tokens) {
-  if (token.type === "heading" && token.depth === 1) docsTitle = token.text;
-  else if (token.type === "heading" && token.depth === 2) groups.push({ id: slug(token.text), heading: token, tokens: [] });
-  else if (token.type === "heading") throw new Error(`docs/INTEGRATION.md: use only # and ## headings (${token.raw.trim()})`);
-  else groups.at(-1).tokens.push(token);
+// One page's sections: each ## heading opens one. `subheadings` allows ### inside them,
+// and `id` names a section from its heading text.
+function renderMarkdown(path, { subheadings = false, id = slug } = {}) {
+  const tokens = marked.lexer(read(path));
+  let title = "Docs";
+  const groups = [{ id: null, heading: null, tokens: [] }];
+  for (const token of tokens) {
+    if (token.type === "heading" && token.depth === 1) title = token.text;
+    else if (token.type === "heading" && token.depth === 2) groups.push({ id: id(token.text), heading: token, tokens: [] });
+    else if (token.type === "heading" && !(subheadings && token.depth === 3)) throw new Error(`${path}: use only # and ## headings (${token.raw.trim()})`);
+    else groups.at(-1).tokens.push(token);
+  }
+  // The lead paragraph drops the sentence pointing readers of the Markdown file to this site.
+  const lead = groups[0].tokens.find((token) => token.type === "paragraph");
+  if (lead) lead.tokens = marked.lexer(lead.text.replace(/\s*This guide is also published at .*$/, ""))[0].tokens;
+  const html = groups
+    .filter((group) => group.heading || group.tokens.some((token) => token.type !== "space"))
+    .map((group) => {
+      const body = marked.parser(Object.assign(group.tokens, { links: tokens.links }), { renderer });
+      const heading = group.heading ? `        <h2>${marked.parseInline(group.heading.text)}</h2>\n` : "";
+      return `      <section class="ds-section"${group.id ? ` id="${group.id}"` : ""}>\n${heading}${body}      </section>`;
+    })
+    .join("\n");
+  return { title, html };
 }
-// The lead paragraph drops the sentence pointing readers of the Markdown file to this page.
-const lead = groups[0].tokens.find((token) => token.type === "paragraph");
-if (lead) lead.tokens = marked.lexer(lead.text.replace(/\s*This guide is also published at .*$/, ""))[0].tokens;
-const docs = groups
-  .filter((group) => group.heading || group.tokens.some((token) => token.type !== "space"))
-  .map((group) => {
-    const body = marked.parser(Object.assign(group.tokens, { links: tokens.links }), { renderer });
-    const heading = group.heading ? `        <h2>${marked.parseInline(group.heading.text)}</h2>\n` : "";
-    return `      <section class="ds-section"${group.id ? ` id="${group.id}"` : ""}>\n${heading}${body}      </section>`;
-  })
-  .join("\n");
+
+const integration = renderMarkdown("docs/INTEGRATION.md");
+const commands = renderMarkdown("docs/commands.md");
+const validation = renderMarkdown("docs/VALIDATION.md");
+// Each release is a section named for its version, such as #v1-5-0.
+const changelog = renderMarkdown("CHANGELOG.md", { subheadings: true, id: (text) => `v${text.split(" ")[0].replaceAll(".", "-")}` });
 
 // ─── Templates ──────────────────────────────────────────────────────────
 const partial = (name) => read(`website/partials/${name}.html`).replace(/\n$/, "");
@@ -107,8 +128,17 @@ mkdirSync(out, { recursive: true });
 cpSync(join(designSystem, "system"), `${out}/system`, { recursive: true, filter: (path) => !path.endsWith(".DS_Store") });
 cpSync("website/site.css", `${out}/site.css`);
 
-const values = { ...facts, docs, "docs-title": escape(docsTitle) };
-for (const page of ["index.html", "docs.html"]) {
+const values = {
+  ...facts,
+  docs: integration.html,
+  "docs-title": escape(integration.title),
+  commands: commands.html,
+  "commands-title": escape(commands.title),
+  validation: validation.html,
+  "validation-title": escape(validation.title),
+  changelog: changelog.html,
+};
+for (const page of ["index.html", ...Object.values(pages)]) {
   writeFileSync(`${out}/${page}`, await render(read(`website/${page}`), values));
 }
 writeFileSync(`${out}/.nojekyll`, "");

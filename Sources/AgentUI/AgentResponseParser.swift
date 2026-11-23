@@ -1,43 +1,25 @@
-import AgentCore
 import Foundation
 
 /// Native block parsing for the response surface. Open fences and unfinished table rows remain
 /// visible during streaming; completed block indices stay stable as the last block grows.
 @MainActor
 enum AgentResponseParser {
-    /// The parse of a streaming source up to a top-level block boundary, so the next,
-    /// longer source parses only from there. A boundary is the start of a finished line
-    /// after a blank one, outside every paragraph, list, fence and block, with nothing
-    /// before it that later text could still turn into another block (an unclosed `$$`,
-    /// `\[` or HTML tag). The source up to it, and through its line, must be unchanged.
-    struct Checkpoint {
-        fileprivate let prefix: String
-        fileprivate let line: Int
-        fileprivate let parseRawHTML: Bool
-        fileprivate let listAncestors: [Bool]
-        fileprivate let result: [AgentMarkdown.Block]
-        fileprivate let looseLists: Set<Int>
-        fileprivate let lastNumbers: [Int: Int]
-        fileprivate let blankBefore: Bool
-
-        /// Lines the next parse skips.
-        var reusedLines: Int { line }
-    }
-
     static func parse(_ source: String, parseRawHTML: Bool = true, listAncestors: [Bool] = []) -> [AgentMarkdown.Block] {
-        var none: Checkpoint?
-        return parse(source, parseRawHTML: parseRawHTML, listAncestors: listAncestors, checkpoint: &none, records: false)
+        parseInternal(source, parseRawHTML: parseRawHTML, listAncestors: listAncestors, lineOffset: 0, captureCommit: false).blocks
     }
 
-    /// Parses `source` from `checkpoint` when it still applies, and leaves in it the latest
-    /// boundary of this parse. The blocks are those `parse(_:)` returns for the same source.
-    static func parse(_ source: String, parseRawHTML: Bool = true, listAncestors: [Bool] = [],
-                      resuming checkpoint: inout Checkpoint?) -> [AgentMarkdown.Block] {
-        parse(source, parseRawHTML: parseRawHTML, listAncestors: listAncestors, checkpoint: &checkpoint, records: true)
+    struct StreamParseResult {
+        let blocks: [AgentMarkdown.Block]
+        let commitLine: Int?
+        let commitUTF8Offset: Int
+        let commitBlockCount: Int
     }
 
-    private static func parse(_ source: String, parseRawHTML: Bool, listAncestors: [Bool],
-                              checkpoint: inout Checkpoint?, records: Bool) -> [AgentMarkdown.Block] {
+    static func parseForStreaming(_ source: String, parseRawHTML: Bool, lineOffset: Int, captureCommit: Bool) -> StreamParseResult {
+        parseInternal(source, parseRawHTML: parseRawHTML, listAncestors: [], lineOffset: lineOffset, captureCommit: captureCommit)
+    }
+
+    private static func parseInternal(_ source: String, parseRawHTML: Bool, listAncestors: [Bool], lineOffset: Int, captureCommit: Bool) -> StreamParseResult {
         let input = AgentMarkdownSource(source)
         let lines = input.lines
         var result: [AgentMarkdown.Block] = []
@@ -47,16 +29,9 @@ enum AgentResponseParser {
         var looseLists: Set<Int> = []
         var lastNumbers: [Int: Int] = [:]
         var blankBefore = false
+        var commitLine: Int?
+        var commitBlockCount = 0
         var i = 0
-        if records, let saved = checkpoint, saved.parseRawHTML == parseRawHTML, saved.listAncestors == listAncestors,
-           saved.line < lines.count, source.hasPrefix(saved.prefix) {
-            result = saved.result; looseLists = saved.looseLists; lastNumbers = saved.lastNumbers
-            blankBefore = saved.blankBefore; i = saved.line
-        } else {
-            checkpoint = nil
-        }
-        var resumable = records
-        var boundary: (line: Int, count: Int, looseLists: Set<Int>, lastNumbers: [Int: Int], blankBefore: Bool)?
         func flush() {
             if !paragraph.isEmpty { result.append(.paragraph(input.join(paragraph, startingAt: paragraphStart))) }
             paragraph.removeAll(keepingCapacity: true)
@@ -66,9 +41,12 @@ enum AgentResponseParser {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.isEmpty { flush(); blankBefore = true; i += 1; continue }
             if list(line) == nil { listContexts.removeAll(keepingCapacity: true) }
-            if resumable, i > 0, i + 1 < lines.count, (checkpoint?.line ?? 0) < i, paragraph.isEmpty, listContexts.isEmpty,
-               lines[i - 1].trimmingCharacters(in: .whitespaces).isEmpty {
-                boundary = (i, result.count, looseLists, lastNumbers, blankBefore)
+            // After a blank line, a completed non-indented line outside any active list
+            // guarantees every earlier block is final and cannot be altered by later chunks.
+            if captureCommit, blankBefore, paragraph.isEmpty, listContexts.isEmpty,
+               indentation(line) < 4, i > 0, i < lines.count - 1, !result.isEmpty {
+                commitLine = i
+                commitBlockCount = result.count
             }
             if paragraph.isEmpty, indentation(line) >= 4, listContexts.isEmpty || list(line) == nil {
                 let start = i
@@ -227,11 +205,11 @@ enum AgentResponseParser {
                 while let last = listContexts.last, last.indent > entry.indent { listContexts.removeLast() }
                 if listContexts.last?.indent == entry.indent, listContexts.last?.kind != entry.kind { listContexts.removeLast() }
                 if listContexts.last?.indent != entry.indent {
-                    listContexts.append(ListContext(id: i, parentID: listContexts.last?.id, indent: entry.indent, kind: entry.kind, start: entry.number, nextNumber: entry.number))
+                    listContexts.append(ListContext(id: lineOffset + i, parentID: listContexts.last?.id, indent: entry.indent, kind: entry.kind, start: entry.number, nextNumber: entry.number))
                 }
                 let depth = max(0, listContexts.count - 1)
                 let context = listContexts[depth]
-                if blankBefore, context.id != i { looseLists.insert(context.id) }
+                if blankBefore, context.id != lineOffset + i { looseLists.insert(context.id) }
                 blankBefore = false
                 let number = listContexts[depth].nextNumber
                 if let number { listContexts[depth].nextNumber = number + 1; lastNumbers[context.id] = number }
@@ -297,19 +275,11 @@ enum AgentResponseParser {
             } else {
                 if paragraph.isEmpty { listContexts.removeAll(keepingCapacity: true); paragraphStart = i }
                 paragraph.append(line)
-                // A later line could still close this into a block: parse it again each time.
-                if trimmed.hasPrefix("<") || trimmed.hasPrefix("$$") || trimmed.hasPrefix("\\[") { resumable = false }
             }
             i += 1
         }
         flush()
-        if let boundary {
-            checkpoint = Checkpoint(prefix: input.join(Array(lines[...boundary.line]), startingAt: 0) + input.ending(after: boundary.line),
-                                    line: boundary.line, parseRawHTML: parseRawHTML, listAncestors: listAncestors,
-                                    result: Array(result[..<boundary.count]), looseLists: boundary.looseLists,
-                                    lastNumbers: boundary.lastNumbers, blankBefore: boundary.blankBefore)
-        }
-        return result.map { block in
+        let finalized: [AgentMarkdown.Block] = result.map { block in
             guard var structure = block.listStructure else { return block }
             structure.isLoose = looseLists.contains(structure.id)
             structure.lastNumber = lastNumbers[structure.id]
@@ -319,6 +289,12 @@ enum AgentResponseParser {
             default: return block
             }
         }
+        return StreamParseResult(
+            blocks: finalized,
+            commitLine: commitLine,
+            commitUTF8Offset: commitLine.map(input.utf8Offset(ofLine:)) ?? 0,
+            commitBlockCount: commitBlockCount
+        )
     }
 
     private static func matches(_ expression: String, in source: String) -> Int {
@@ -327,7 +303,7 @@ enum AgentResponseParser {
 
     private typealias Fence = AgentMarkdownFence
 
-    private static func openingFence(_ line: String) -> Fence? { Fence.opening(line) }
+    private static func openingFence(_ line: String) -> Fence? { AgentMarkdownFence.opening(line) }
 
     private static func closesFence(_ line: String, fence: Fence) -> Bool { fence.isClosed(by: line) }
 
@@ -341,7 +317,9 @@ enum AgentResponseParser {
         return String(repeating: " ", count: max(0, column - columns)) + line[index...]
     }
 
-    private static func indentation(_ line: String) -> Int { AgentMarkdownFence.indentation(line) }
+    private static func indentation(_ line: String) -> Int {
+        line.prefix { $0 == " " || $0 == "\t" }.reduce(0) { $0 + ($1 == "\t" ? 4 - $0 % 4 : 1) }
+    }
 
     private struct ListContext {
         let id: Int
@@ -515,5 +493,113 @@ enum AgentResponseParser {
             while remaining >= value { result += letters; remaining -= value }
         }
         return result
+    }
+}
+
+/// Checkpointed streaming parser: remembers finalized leading blocks across append-only
+/// updates so only the uncommitted tail is scanned, held back, and parsed on each chunk.
+@MainActor
+final class AgentStreamingParser {
+    private var parseRawHTML = true
+    private var lastSource = ""
+    private var committedUTF8Count = 0
+    private var committedLineCount = 0
+    private var committedBlocks: [AgentMarkdown.Block] = []
+    private var committedReferences: [String: String] = [:]
+    private var committedHasFootnotes = false
+    /// Count of updates that reused a committed prefix instead of parsing from byte zero.
+    private(set) var tailParseCount = 0
+    /// Byte length of the tail parsed on the most recent update.
+    private(set) var lastParsedTailBytes = 0
+
+    func reset() {
+        lastSource = ""
+        committedUTF8Count = 0
+        committedLineCount = 0
+        committedBlocks.removeAll(keepingCapacity: true)
+        committedReferences.removeAll(keepingCapacity: true)
+        committedHasFootnotes = false
+    }
+
+    func parse(_ source: String, isStreaming: Bool, parseRawHTML: Bool) -> (blocks: [AgentMarkdown.Block], references: [String: String], completedTail: Bool) {
+        if self.parseRawHTML != parseRawHTML || !matchesCommittedPrefix(source) {
+            self.parseRawHTML = parseRawHTML
+            reset()
+        }
+        lastSource = source
+        let usedCheckpoint = committedUTF8Count > 0
+        let tailStart = source.utf8.index(source.utf8.startIndex, offsetBy: committedUTF8Count)
+        let rawTail = usedCheckpoint ? String(source[tailStart...]) : source
+        let heldTail = isStreaming ? AgentStreamingCompletion.holdingBackAmbiguousTail(rawTail) : rawTail
+        lastParsedTailBytes = heldTail.utf8.count
+        if usedCheckpoint { tailParseCount += 1 }
+        let canCommit = isStreaming && !rawTail.utf8.contains(0)
+        let parsed = AgentResponseParser.parseForStreaming(heldTail, parseRawHTML: parseRawHTML, lineOffset: committedLineCount, captureCommit: canCommit)
+
+        var tailBlocks = parsed.blocks
+        if canCommit, let commitLine = parsed.commitLine, commitLine > 0, parsed.commitBlockCount > 0, parsed.commitUTF8Offset > 0 {
+            let newlyCommitted = Array(parsed.blocks[..<parsed.commitBlockCount])
+            committedBlocks.append(contentsOf: newlyCommitted)
+            let newRefs = AgentMarkdownReferences.collect(newlyCommitted, parseRawHTML: parseRawHTML)
+            for (key, value) in newRefs where committedReferences[key] == nil {
+                committedReferences[key] = value
+            }
+            if !committedHasFootnotes {
+                committedHasFootnotes = Self.containsFootnoteDefinition(newlyCommitted, parseRawHTML: parseRawHTML)
+            }
+            committedLineCount += commitLine
+            committedUTF8Count += parsed.commitUTF8Offset
+            tailBlocks = Array(parsed.blocks[parsed.commitBlockCount...])
+        }
+
+        var completedTail = false
+        if isStreaming {
+            let completed = AgentStreamingCompletion.completingLastBlock(tailBlocks)
+            completedTail = completed != tailBlocks || heldTail != rawTail
+            tailBlocks = completed
+        }
+
+        var references = committedReferences
+        let tailRefs = AgentMarkdownReferences.collect(tailBlocks, parseRawHTML: parseRawHTML)
+        for (key, value) in tailRefs where references[key] == nil {
+            references[key] = value
+        }
+
+        var allBlocks: [AgentMarkdown.Block]
+        if committedBlocks.isEmpty {
+            allBlocks = tailBlocks
+        } else {
+            allBlocks = []
+            allBlocks.reserveCapacity(committedBlocks.count + tailBlocks.count)
+            allBlocks.append(contentsOf: committedBlocks)
+            allBlocks.append(contentsOf: tailBlocks)
+        }
+
+        if committedHasFootnotes || Self.containsFootnoteDefinition(tailBlocks, parseRawHTML: parseRawHTML) {
+            allBlocks = AgentMarkdownFootnotes.prepare(allBlocks, parseRawHTML: parseRawHTML)
+        }
+        return (allBlocks, references, completedTail)
+    }
+
+    private func matchesCommittedPrefix(_ source: String) -> Bool {
+        guard committedUTF8Count > 0 else { return true }
+        guard source.utf8.count >= committedUTF8Count, lastSource.utf8.count >= committedUTF8Count else { return false }
+        return source.utf8.prefix(committedUTF8Count).elementsEqual(lastSource.utf8.prefix(committedUTF8Count))
+    }
+
+    private static func containsFootnoteDefinition(_ blocks: [AgentMarkdown.Block], parseRawHTML: Bool) -> Bool {
+        for block in blocks {
+            switch block {
+            case .footnoteDefinition:
+                return true
+            case .quote(let source), .listBlock(_, let source, _, _), .details(_, let source, _):
+                if containsFootnoteDefinition(AgentResponseParser.parse(source, parseRawHTML: parseRawHTML), parseRawHTML: parseRawHTML) {
+                    return true
+                }
+            default:
+                break
+            }
+        }
+        return false
     }
 }

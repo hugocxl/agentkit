@@ -19,6 +19,8 @@ public struct AgentLaunchContext: Sendable {
 /// layout as AgentWorkspace; existing records need no conversion.
 public final class AgentRuntimeService: @unchecked Sendable {
     let sessions: AgentSessions
+    public let providers: AgentProviderStore
+    private let usageLimitsService: AgentUsageLimitsService
     private let composer: AgentComposerContextService
     let models: AgentModelCatalogService
     private let historyStore: AgentHistory
@@ -99,6 +101,10 @@ public final class AgentRuntimeService: @unchecked Sendable {
             ownership = nil
         }
         let providerEnvironment = AgentProcess.environment().merging(environment) { _, value in value }
+        let providerStore = AgentProviderStore(url: storageDirectory.appendingPathComponent("agent-providers.json"),
+                                               environment: { AgentProcess.environment().merging(environment) { _, value in value } })
+        self.providers = providerStore
+        self.usageLimitsService = AgentUsageLimitsService(providers: { providerStore.provider(nil, kind: $0) })
         let discoveries = discoveries
         composer = AgentComposerContextService(home: home, environment: providerEnvironment,
             discoverProvider: { provider, directory in
@@ -107,9 +113,12 @@ public final class AgentRuntimeService: @unchecked Sendable {
                 return await AgentCommandDiscovery.discover(provider: provider, directory: directory,
                     environment: current, executable: executables[provider], processes: discoveries)
             }, projectDirectory: projectDirectory)
-        models = AgentModelCatalogService(home: home, executables: executables, environment: providerEnvironment,
+        let modelService = AgentModelCatalogService(home: home, executables: executables, environment: providerEnvironment,
             cacheDirectory: modelCacheDirectory ?? storageDirectory.appendingPathComponent("models"), processes: discoveries,
+            providers: { providerStore.provider($0, kind: $1) },
             projectDirectory: projectDirectory)
+        models = modelService
+        providerStore.onChange = { Task { await modelService.invalidate() } }
         historyStore = AgentHistory(home: home, environment: providerEnvironment)
         let store = historyStore
         listHistory = { store.list(directory: $0, excluding: $1) }
@@ -121,10 +130,13 @@ public final class AgentRuntimeService: @unchecked Sendable {
             return String(decoding: try encoder.encode(tools.definitions.sorted { $0.name < $1.name }), as: UTF8.self)
         }
         sessions = try AgentSessions(root: storageDirectory, projectDirectory: { try projectDirectory($0).path },
-            retention: retention, now: now, checkpoints: checkpoints, factory: { provider, directory, resume, callback in
-                AgentRuntime(provider: provider, directory: directory, resumeSession: resume,
-                             executable: executables[provider], tools: tools, onEvent: callback)
+            retention: retention, now: now, checkpoints: checkpoints, factory: { provider, directory, resume, callback -> any AgentSessionRuntime in
+                provider.spec.wire == .acp
+                    ? AcpAgentRuntime(provider: provider, directory: directory, resumeSession: resume, onEvent: callback)
+                    : AgentRuntime(provider: provider, directory: directory, resumeSession: resume,
+                                   executable: executables[provider], tools: tools, onEvent: callback)
             })
+        sessions.providers = { providerStore.provider($0, kind: $1) }
         titles.onChange = { [weak sessions] in sessions?.publishActivity() }
         if let toolSignature { sessions.applicationToolSignature = toolSignature }
         sessions.otherProvidersMayRun = { [discoveries] in discoveries.mayRun(in: $0) }
@@ -175,6 +187,9 @@ public final class AgentRuntimeService: @unchecked Sendable {
         return try await sessions.checkpoint(request)
     }
     public func modelCatalog(_ request: AgentModelCatalogRequest) async throws -> AgentModelCatalogReply { try await models.handle(request) }
+    public func usageLimits(_ request: AgentUsageLimitsRequest = .init()) async -> AgentUsageLimitsReply {
+        await usageLimitsService.handle(request)
+    }
     public func composerContext(_ request: AgentComposerContextRequest) async throws -> AgentComposerContextReply {
         guard !applicationToolsOnly else { throw ServiceError(.unsupported, "Provider commands are unavailable for application tools.") }
         return try await composer.catalog(request)

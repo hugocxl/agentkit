@@ -55,7 +55,9 @@ internal final class AgentProcess: @unchecked Sendable {
             let path = URL(fileURLWithPath: String(directory)).appendingPathComponent(name)
             if FileManager.default.isExecutableFile(atPath: path.path) { return path }
         }
-        throw AgentRuntimeError("\(name) CLI was not found. Install \(name == "claude" ? "Claude Code" : "Codex"), sign in with `\(name)`, and ensure it is on PATH (for example ~/.local/bin or /opt/homebrew/bin).")
+        let kind = AgentChatProvider.allCases.first { $0.spec.executable == name }
+        let install = " Install \(kind?.name ?? name)" + (kind?.spec.installCommand.map { " with `\($0)`," } ?? ",")
+        throw AgentRuntimeError("\(name) was not found.\(install) sign in, and make sure it is on PATH (for example ~/.local/bin or /opt/homebrew/bin).")
     }
 
     init(launch: Launch, directory: String, maxLineBytes: Int = AgentProcess.maxLineBytes,

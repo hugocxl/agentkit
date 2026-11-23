@@ -134,7 +134,7 @@ actor DemoConversation {
         switch request {
         case .create, .read: return snapshot
         case .submit(_, let prompt): start(prompt.text)
-        case .send(_, let text, _, _, _, _): start(text)
+        case .send(_, let text, _, _, _, _, _): start(text)
         case .interrupt: generation = UUID(); snapshot.status = .idle; publish()
         case .setPlan(_, let enabled): snapshot.planMode = enabled; publish()
         case .setAccess(_, let access): snapshot.accessMode = access; publish()

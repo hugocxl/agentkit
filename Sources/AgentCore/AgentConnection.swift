@@ -39,6 +39,8 @@ public struct AgentConnection: Sendable {
     public let session: SessionId
     public let project: ProjectId
     public let provider: AgentChatProvider
+    /// Which configured provider of `provider`'s kind to run, when not its built-in one.
+    public var providerID: String?
     public var capabilities: AgentCapabilities = .all
     /// The local working folder, when the backend runs on this computer.
     public var workingDirectory: URL?
@@ -55,6 +57,12 @@ public struct AgentConnection: Sendable {
     public var checkpoint: (@Sendable (AgentCheckpointRequest) async throws -> AgentCheckpointReply)?
     public var files: (@Sendable (FilesRequest) async throws -> FilesReply)?
     public var models: (@Sendable (AgentChatProvider, Bool) async throws -> [AgentModelDescriptor])?
+    /// Lists models for a specific configured provider ID; falls back to `models` when nil.
+    public var modelsForProvider: (@Sendable (AgentChatProvider, String?, Bool) async throws -> [AgentModelDescriptor])?
+    /// The backend's configured providers and their last health checks.
+    public var providers: (@Sendable () async throws -> AgentProvidersState)?
+    /// Subscription usage limits for signed-in providers.
+    public var usageLimits: (@Sendable (AgentUsageLimitsRequest) async throws -> AgentUsageLimitsReply)?
     public var history: (@Sendable () async throws -> AgentHistoryReply)?
     public var importHistory: (@Sendable (AgentHistoryEntry, SessionId) async throws -> AgentChatSnapshot)?
     public var composerContext: (@Sendable (AgentChatProvider) async throws -> AgentComposerContextReply)?

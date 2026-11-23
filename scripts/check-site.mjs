@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { JSDOM } from "jsdom";
 
 const site = "_site";
-const pages = ["index.html", "docs.html"];
+const pages = ["index.html", "docs.html", "commands.html", "validation.html", "changelog.html"];
 const docs = new Map(pages.map((name) => [name, new JSDOM(readFileSync(`${site}/${name}`, "utf8")).window.document]));
 const version = readFileSync("Sources/AgentCore/AgentKitVersion.swift", "utf8").match(/current = "([^"]+)"/)[1];
 const local = (href) => !/^(https?:|mailto:|data:)/.test(href);
@@ -68,7 +68,7 @@ for (const name of pages) {
   assert.deepEqual(linkList(doc.querySelector(".ds-masthead")), [
     "AgentKit ./",
     "Docs docs.html",
-    "Changelog https://github.com/hugocxl/agentkit/blob/main/CHANGELOG.md",
+    "Changelog changelog.html",
     "GitHub https://github.com/hugocxl/agentkit",
   ]);
   assert.ok(doc.querySelector('.ds-masthead > button.ds-theme[data-ds-theme][aria-label] > svg.ds-icon[data-icon="contrast"]'), `${name}: theme button`);
@@ -139,6 +139,22 @@ for (const id of ["install", "build-an-ai-first-app", "connect-your-app", "own-t
   assert.ok(docsPage.getElementById(id), `docs: #${id}`);
 }
 assert.match(docsPage.body.textContent, new RegExp(`from: "${version.replaceAll(".", "\\.")}"`), "docs install version");
+assert.ok(docsPage.getElementById("choose-providers"), "docs: #choose-providers");
+
+// commands, validation, changelog: masthead title meta? section+ footer
+for (const name of ["commands.html", "validation.html", "changelog.html"]) {
+  assert.match(sequence(name), /^title( meta)? section( section)*$/, `${name} order: ${sequence(name)}`);
+  assert.equal(docs.get(name).querySelectorAll(".ds-accent").length, 0, `${name}: no accent`);
+}
+assert.ok(docs.get("commands.html").querySelectorAll(".ds-section > h2").length >= 4, "commands sections");
+// The changelog starts with the package's version, and every release has its own anchor.
+const releases = [...docs.get("changelog.html").querySelectorAll(".ds-section[id]")];
+assert.equal(releases[0]?.id, `v${version.replaceAll(".", "-")}`, "changelog starts with the current version");
+assert.equal(releases.length, (readFileSync("CHANGELOG.md", "utf8").match(/^## /gm) ?? []).length, "changelog releases");
+// Docs links to the other Markdown files stay on the site.
+for (const a of docsPage.querySelectorAll("a[href]")) {
+  assert.doesNotMatch(a.getAttribute("href"), /\/(commands|VALIDATION|CHANGELOG)\.md/, `docs: ${a.getAttribute("href")} should link to its page`);
+}
 
 // Site CSS stays inside the design system's tokens.
 const css = readFileSync("website/site.css", "utf8").replace(/\/\*[\s\S]*?\*\//g, "");

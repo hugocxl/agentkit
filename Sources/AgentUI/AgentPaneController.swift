@@ -18,7 +18,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     }
     /// The provider's logo, as a terminal running the same agent shows it.
     var icon: NSImage? {
-        AgentLogo.image(for: selection.provider == .claude ? .claude : .codex, theme: surface.theme)
+        AgentLogo.image(for: selection.provider, theme: surface.theme)
     }
     /// Keeps the pane's saved title in step with the conversation, for the
     /// tab title, sidebar filter and palette.
@@ -35,7 +35,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     private var initialPreferences: AgentComposerPreferences?
     private var savePreferences: ((AgentComposerPreferences?) -> Void)?
     private func persistSelection(access: AgentAccessMode? = nil) {
-        savePreferences?(.init(provider: selection.provider, model: selection.model,
+        savePreferences?(.init(provider: selection.provider, providerID: selection.providerID, model: selection.model,
                                effort: reasoningEffort, access: access ?? snapshot?.accessMode))
     }
     var confirmClose: (() async -> Bool)?
@@ -107,12 +107,15 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     var created = false
     private(set) var disposed = false
     private var selectionEdited = false
-    var submitting = false
+    var submitting = false {
+        didSet { if submitting != oldValue { onSubmittingChange?() } }
+    }
+    var onSubmittingChange: (() -> Void)?
     private var stopRequested = false
     private(set) var selection: AgentModelSelection {
         didSet { if selection.provider != oldValue.provider { onProviderChange?() } }
     }
-    /// Tells the sidebar, whose card shows the provider's logo, that the
+    /// Tells the host, whose card shows the provider's logo, that the
     /// composer switched providers.
     var onProviderChange: (() -> Void)?
     private(set) var reasoningEffort: AgentReasoningEffort?
@@ -120,8 +123,10 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     private struct PickerState: Equatable {
         var selection: AgentModelSelection
         var effort: AgentReasoningEffort?
-        var lockedProvider: AgentChatProvider?
+        var lockedProvider: String?
         var resolvedModel: String?
+        var providers: [AgentProviderConfig]
+        var health: [String: AgentProviderHealth]
     }
     var connectionGeneration: UInt64 = 0
     var needsAuthoritativeSnapshot = false
@@ -144,10 +149,23 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     private var previewedAttachment: String?
     private lazy var composerCoordinator = AgentComposerCoordinator(surface: surface)
     var loadModelCatalog: ((AgentChatProvider, Bool) async throws -> [AgentModelDescriptor])?
-    private var modelCatalogs: [AgentChatProvider: [AgentModelDescriptor]] = [:]
+    /// A provider's models as its menu offers them: the user's order, hidden ones left out.
+    var loadProviderModelCatalog: ((AgentProviderConfig, Bool) async throws -> [AgentModelDescriptor])?
+    /// The backend's providers with their last checks.
+    var loadProviders: (() async throws -> AgentProvidersState)?
+    /// Runs a command, such as a provider's sign-in, in a terminal.
+    var openTerminal: ((String) -> Void)?
+    /// The providers the model menu offers.
+    private var providers = AgentProviderSettings().providers
+    /// What each provider's last check found, by provider ID.
+    private var providerHealth: [String: AgentProviderHealth] = [:]
+    /// The unavailable provider and reason the composer last warned about, so it warns once.
+    private var announcedUnavailable: String?
+    /// Each provider's models, by provider ID.
+    private var modelCatalogs: [String: [AgentModelDescriptor]] = [:]
     private var modelCatalogTask: Task<Void, Never>?
     private var modelCatalogLoadedAt = Date.distantPast
-    private var unavailableModelCatalogs = Set<AgentChatProvider>()
+    private var unavailableModelCatalogs = Set<String>()
     private var modelMenuOpen = false
 
     func restorePreferences(defaults: AgentComposerPreferences?, draft: AgentComposerPreferences?,
@@ -155,7 +173,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         initialPreferences = draft ?? defaults
         savePreferences = save
         if let draft {
-            selection = AgentModelSelection(provider: draft.provider, model: draft.model)
+            selection = AgentModelSelection(provider: draft.provider, providerID: draft.providerID, model: draft.model)
             reasoningEffort = draft.effort
             selectionEdited = true
         }
@@ -1155,7 +1173,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
             guard capabilities.contains(.providerCommands) else {
                 showComposerError("Provider commands are unavailable in this conversation."); return
             }
-            let provider = selection.provider == .claude ? AgentCore.AgentChatProvider.claude : .codex
+            let provider = selection.provider
             let names = composerCoordinator.providerCommands + composerCoordinator.providerDescriptors.flatMap(\.names)
             if let error = command.validationError(provider: provider, commands: names,
                                                     hasAttachments: !draftAttachments.isEmpty, descriptors: composerCoordinator.providerDescriptors) {
@@ -1167,10 +1185,12 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         }
         let attachments = draftAttachments.map { AgentChatAttachment(id: $0.id, name: $0.name, mimeType: $0.mimeType, data: $0.data) }
         let sentIDs = Set(attachments.map(\.id))
+        // The message shows these bytes at once, never downloading them back from the backend.
+        attachmentCache.seed(attachments)
         composerCoordinator.dismiss()
         surface.scrollToEnd()
         var prompt = AgentPrompt(text: text, model: selection.model, effort: reasoningEffort,
-                                 provider: selection.provider, planMode: snapshot?.planMode == true, attachments: attachments)
+                                 provider: selection.provider, providerID: selection.providerKey, planMode: snapshot?.planMode == true, attachments: attachments)
         // A reconnect may update the displayed model or mode after acceptance.
         // Keep the original delivery identity until the user edits the payload or settings.
         if let previous = lastSubmission, previous.text == text, previous.attachments == attachments {
@@ -1836,6 +1856,8 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         if needsAuthoritativeSnapshot {
             guard authoritative else { return }
             needsAuthoritativeSnapshot = false
+            // Previews that failed while the backend was away load now that it's back.
+            surface.transcript.retryFailedAttachments()
         } else {
             guard result.revision >= (snapshot?.revision ?? 0) else { return }
         }
@@ -1858,12 +1880,13 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         authoritativeProject = result.project
         surface.citationEnvironmentId = result.project.description
         errorMessage = nil
-        if !selectionEdited || (result.providerSession != nil && selection.provider != result.provider) {
-            selection = AgentModelSelection(provider: result.provider, model: result.model)
+        if !selectionEdited || (result.providerSession != nil && selection.providerKey != Self.providerKey(result)) {
+            selection = AgentModelSelection(provider: result.provider, providerID: result.providerID, model: result.model)
             reasoningEffort = result.reasoningEffort
             selectionEdited = false
         }
-        surface.render(displayed(result), itemsUnchanged: itemsUnchanged)
+        let shown = displayed(result)
+        surface.render(shown, itemsUnchanged: itemsUnchanged, unchangedLead: earlierTimeline.unchangedLead)
         announceTransitions(result)
         for (toolUseID, window) in subagentWindows {
             if let agent = result.subagents?.first(where: { $0.toolUseID == toolUseID }) { window.update(agent) }
@@ -1974,6 +1997,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         updateSelectionMenus()
         surface.setApprovalsEnabled(!approvalInFlight && commandTask == nil && !disposed && !needsAuthoritativeSnapshot)
         surface.feedback.stringValue = errorMessage ?? notice?.text ?? statusText
+        surface.noticeTone = noticeTone
         surface.feedback.toolTip = surface.feedback.stringValue
         surface.feedback.setAccessibilityValue(surface.feedback.stringValue)
         surface.retry.isHidden = errorMessage == nil
@@ -2025,6 +2049,26 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         dictation = final ? nil : (NSRange(location: range.location, length: (replacement as NSString).length), replacement)
         saveDraft()
         updateControls()
+    }
+
+    /// The tone of what the notice card shows: an error, the notice, or else the status.
+    private var noticeTone: AgentPaneView.NoticeTone {
+        if errorMessage != nil { return .danger }
+        if let notice {
+            switch notice.kind {
+            case .warning: return .warning
+            case .info: return .info
+            }
+        }
+        if voice.state == .authorizing || preparingAttachments > 0 || historyTask != nil || needsAuthoritativeSnapshot { return .progress }
+        if voice.state == .listening { return .info }
+        switch snapshot?.status {
+        case nil: return .progress
+        case .failed:
+            if usageLimit != nil { return .warning }
+            return snapshot?.turns?.last?.outcome == .interrupted ? .warning : .danger
+        default: return .info
+        }
     }
 
     private var statusText: String {
@@ -2083,12 +2127,12 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     }
 
     private var selectedModelDescriptor: AgentModelDescriptor? {
-        descriptor(for: AgentModelSelection(provider: selection.provider, model: effectiveModel))
+        descriptor(for: AgentModelSelection(provider: selection.provider, providerID: selection.providerID, model: effectiveModel))
     }
 
     private func descriptor(for choice: AgentModelSelection) -> AgentModelDescriptor? {
         guard let model = choice.model else { return nil }
-        let models = modelCatalogs[choice.provider] ?? []
+        let models = modelCatalogs[choice.providerKey] ?? []
         return models.first { $0.id == model } ?? models.first { $0.resolvedModel == model }
     }
 
@@ -2097,24 +2141,34 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     }
 
     private func refreshModelCatalog(force: Bool = false) {
+        let loader: ((AgentProviderConfig, Bool) async throws -> [AgentModelDescriptor])? = loadProviderModelCatalog
+            ?? loadModelCatalog.map { fn in { config, force in try await fn(config.kind, force) } }
         guard modelCatalogTask == nil, force || Date().timeIntervalSince(modelCatalogLoadedAt) > 60,
-              let loadModelCatalog else { return }
+              let loader else { return }
         modelCatalogLoadedAt = Date()
         let generation = connectionGeneration
         modelCatalogTask = Task { [weak self] in
             guard let self else { return }
             defer { if generation == self.connectionGeneration { self.modelCatalogTask = nil } }
-            for provider in AgentChatProvider.allCases {
+            if let state = try? await self.loadProviders?() {
+                guard !Task.isCancelled, !self.disposed, generation == self.connectionGeneration else { return }
+                self.providers = state.settings.providers
+                self.providerHealth = Dictionary(state.health.map { ($0.provider, $0) }, uniquingKeysWith: { _, last in last })
+                self.menuState = nil
+                self.updateControls()
+                self.warnIfUnavailable()
+            }
+            for provider in self.menuProviders {
                 do {
-                    let models = try await loadModelCatalog(provider, force)
+                    let models = try await loader(provider, force)
                     guard !Task.isCancelled, !self.disposed, generation == self.connectionGeneration else { return }
-                    self.modelCatalogs[provider] = models
-                    self.unavailableModelCatalogs.remove(provider)
+                    self.modelCatalogs[provider.id] = models
+                    self.unavailableModelCatalogs.remove(provider.id)
                     self.menuState = nil
                     self.updateControls()
                 } catch {
                     guard !Task.isCancelled, !self.disposed, generation == self.connectionGeneration else { return }
-                    self.unavailableModelCatalogs.insert(provider)
+                    self.unavailableModelCatalogs.insert(provider.id)
                     self.menuState = nil
                     self.updateControls()
                 }
@@ -2124,7 +2178,43 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
 
     var effectiveModel: String? {
         selection.model ?? (selection.provider == snapshot?.provider ? snapshot?.resolvedModel : nil)
-            ?? modelCatalogs[selection.provider]?.first(where: \.isDefault)?.id
+            ?? modelCatalogs[selection.providerKey]?.first(where: \.isDefault)?.id
+    }
+
+    /// The providers the model menu lists: the enabled ones whose CLI was found, and the
+    /// chosen one even when turned off or missing.
+    private var menuProviders: [AgentProviderConfig] {
+        providers.filter { ($0.enabled && providerHealth[$0.id]?.installed != false) || $0.id == selection.providerKey }
+    }
+
+    /// Why a provider can't start a conversation now, as its last check found.
+    private func unavailability(_ config: AgentProviderConfig) -> AgentProviderUnavailability? {
+        AgentProviderUnavailability(config, health: providerHealth[config.id])
+    }
+
+    /// Warns in the composer, once, that the chosen provider can't run, as a new
+    /// conversation would otherwise fail only after a prompt is sent.
+    private func warnIfUnavailable() {
+        let config = providerConfig(selection.providerKey, kind: selection.provider)
+        guard canChangeProvider, let reason = unavailability(config) else { return }
+        let key = config.id + "\n" + reason.detail
+        guard announcedUnavailable != key else { return }
+        announcedUnavailable = key
+        showNotice(reason.detail, kind: .warning)
+    }
+
+    private func providerConfig(_ key: String, kind: AgentChatProvider) -> AgentProviderConfig {
+        providers.first { $0.id == key && $0.kind == kind } ?? .builtIn(kind)
+    }
+
+    /// The conversation's provider ID, a built-in one's being its kind's name.
+    private static func providerKey(_ snapshot: AgentChatSnapshot) -> String {
+        snapshot.providerID ?? snapshot.provider.rawValue
+    }
+
+    /// Whether `key` is the provider the conversation already runs.
+    private func isCurrentProvider(_ key: String) -> Bool {
+        snapshot.map { Self.providerKey($0) == key } ?? false
     }
 
     /// Provider conversations cannot be resumed by a different provider.
@@ -2166,13 +2256,14 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         return await present(alert, on: window) == .alertFirstButtonReturn
     }
 
-    func selectModel(provider: AgentChatProvider, model: String?) {
+    func selectModel(provider: AgentChatProvider, providerID: String? = nil, model: String?) {
         // A picker opened while idle can finish during reconnection. Keep that
         // choice as a local draft until an authoritative snapshot arrives.
+        let key = providerID ?? (provider == selection.provider ? selection.providerKey : provider.rawValue)
         guard canEditSelection,
-              canChangeProvider || provider == snapshot?.provider else { return }
+              canChangeProvider || isCurrentProvider(key) else { return }
         let trimmed = model?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let chosen = AgentModelSelection(provider: provider, model: trimmed?.isEmpty == false ? trimmed : nil)
+        let chosen = AgentModelSelection(provider: provider, providerID: key, model: trimmed?.isEmpty == false ? trimmed : nil)
         guard chosen != selection else { return applyModel(chosen) }
         confirmingRestart { [weak self] in self?.applyModel(chosen) }
     }
@@ -2207,12 +2298,17 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     @objc private func modelSelected(_ sender: Any?) {
         guard let item = (sender as? NSMenuItem) ?? surface.model.selectedItem else { return }
         if let value = item.representedObject as? AgentModelSelection {
-            selectModel(provider: value.provider, model: value.model)
+            selectModel(provider: value.provider, providerID: value.providerKey, model: value.model)
         } else if item.representedObject as? String == "refresh-models" {
             modelCatalogLoadedAt = .distantPast
             menuState = nil
             refreshModelCatalog(force: true)
         }
+    }
+
+    @objc private func signInSelected(_ sender: NSMenuItem) {
+        guard let command = sender.representedObject as? String else { return }
+        openTerminal?(command)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -2239,30 +2335,51 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     private func updateSelectionMenus() {
         guard !modelMenuOpen else { return }
         let state = PickerState(selection: selection, effort: reasoningEffort,
-                                lockedProvider: canChangeProvider ? nil : snapshot?.provider,
-                                resolvedModel: effectiveModel)
+                                lockedProvider: canChangeProvider ? nil : snapshot.map(Self.providerKey),
+                                resolvedModel: effectiveModel, providers: menuProviders, health: providerHealth)
         guard menuState != state else { return }
         menuState = state
-        let displayedSelection = AgentModelSelection(provider: selection.provider, model: effectiveModel)
+        let displayedSelection = AgentModelSelection(provider: selection.provider, providerID: selection.providerID, model: effectiveModel)
         let menu = NSMenu()
         menu.delegate = self
-        var menuLogos: [Int: AgentChatProvider] = [:]
+        var menuLogos: [Int: AgentProviderConfig] = [:]
         menu.autoenablesItems = false
-        for provider in AgentChatProvider.allCases {
-            let heading = NSMenuItem(title: provider.name, action: nil, keyEquivalent: "")
-            let models = NSMenu(title: provider.name)
+        for config in menuProviders {
+            let provider = config.kind
+            let key = config.id
+            let heading = NSMenuItem(title: config.title, action: nil, keyEquivalent: "")
+            let models = NSMenu(title: config.title)
             models.autoenablesItems = false
             heading.submenu = models
-            heading.state = selection.provider == provider ? .on : .off
-            menuLogos[menu.items.count] = provider == .claude ? .claude : .codex
+            heading.state = selection.providerKey == key ? .on : .off
+            let unavailable = config.enabled ? unavailability(config) : nil
+            if !config.enabled { heading.toolTip = "\(config.title): Disabled." }
+            if let unavailable {
+                heading.toolTip = unavailable.detail
+                heading.badge = NSMenuItemBadge(string: unavailable.badge)
+                let reason = NSMenuItem(title: unavailable.reason, action: nil, keyEquivalent: "")
+                reason.isEnabled = false
+                reason.toolTip = unavailable.detail
+                models.addItem(reason)
+                if let command = unavailable.signInCommand, openTerminal != nil {
+                    let signIn = NSMenuItem(title: "Sign In in a Terminal…", action: #selector(signInSelected(_:)), keyEquivalent: "")
+                    signIn.target = self
+                    signIn.representedObject = command
+                    signIn.toolTip = "Runs \(command)"
+                    models.addItem(signIn)
+                }
+                models.addItem(.separator())
+            }
+            menuLogos[menu.items.count] = config
             menu.addItem(heading)
-            var choices = (modelCatalogs[provider] ?? []).map { AgentModelSelection(provider: provider, model: $0.id) }
+            var choices = (modelCatalogs[key] ?? []).map { AgentModelSelection(provider: provider, providerID: key, model: $0.id) }
             let shownModel = descriptor(for: displayedSelection)
-            if displayedSelection.provider == provider && displayedSelection.model != nil && shownModel == nil {
+            if displayedSelection.providerKey == key && displayedSelection.model != nil && shownModel == nil {
                 choices.append(displayedSelection)
             }
             if choices.isEmpty {
-                let title = unavailableModelCatalogs.contains(provider) ? "Models unavailable" : modelCatalogs[provider] == nil ? "Loading models…" : "No models reported"
+                let title = !config.enabled ? "Turned off" : unavailableModelCatalogs.contains(key) ? "Models unavailable"
+                    : modelCatalogs[key] == nil ? "Loading models…" : "No models reported"
                 let status = NSMenuItem(title: title, action: nil, keyEquivalent: "")
                 status.isEnabled = false
                 models.addItem(status)
@@ -2272,12 +2389,15 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
                 item.representedObject = choice
                 item.target = self
                 item.action = #selector(modelSelected(_:))
-                let current = selectedModelDescriptor.map { AgentModelSelection(provider: selection.provider, model: $0.id) } ?? displayedSelection
+                let current = selectedModelDescriptor.map {
+                    AgentModelSelection(provider: selection.provider, providerID: selection.providerID, model: $0.id)
+                } ?? displayedSelection
                 item.state = choice == current ? .on : .off
                 let reported = descriptor(for: choice) != nil
-                item.isEnabled = reported && (canChangeProvider || provider == snapshot?.provider)
+                item.isEnabled = reported && (canChangeProvider || isCurrentProvider(key))
+                    && ((config.enabled && unavailable == nil) || isCurrentProvider(key))
                 item.toolTip = !reported ? "Current model is not listed in the provider catalog."
-                    : item.isEnabled ? choice.model : "Open a new agent pane to use another provider."
+                    : unavailable.map { $0.detail } ?? (item.isEnabled ? choice.model : "Open a new conversation to use another provider.")
                 models.addItem(item)
             }
         }
@@ -2287,11 +2407,11 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         menu.addItem(refreshModels)
         surface.model.menu = menu
         surface.model.menuLogos = menuLogos
-        surface.model.providerLogo = selection.provider == .claude ? .claude : .codex
+        surface.model.providerLogo = selection.provider
         surface.model.select(nil)
         surface.model.displayedTitle = modelTitle(displayedSelection)
         surface.model.icon = selection.provider == .claude ? .sparkles : .cpu
-        surface.model.toolTip = "Model · \(selection.provider.name). Changes apply to the next message."
+        surface.model.toolTip = "Model · \(providerConfig(selection.providerKey, kind: selection.provider).title). Changes apply to the next message."
 
         surface.effort.removeAllItems()
         surface.effort.addItem(withTitle: selectedModelDescriptor?.reasoningEfforts.isEmpty == true ? "Off" : "Auto")
@@ -2476,6 +2596,16 @@ extension AgentPaneController {
             }
         }
         loadModelCatalog = connection.models
+        if let modelsForProvider = connection.modelsForProvider {
+            loadProviderModelCatalog = { config, force in
+                try await modelsForProvider(config.kind, config.id, force)
+            }
+        }
+        loadProviders = connection.providers
+        openTerminal = host.runCommand
+        if let providerID = connection.providerID {
+            selection = AgentModelSelection(provider: connection.provider, providerID: providerID, model: selection.model)
+        }
         loadHistory = connection.history
         importHistory = connection.importHistory
         library = connection.library

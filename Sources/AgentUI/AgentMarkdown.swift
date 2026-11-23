@@ -1,5 +1,7 @@
 import AgentCore
 import AppKit
+import QuartzCore
+import AgentCore
 
 /// Small native Markdown presentation layer. Foundation handles inline syntax; block structure
 /// supplies readable typography with a sanitized inline-HTML subset and no executable link
@@ -250,18 +252,26 @@ enum AgentMarkdown {
             return plain
         }
         let result = NSMutableAttributedString(string: "")
-        var lastThreadChip: String?
+        var lastChip: String?
         for (runIndex, run) in parsed.runs.enumerated() {
             if let url = run.link, let thread = AgentThreadLink(url.absoluteString) {
                 // One chip per link, even when emphasis splits its label into several runs.
-                guard url.absoluteString != lastThreadChip else { continue }
-                lastThreadChip = url.absoluteString
+                guard url.absoluteString != lastChip else { continue }
+                lastChip = url.absoluteString
                 let label = String(parsed[run.range].characters)
                 result.append(AgentThreadLink.chip(thread, title: thread.chipTitle(label: label, knownTitle: nil), font: font,
                                                    color: colors.link, background: colors.link.withAlphaComponent(0.12), identity: "thread:\(runIndex)"))
                 continue
             }
-            lastThreadChip = nil
+            if let url = run.link, let citation = AgentAssistantCitation.parse(url.absoluteString) {
+                // A sent quotation shows the quoted words, as it did in the composer.
+                guard url.absoluteString != lastChip else { continue }
+                lastChip = url.absoluteString
+                result.append(AgentComposerCitation.chip(citation, font: font, color: colors.link,
+                                                         background: colors.link.withAlphaComponent(0.12), identity: "citation:\(runIndex)"))
+                continue
+            }
+            lastChip = nil
             let intent = run.inlinePresentationIntent ?? []
             let inheritedWeight = (font.fontDescriptor.object(forKey: .traits) as? [NSFontDescriptor.TraitKey: Any])?[.weight] as? NSNumber
             var runFont = intent.contains(.code)
@@ -398,12 +408,21 @@ extension NSAttributedString.Key {
 
 /// Draw a single full-width surface around each fenced block, including wrapped lines.
 private final class AgentTextLayoutManager: NSLayoutManager, NSLayoutManagerDelegate {
+    struct FadeSpan {
+        let range: NSRange
+        let startTime: CFTimeInterval
+    }
+
+    static let fadeDuration: CFTimeInterval = 0.14
+
     /// Off while the text streams, so half-written link hosts are never looked up.
     var fetchesFavicons = true
     /// The theme branded link icons are drawn in: the conversation's.
     var iconTheme: AgentTheme?
     /// Where link icons come from; tests stand in their own.
     var favicons: AgentLinkFavicon?
+    /// Newly streamed character ranges currently fading in; empty when idle.
+    private(set) var activeFades: [FadeSpan] = []
     override init() {
         super.init()
         // Rich-text rows ensure layout when measured. Background TextKit work
@@ -412,6 +431,48 @@ private final class AgentTextLayoutManager: NSLayoutManager, NSLayoutManagerDele
         delegate = self
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    func addFade(range: NSRange, now: CFTimeInterval = CACurrentMediaTime()) {
+        guard range.length > 0 else { return }
+        activeFades.removeAll { now - $0.startTime >= Self.fadeDuration || $0.range.location >= range.location }
+        for index in activeFades.indices where NSMaxRange(activeFades[index].range) > range.location {
+            let clamped = NSRange(location: activeFades[index].range.location, length: range.location - activeFades[index].range.location)
+            activeFades[index] = FadeSpan(range: clamped, startTime: activeFades[index].startTime)
+        }
+        activeFades.removeAll { $0.range.length <= 0 }
+        activeFades.append(FadeSpan(range: range, startTime: now))
+    }
+
+    func clearFades() {
+        activeFades.removeAll(keepingCapacity: false)
+    }
+
+    @discardableResult
+    func pruneExpiredFades(now: CFTimeInterval = CACurrentMediaTime()) -> Bool {
+        activeFades.removeAll { now - $0.startTime >= Self.fadeDuration }
+        return !activeFades.isEmpty
+    }
+
+    func fadeDirtyRect(in container: NSTextContainer, origin: NSPoint) -> NSRect? {
+        guard let storage = textStorage, !activeFades.isEmpty else { return nil }
+        let length = storage.length
+        var union: NSRect?
+        for span in activeFades {
+            let clamped = NSIntersectionRange(span.range, NSRange(location: 0, length: length))
+            guard clamped.length > 0 else { continue }
+            let glyphs = glyphRange(forCharacterRange: clamped, actualCharacterRange: nil)
+            guard glyphs.length > 0 else { continue }
+            let rect = boundingRect(forGlyphRange: glyphs, in: container).offsetBy(dx: origin.x, dy: origin.y).insetBy(dx: -2, dy: -2)
+            union = union?.union(rect) ?? rect
+        }
+        return union
+    }
+
+    private func alpha(for span: FadeSpan, now: CFTimeInterval) -> CGFloat {
+        let progress = max(0, min(1, (now - span.startTime) / Self.fadeDuration))
+        let eased = 1 - (1 - progress) * (1 - progress)
+        return CGFloat(0.15 + 0.85 * eased)
+    }
 
     func layoutManager(_ layoutManager: NSLayoutManager, shouldGenerateGlyphs glyphs: UnsafePointer<CGGlyph>,
                        properties props: UnsafePointer<NSLayoutManager.GlyphProperty>, characterIndexes indexes: UnsafePointer<Int>,
@@ -506,7 +567,11 @@ private final class AgentTextLayoutManager: NSLayoutManager, NSLayoutManagerDele
     }
 
     override func drawGlyphs(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
-        super.drawGlyphs(forGlyphRange: glyphsToShow, at: origin)
+        if activeFades.isEmpty {
+            super.drawGlyphs(forGlyphRange: glyphsToShow, at: origin)
+        } else {
+            drawGlyphsWithFades(forGlyphRange: glyphsToShow, at: origin)
+        }
         guard let textStorage else { return }
         let visible = characterRange(forGlyphRange: glyphsToShow, actualGlyphRange: nil)
         for key in [NSAttributedString.Key.agentExternalLinkGroup, .agentInlineCodeBoundary] {
@@ -570,6 +635,40 @@ private final class AgentTextLayoutManager: NSLayoutManager, NSLayoutManagerDele
                     y: origin.y + fragment.minY + (style?.paragraphSpacingBefore ?? 0) + AgentTaskCheckbox.top,
                     width: AgentTaskCheckbox.size, height: AgentTaskCheckbox.size))
             }
+        }
+    }
+
+    private func drawGlyphsWithFades(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
+        let now = CACurrentMediaTime()
+        guard pruneExpiredFades(now: now), let storage = textStorage, storage.length > 0 else {
+            super.drawGlyphs(forGlyphRange: glyphsToShow, at: origin)
+            return
+        }
+        let maxGlyph = NSMaxRange(glyphsToShow)
+        var cursor = glyphsToShow.location
+        for span in activeFades {
+            let clamped = NSIntersectionRange(span.range, NSRange(location: 0, length: storage.length))
+            guard clamped.length > 0 else { continue }
+            let fadeGlyphs = NSIntersectionRange(glyphRange(forCharacterRange: clamped, actualCharacterRange: nil), glyphsToShow)
+            guard fadeGlyphs.length > 0, NSMaxRange(fadeGlyphs) > cursor else { continue }
+            let start = max(cursor, fadeGlyphs.location)
+            if start > cursor {
+                super.drawGlyphs(forGlyphRange: NSRange(location: cursor, length: start - cursor), at: origin)
+            }
+            let segment = NSRange(location: start, length: NSMaxRange(fadeGlyphs) - start)
+            let segmentAlpha = alpha(for: span, now: now)
+            if segmentAlpha < 0.999, let context = NSGraphicsContext.current?.cgContext {
+                context.saveGState()
+                context.setAlpha(segmentAlpha)
+                super.drawGlyphs(forGlyphRange: segment, at: origin)
+                context.restoreGState()
+            } else {
+                super.drawGlyphs(forGlyphRange: segment, at: origin)
+            }
+            cursor = NSMaxRange(segment)
+        }
+        if cursor < maxGlyph {
+            super.drawGlyphs(forGlyphRange: NSRange(location: cursor, length: maxGlyph - cursor), at: origin)
         }
     }
 
@@ -730,6 +829,7 @@ final class AgentRichTextView: NSTextView {
         }
         super.init(frame: frameRect, textContainer: resolved)
         isEditable = false
+        unregisterDraggedTypes()
         isSelectable = true
         isRichText = true
         drawsBackground = false
@@ -829,10 +929,16 @@ final class AgentRichTextView: NSTextView {
     /// What was last set, before the text storage fixed its attributes (such as giving a
     /// font to a bare line break), so the next content compares like with like.
     private var lastContent: NSAttributedString?
+    /// Gently fades newly appended characters while streaming; respects Reduce Motion.
+    var fadesStreamedTokens = false
+    private var fadeDisplayLink: CADisplayLink?
+    var hasActiveTokenFades: Bool { (layoutManager as? AgentTextLayoutManager)?.activeFades.isEmpty == false }
 
     func setContent(_ content: NSAttributedString) {
         guard let storage = textStorage, lastContent?.isEqual(to: content) != true, !storage.isEqual(to: content) else { return }
         let selection = selectedRanges
+        let oldLength = storage.length
+        let oldString = fadesStreamedTokens ? (storage.string as NSString) : nil
         // Streaming changes the end; replacing only that keeps the earlier lines' layout.
         let unchanged = lastContent.map { $0.length == storage.length ? Self.unchangedParagraphs($0, content) : 0 } ?? 0
         lastContent = content.copy() as? NSAttributedString
@@ -845,6 +951,74 @@ final class AgentRichTextView: NSTextView {
             let range = value.rangeValue
             return NSValue(range: NSRange(location: min(range.location, length), length: min(range.length, max(0, length - range.location))))
         }
+        if fadesStreamedTokens, length > oldLength {
+            let fadeStart: Int
+            if let oldString, oldLength > 0 {
+                fadeStart = Self.commonPrefixLength(oldString, content.string as NSString, startingAt: unchanged)
+            } else {
+                fadeStart = 0
+            }
+            if fadeStart < length {
+                scheduleTokenFade(for: NSRange(location: fadeStart, length: length - fadeStart))
+            }
+        } else if !fadesStreamedTokens || unchanged == 0 {
+            stopTokenFades()
+        }
+    }
+
+    /// Replaces the text storage from `location` to the end without rebuilding the prefix.
+    func replaceTail(from location: Int, with tail: NSAttributedString, fadeFrom: Int? = nil) {
+        guard let storage = textStorage, location >= 0, location <= storage.length else { return }
+        let selection = selectedRanges
+        lastContent = nil
+        storage.replaceCharacters(in: NSRange(location: location, length: storage.length - location), with: tail)
+        let length = storage.length
+        selectedRanges = selection.map { value in
+            let range = value.rangeValue
+            return NSValue(range: NSRange(location: min(range.location, length), length: min(range.length, max(0, length - range.location))))
+        }
+        if fadesStreamedTokens, let fadeFrom, fadeFrom < length {
+            scheduleTokenFade(for: NSRange(location: fadeFrom, length: length - fadeFrom))
+        }
+    }
+
+    private func scheduleTokenFade(for range: NSRange) {
+        guard range.length > 0, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+              let manager = layoutManager as? AgentTextLayoutManager else { return }
+        manager.addFade(range: range)
+        guard window != nil, fadeDisplayLink == nil else { return }
+        let proxy = DisplayLinkProxy(owner: self)
+        let link = displayLink(target: proxy, selector: #selector(DisplayLinkProxy.step(_:)))
+        link.add(to: .main, forMode: .common)
+        fadeDisplayLink = link
+    }
+
+    fileprivate func stepTokenFades() {
+        guard let manager = layoutManager as? AgentTextLayoutManager else {
+            stopTokenFades()
+            return
+        }
+        let dirty = textContainer.flatMap { manager.fadeDirtyRect(in: $0, origin: textContainerOrigin) }
+        let hasRemaining = manager.pruneExpiredFades()
+        if let dirty { setNeedsDisplay(dirty) } else { needsDisplay = true }
+        if !hasRemaining { stopDisplayLink() }
+    }
+
+    private func stopDisplayLink() {
+        fadeDisplayLink?.invalidate()
+        fadeDisplayLink = nil
+    }
+
+    private func stopTokenFades() {
+        stopDisplayLink()
+        (layoutManager as? AgentTextLayoutManager)?.clearFades()
+    }
+
+    private static func commonPrefixLength(_ old: NSString, _ new: NSString, startingAt start: Int) -> Int {
+        let limit = min(old.length, new.length)
+        var index = min(start, limit)
+        while index < limit, old.character(at: index) == new.character(at: index) { index += 1 }
+        return index
     }
 
     /// The length of the whole leading paragraphs `old` and `new` share, in characters and attributes.
@@ -894,7 +1068,10 @@ final class AgentRichTextView: NSTextView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window == nil { fileLinkHover?.cancelRequests() }
+        if window == nil {
+            fileLinkHover?.cancelRequests()
+            stopTokenFades()
+        }
     }
 
     func height(for width: CGFloat) -> CGFloat {
@@ -911,5 +1088,19 @@ final class AgentRichTextView: NSTextView {
         }
         layoutManager.ensureLayout(for: textContainer)
         return max(1, layoutManager.usedRect(for: textContainer).maxY)
+    }
+}
+
+@MainActor
+private final class DisplayLinkProxy: NSObject {
+    weak var owner: AgentRichTextView?
+
+    init(owner: AgentRichTextView) {
+        self.owner = owner
+    }
+
+    @objc func step(_ link: CADisplayLink) {
+        guard let owner else { link.invalidate(); return }
+        owner.stepTokenFades()
     }
 }

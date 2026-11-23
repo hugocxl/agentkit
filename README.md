@@ -2,7 +2,7 @@
 
 ### A native AI conversation, inside your Mac app.
 
-**A Swift package that puts a full AI conversation inside your macOS app**, powered by the Claude Code or Codex CLI already installed on the Mac. It is the conversation from [Tab](https://hugocxl.github.io/tab/), with its interface, runtime and saved sessions, made into something any app can use.
+**A Swift package that puts a full AI conversation inside your macOS app**, powered by the Claude Code, Codex or other agent CLI already installed on the Mac, from Gemini CLI to any Agent Client Protocol agent. It is the conversation from [Tab](https://hugocxl.github.io/tab/), with its interface, runtime and saved sessions, made into something any app can use.
 
 [Read the docs](https://hugocxl.github.io/agentkit/docs.html) · [See the changelog](CHANGELOG.md) · [Visit the website](https://hugocxl.github.io/agentkit/)
 

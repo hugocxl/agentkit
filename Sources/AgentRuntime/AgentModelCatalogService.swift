@@ -15,10 +15,12 @@ actor AgentModelCatalogService {
     nonisolated let cacheWrites = AgentStoreFence()
     private let now: @Sendable () -> Date
     private let processes: AgentProcessTracker
+    private let providers: @Sendable (String?, AgentChatProvider) -> AgentProviderConfig
     private struct Key: Hashable, Sendable {
         var project: ProjectId
-        var provider: AgentChatProvider
-        var filename: String { "\(project.description)-\(provider.rawValue).json" }
+        /// The provider's ID; a built-in provider's is its kind's name.
+        var provider: String
+        var filename: String { "\(project.description)-\(provider).json" }
     }
     private struct Refresh: Sendable {
         var id = UUID()
@@ -30,6 +32,7 @@ actor AgentModelCatalogService {
     init(home: URL, executables: [AgentChatProvider: URL] = [:], environment: [String: String] = AgentProcess.environment(),
          launch: AgentProcess.Launch? = nil, timeout: TimeInterval = 4, cacheDirectory: URL? = nil,
          now: @escaping @Sendable () -> Date = { Date() }, processes: AgentProcessTracker = AgentProcessTracker(),
+         providers: @escaping @Sendable (String?, AgentChatProvider) -> AgentProviderConfig = { _, kind in .builtIn(kind) },
          projectDirectory: @escaping @Sendable (ProjectId) throws -> URL) {
         self.executables = executables
         self.processes = processes
@@ -39,6 +42,7 @@ actor AgentModelCatalogService {
         self.timeout = timeout
         self.cacheDirectory = cacheDirectory
         self.now = now
+        self.providers = providers
         self.projectDirectory = projectDirectory
     }
 
@@ -47,10 +51,27 @@ actor AgentModelCatalogService {
     /// is retried sooner.
     static func freshness(_ reply: AgentModelCatalogReply) -> TimeInterval { reply.models.isEmpty ? 30 : 600 }
 
+    /// Forgets every discovered catalog, as after the providers' settings change.
+    func invalidate() {
+        cached = [:]
+    }
+
+    /// The provider's models, arranged as configured: custom ones added, favorites first,
+    /// hidden ones left out unless asked for.
     func handle(_ request: AgentModelCatalogRequest) async throws -> AgentModelCatalogReply {
+        let config = providers(request.providerID, request.provider)
+        guard config.enabled else { return AgentModelCatalogReply(models: [], source: "disabled") }
+        var reply = try await discover(request, config: config)
+        reply.models = Array((request.includeHidden ? config.models.arrange(reply.models) : config.models.visible(reply.models))
+            .prefix(AgentModelCatalogReply.maxModels))
+        return reply
+    }
+
+    private func discover(_ request: AgentModelCatalogRequest, config: AgentProviderConfig) async throws -> AgentModelCatalogReply {
         let directory = try projectDirectory(request.project)
         let provider = request.provider
-        let key = Key(project: request.project, provider: provider)
+        let key = Key(project: request.project, provider: config.id)
+        let environment = AgentProviderLaunch.environment(config, base: self.environment)
         if !request.forceRefresh, let cached = cached[key], now().timeIntervalSince(cached.0) < Self.freshness(cached.1) { return cached.1 }
         if let pending = pending[key] {
             if !request.forceRefresh, let cached = cached[key], !cached.1.models.isEmpty { return cached.1 }
@@ -69,20 +90,41 @@ actor AgentModelCatalogService {
             if !request.forceRefresh, memory == nil, provider == .codex, disk.source == "cache", let modified,
                Date().timeIntervalSince(modified) < 300 { return disk }
         }
-        var environment = environment
-        if provider == .claude { environment.removeValue(forKey: "CLAUDECODE") }
-        let launchEnvironment = environment
+        var launchEnvironment = environment
+        if provider == .claude { launchEnvironment.removeValue(forKey: "CLAUDECODE") }
+        launchEnvironment.removeValue(forKey: "TAB_SESSION_ID")
         let override = launch
         let executable = executables[provider]
         let timeout = timeout
         let processes = processes
-        let task = Task.detached { () -> AgentModelCatalogReply in
+        let task = Task.detached { [launchEnvironment] () -> AgentModelCatalogReply in
             do {
-                let launch = try override ?? AgentProcess.Launch(
-                    executable: executable ?? AgentProcess.resolve(provider == .codex ? "codex" : "claude", environment: launchEnvironment),
-                    arguments: provider == .codex ? ["app-server"] : ["--print", "--verbose", "--input-format", "stream-json",
+                let arguments: [String]
+                switch provider.spec.wire {
+                case .codexAppServer:
+                    try AgentProviderLaunch.prepareShadowHome(config)
+                    arguments = ["app-server"] + AgentProviderLaunch.homeArguments(config)
+                case .acp:
+                    arguments = AgentProviderLaunch.sessionArguments(config)
+                case .claudeStream:
+                    arguments = ["--print", "--verbose", "--input-format", "stream-json",
                         "--output-format", "stream-json", "--no-session-persistence", "--safe-mode",
-                        "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--tools", ""], environment: launchEnvironment)
+                        "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--tools", ""]
+                }
+                var environment = launchEnvironment
+                let scratch = AgentProviderLaunch.scratchDirectory(config)
+                if let scratch { environment["TMPDIR"] = scratch.path }
+                defer { AgentProviderLaunch.removeScratch(scratch, after: 5) }
+                let launch = try override ?? AgentProcess.Launch(
+                    executable: executable ?? AgentProviderLaunch.executable(config, environment: environment),
+                    arguments: arguments, environment: environment)
+                if provider.spec.wire == .acp {
+                    // Node CLIs such as Gemini load their settings before they answer.
+                    return await AcpModelDiscovery.discover(launch: launch, directory: directory.path,
+                                                            timeout: max(timeout, Self.acpTimeout), provider: provider,
+                                                            hasKey: provider.spec.apiKeyVariables.contains { environment[$0]?.isEmpty == false },
+                                                            processes: processes)
+                }
                 return await AgentModelCatalogDiscovery.discover(provider: provider, launch: launch,
                     directory: directory.path, timeout: timeout, processes: processes)
             } catch { return .init(models: []) }
@@ -125,6 +167,8 @@ actor AgentModelCatalogService {
     }
 
     static let maxCacheBytes = 4 * 1024 * 1024
+    /// How long an ACP agent may take to start and open the session its models come from.
+    static let acpTimeout: TimeInterval = 25
 
     private static func cacheURL(home: URL, environment: [String: String]) -> URL {
         let root = environment["CODEX_HOME"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
@@ -310,5 +354,109 @@ private final class AgentModelCatalogDiscovery: @unchecked Sendable {
             : AgentModelCatalogService.descriptors(rows, cache: false)
         continuation.resume(returning: .init(models: success ? models : [],
                                              source: success ? "live" : nil))
+    }
+}
+
+/// An ACP agent lists its models only for a session: this opens one in the project with no
+/// MCP servers and nothing sent, reads its model and reasoning options, and deletes it
+/// again where the agent can, so it never shows among the agent's own conversations.
+private final class AcpModelDiscovery: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "agentkit.acp-model-catalog")
+    private var process: AgentProcess?
+    private var continuation: CheckedContinuation<AgentModelCatalogReply, Never>?
+    private var capabilities: [String: Any] = [:]
+    private var directory = ""
+    private var bytes = 0
+    private var models: [AgentModelDescriptor] = []
+    private var provider: AgentChatProvider = .acp
+    private var hasKey = false
+    private var authenticated = false
+    private var methods: [[String: Any]] = []
+
+    static func discover(launch: AgentProcess.Launch, directory: String, timeout: TimeInterval,
+                         provider: AgentChatProvider, hasKey: Bool, processes: AgentProcessTracker) async -> AgentModelCatalogReply {
+        let discovery = AcpModelDiscovery()
+        discovery.directory = directory
+        discovery.provider = provider
+        discovery.hasKey = hasKey
+        return await withCheckedContinuation { continuation in
+            discovery.queue.async {
+                discovery.continuation = continuation
+                discovery.queue.asyncAfter(deadline: .now() + timeout) { discovery.finish() }
+                do {
+                    discovery.process = try processes.launch(launch, directory: directory, onLine: { data in
+                        discovery.queue.async { discovery.receive(data) }
+                    }, onExit: { _, _ in
+                        discovery.queue.async { discovery.finish() }
+                    })
+                    try discovery.write(1, "initialize", ["protocolVersion": 1,
+                        "clientCapabilities": ["fs": ["readTextFile": false, "writeTextFile": false], "terminal": false],
+                        "clientInfo": ["name": "agentkit", "title": "AgentKit", "version": AgentKitVersion.current]])
+                } catch { discovery.finish() }
+            }
+        }
+    }
+
+    private func write(_ id: Int, _ method: String, _ params: [String: Any]) throws {
+        try process?.write(["jsonrpc": "2.0", "id": id, "method": method, "params": params])
+    }
+
+    private func receive(_ data: Data) {
+        guard continuation != nil else { return }
+        bytes += data.count
+        guard bytes <= AgentModelCatalogService.maxCacheBytes else { finish(); return }
+        guard let message = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            // A browser sign-in can't happen here; the agent is signed out.
+            if AcpAuthentication.asksForBrowser(data) { finish() }
+            return
+        }
+        if message["method"] != nil {
+            // Refuse anything the agent asks; this session never runs a prompt.
+            if let id = message["id"] {
+                try? process?.write(["jsonrpc": "2.0", "id": id, "error": ["code": -32601, "message": "Not supported while listing models."]])
+            }
+            return
+        }
+        let error = message["error"] as? [String: Any]
+        if message["id"] as? Int == 2, let error, !authenticated, (error["code"] as? NSNumber)?.intValue == -32000,
+           let method = AcpAuthentication.method(methods, provider: provider, hasKey: hasKey) {
+            // Signed in as the runtime would be, then asked again.
+            authenticated = true
+            try? write(3, "authenticate", ["methodId": method])
+            return
+        }
+        guard let id = message["id"] as? Int, let result = message["result"] as? [String: Any] else {
+            if message["id"] != nil { finish() }
+            return
+        }
+        do {
+            switch id {
+            case 1:
+                capabilities = result["agentCapabilities"] as? [String: Any] ?? [:]
+                methods = result["authMethods"] as? [[String: Any]] ?? []
+                try write(2, "session/new", ["cwd": directory, "mcpServers": [Any]()])
+            case 3:
+                try write(2, "session/new", ["cwd": directory, "mcpServers": [Any]()])
+            case 2:
+                models = AcpSessionOptions(result).descriptors()
+                let session = (capabilities["sessionCapabilities"] as? [String: Any]) ?? [:]
+                if let sessionID = result["sessionId"] as? String, session["delete"] != nil || session["close"] != nil {
+                    try write(4, session["delete"] != nil ? "session/delete" : "session/close", ["sessionId": sessionID])
+                } else {
+                    finish()
+                }
+            default:
+                finish()
+            }
+        } catch { finish() }
+    }
+
+    private func finish() {
+        guard let continuation else { return }
+        self.continuation = nil
+        process?.stop()
+        process = nil
+        let listed = Array(models.prefix(AgentModelCatalogReply.maxModels))
+        continuation.resume(returning: .init(models: listed, source: listed.isEmpty ? nil : "live"))
     }
 }

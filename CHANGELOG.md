@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.5.0 - 2026-11-23
+
+### Added
+
+- Run Antigravity CLI, Gemini CLI, OpenCode, Grok, Kiro and any Agent Client Protocol agent beside Claude Code and Codex, through the new `AgentChatProvider` kinds and their `AgentProviderSpec`.
+- Configure more than one provider of a kind, each with its own executable, home folder, arguments, environment, accent color, auto-compact threshold and model preferences, through `AgentProviderStore` and its `agent-providers.json`; start a conversation on one with `connect(provider:providerID:)`.
+- Check whether each provider's CLI is installed and signed in, install or update it with `maintain`, and say in the model menu why a provider can't run.
+- Sign a second Codex account in from a shadow home that shares the main home's conversations, skills and settings.
+- Read Claude and Codex plan usage limits through `usageLimits` on `AgentWorkspace`, `AgentRuntimeService` and `AgentConnection`.
+- Drop files anywhere on a conversation, which highlights as a whole while a file is over it.
+
+### Changed
+
+- Stream replies by parsing only the unfinished tail after each finished block, and fade new words in.
+- Load earlier messages by themselves as the reader scrolls toward them, keep the whole archive instead of the first 64 MiB, and read it through a line index; the transcript rebuilds only from the first changed turn.
+- Give every attachment one look: files as cards above the message, images as a mosaic, and sent images shown at once instead of downloaded back.
+- Label tool calls by what they did, and show the quoted words of a sent quote.
+- Show only the time in the working line, and restyle the activity and notices above the composer.
+- Draw icons as outlines; `AppIcon.Artwork` still offers the two-tone set.
+- `AgentChatRequest.send` carries the provider ID, so a host that matches it gains one more value to bind.
+- Publish the command reference, the integration verification and the changelog on the website beside the docs.
+
+### Fixed
+
+- Keep an Antigravity turn open while work it started outlives the prompt.
+
 ## 1.4.3 - 2026-11-19
 
 ### Changed

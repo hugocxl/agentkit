@@ -62,12 +62,21 @@ public final class AgentWorkspace: @unchecked Sendable {
         }
     }
 
+    /// Configured agent providers and their health checks for this workspace.
+    public var providers: AgentProviderStore { runtime.providers }
+
+    /// Reads subscription usage limits for signed-in providers.
+    public func usageLimits(_ request: AgentUsageLimitsRequest = .init()) async -> AgentUsageLimitsReply {
+        await runtime.usageLimits(request)
+    }
+
     /// Creates a connection without starting a CLI. Sending the first prompt starts it.
     /// Reuse a session ID to reopen a saved conversation.
-    public func connect(provider: AgentChatProvider, session: SessionId = SessionId()) -> AgentConnection {
+    public func connect(provider: AgentChatProvider, providerID: String? = nil, session: SessionId = SessionId()) -> AgentConnection {
         var connection = AgentConnection(session: session, project: project, provider: provider,
                                          request: { [runtime] in try await runtime.handle($0) },
                                          observe: { [runtime] in runtime.observe(session: session) })
+        connection.providerID = providerID
         connection.workingDirectory = workingDirectory
         connection.draftURL = storageDirectory.appendingPathComponent("drafts/\(session).json")
         connection.conversation = { [runtime] in try await runtime.conversation($0) }
@@ -78,6 +87,11 @@ public final class AgentWorkspace: @unchecked Sendable {
         connection.models = { [runtime, project] provider, refresh in
             try await runtime.modelCatalog(.init(project: project, provider: provider, forceRefresh: refresh)).models
         }
+        connection.modelsForProvider = { [runtime, project] provider, providerID, refresh in
+            try await runtime.modelCatalog(.init(project: project, provider: provider, forceRefresh: refresh, providerID: providerID)).models
+        }
+        connection.providers = { [runtime] in runtime.providers.refreshingState() }
+        connection.usageLimits = { [runtime] in await runtime.usageLimits($0) }
         connection.history = { [runtime, project] in try await runtime.history(.init(project: project)) }
         connection.importHistory = { [runtime, project] entry, session in
             try await runtime.importHistory(.init(session: session, project: project, provider: entry.provider,

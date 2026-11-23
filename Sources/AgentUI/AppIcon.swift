@@ -17,7 +17,7 @@ public enum AppIcon: String, CaseIterable, Sendable {
     case babel
     case ban
     case bash
-    case bellUnread = "bell-unread"
+    case bell
     case biome
     case bitbucket
     case bootstrap
@@ -26,20 +26,23 @@ public enum AppIcon: String, CaseIterable, Sendable {
     case browserslist
     case bun
     case c
+    case chartLine = "chart-line"
     case check
     case checkbox
-    case checkboxFill = "checkbox-fill"
     case chevronDown = "chevron-down"
     case chevronLeft = "chevron-left"
     case chevronRight = "chevron-right"
     case chevronUp = "chevron-up"
     case chevronsIn = "chevrons-in"
     case chevronsUpDown = "chevrons-up-down"
+    case circleAlert = "circle-alert"
+    case circleArrowDown = "circle-arrow-down"
+    case circleArrowUp = "circle-arrow-up"
+    case circleDashed = "circle-dashed"
     case circle
     case circleCheck = "circle-check"
-    case circleCheckFill = "circle-check-fill"
-    case circleUser = "circle-user"
-    case circleXFill = "circle-x-fill"
+    case circleUser = "circle-user-round"
+    case circleX = "circle-x"
     case claude
     case close
     case code
@@ -53,7 +56,7 @@ public enum AppIcon: String, CaseIterable, Sendable {
     case copilot
     case copy
     case cpp
-    case cpu
+    case cpu = "microchip"
     case csharp
     case css
     case cursor
@@ -62,9 +65,8 @@ public enum AppIcon: String, CaseIterable, Sendable {
     case deno
     case diff
     case docker
-    case dot
+    case dot = "circle-small"
     case download
-    case downloadCircleFill = "download-circle-fill"
     case droid
     case elixir
     case ellipsis
@@ -73,7 +75,6 @@ public enum AppIcon: String, CaseIterable, Sendable {
     case epub
     case eraser
     case eslint
-    case exclamationCircleFill = "exclamation-circle-fill"
     case extensions = "extension"
     case externalLink = "external-link"
     case eye
@@ -111,7 +112,6 @@ public enum AppIcon: String, CaseIterable, Sendable {
     case html
     case image
     case info
-    case infoFill = "info-fill"
     case java
     case javascript
     case kiro
@@ -121,6 +121,7 @@ public enum AppIcon: String, CaseIterable, Sendable {
     case layers
     case lightbulb
     case listTodo = "list-todo"
+    case locate
     case lock
     case lockOpen = "lock-open"
     case logs
@@ -129,6 +130,7 @@ public enum AppIcon: String, CaseIterable, Sendable {
     case maximize
     case mcp
     case minus
+    case star
     case minusCircle = "minus-circle"
     case monitor
     case multiplexer
@@ -144,7 +146,7 @@ public enum AppIcon: String, CaseIterable, Sendable {
     case panelLeft = "panel-left"
     case panelRight = "panel-right"
     case paperclip
-    case pauseCircleFill = "pause-circle-fill"
+    case pauseCircle = "pause-circle-fill"
     case pdf
     case pencil
     case phone
@@ -162,7 +164,7 @@ public enum AppIcon: String, CaseIterable, Sendable {
     case r
     case react
     case refresh
-    case refreshCircleFill = "refresh-circle-fill"
+    case refreshCircle = "refresh-circle-fill"
     case reset
     case rows
     case rss
@@ -175,12 +177,12 @@ public enum AppIcon: String, CaseIterable, Sendable {
     case settings
     case shield
     case shieldKeyhole = "shield-keyhole"
-    case slides
-    case sparkles
+    case slides = "presentation"
+    case sparkles = "sparkle"
     case spinner
+    case square
     case spreadsheet
     case ssh
-    case stop
     case stylelint
     case svelte
     case svg
@@ -191,14 +193,13 @@ public enum AppIcon: String, CaseIterable, Sendable {
     case terminal
     case terminalStack = "terminal-stack"
     case terraform
-    case themes
+    case themes = "palette"
     case toml
     case triangleAlert = "triangle-alert"
-    case triangleAlertFill = "triangle-alert-fill"
     case typescript
-    case viewList = "view-list"
-    case viewTree = "view-tree"
-    case video
+    case viewList = "list"
+    case viewTree = "list-tree"
+    case video = "film"
     case vim
     case vite
     case vscode
@@ -338,11 +339,20 @@ public enum AppIcon: String, CaseIterable, Sendable {
     /// matching the visible size of the SF Symbols they replaced on the same canvas.
     public static let inlineScale: CGFloat = 0.78
 
+    /// Which of @hugocxl/icons' sets an image comes from.
+    public enum Artwork: String, Sendable {
+        /// Outlines, used everywhere by default.
+        case stroke
+        /// The default two-tone set.
+        case duotone
+    }
+
     /// Draws signature marks in their theme hue; UI glyphs remain templates.
     @MainActor
-    public func image(size: CGFloat = Metrics.glyph, scale: CGFloat = 1, theme: AgentTheme) -> NSImage? {
-        if let hue = signatureHue { return image(size: size, scale: scale, hue: hue, theme: theme) }
-        return image(size: size, scale: scale)
+    public func image(size: CGFloat = Metrics.glyph, scale: CGFloat = 1, theme: AgentTheme,
+                      artwork: Artwork = .stroke) -> NSImage? {
+        if let hue = signatureHue { return image(size: size, scale: scale, hue: hue, theme: theme, artwork: artwork) }
+        return image(size: size, scale: scale, artwork: artwork)
     }
 
     /// Applies a contextual tint only to UI glyphs, preserving signature colors.
@@ -352,15 +362,39 @@ public enum AppIcon: String, CaseIterable, Sendable {
         return image(size: size, scale: scale, color: tint)
     }
 
+    /// The default set's name for icons whose stroke stand-in has another name.
+    private var duotoneName: String {
+        switch self {
+        case .bell: return "bell-unread"
+        case .circleUser: return "circle-user"
+        case .cpu: return "cpu"
+        case .dot: return "dot"
+        case .simulator: return "simulator"
+        case .slides: return "slides"
+        case .sparkles: return "sparkles"
+        case .themes: return "themes"
+        case .video: return "video"
+        default: return rawValue
+        }
+    }
+
+    /// The glyph from the chosen set. Brand and language logos have no
+    /// stroke version, so they keep their single mark.
+    private func source(_ artwork: Artwork) -> NSImage? {
+        switch artwork {
+        case .stroke: return StrokeIcon(rawValue: rawValue)?.nsImage ?? Icon(rawValue: rawValue)?.nsImage
+        case .duotone: return Icon(rawValue: duotoneName)?.nsImage
+        }
+    }
+
     /// A template image on a square canvas `size` points on a side, with the
     /// glyph fitted to `size * scale` and centered, so wide and narrow icons
     /// lay out like the square ones.
     @MainActor
-    public func image(size: CGFloat = Metrics.glyph, scale: CGFloat = 1) -> NSImage? {
-        let key = "template-\(rawValue)-\(size)-\(scale)"
+    public func image(size: CGFloat = Metrics.glyph, scale: CGFloat = 1, artwork: Artwork = .stroke) -> NSImage? {
+        let key = "template-\(artwork.rawValue)-\(rawValue)-\(size)-\(scale)"
         if let cached = IconCache.images[key] { return cached }
-        let source = Icon(rawValue: rawValue)?.nsImage ?? BundledImage.loadTabIcon(rawValue)
-        guard let source, source.size.width > 0, source.size.height > 0 else { return nil }
+        guard let source = source(artwork), source.size.width > 0, source.size.height > 0 else { return nil }
         let fit = min(size * scale / source.size.width, size * scale / source.size.height)
         let fitted = NSSize(width: source.size.width * fit, height: source.size.height * fit)
         let image = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
@@ -375,11 +409,11 @@ public enum AppIcon: String, CaseIterable, Sendable {
 
     /// A non-template image filled with `color`, preserving the SVG's opacity.
     @MainActor
-    public func image(size: CGFloat, scale: CGFloat = 1, color: NSColor) -> NSImage? {
+    public func image(size: CGFloat, scale: CGFloat = 1, color: NSColor, artwork: Artwork = .stroke) -> NSImage? {
         let resolved = color.usingColorSpace(.sRGB) ?? color
-        let key = "tinted-\(rawValue)-\(size)-\(scale)-\(resolved)"
+        let key = "tinted-\(artwork.rawValue)-\(rawValue)-\(size)-\(scale)-\(resolved)"
         if let cached = IconCache.images[key] { return cached }
-        guard let source = image(size: size, scale: scale) else { return nil }
+        guard let source = image(size: size, scale: scale, artwork: artwork) else { return nil }
         let tinted = NSImage(size: source.size, flipped: false) { rect in
             source.draw(in: rect)
             resolved.setFill()
@@ -393,9 +427,10 @@ public enum AppIcon: String, CaseIterable, Sendable {
 
     /// A non-template image in the chosen theme hue.
     @MainActor
-    public func image(size: CGFloat, scale: CGFloat = 1, hue: AgentTheme.IconHue, theme: AgentTheme) -> NSImage? {
+    public func image(size: CGFloat, scale: CGFloat = 1, hue: AgentTheme.IconHue, theme: AgentTheme,
+                      artwork: Artwork = .stroke) -> NSImage? {
         guard let hex = UInt32(theme.iconHex(hue).dropFirst(), radix: 16) else { return nil }
-        return image(size: size, scale: scale, color: NSColor(hex: hex))
+        return image(size: size, scale: scale, color: NSColor(hex: hex), artwork: artwork)
     }
 }
 
@@ -485,10 +520,31 @@ public enum AgentLogo {
         image(for: provider, theme: .shared)
     }
 
+    /// A configured provider's mark, with a dot of its accent color in the corner when it has one,
+    /// so several accounts of one kind tell apart.
+    @MainActor
+    public static func image(for provider: AgentProviderConfig, theme: AgentTheme) -> NSImage? {
+        let logo = image(for: provider.kind, theme: theme)
+        guard let logo, let accent = provider.accentColor.flatMap(RGBColor.init(hex:))?.nsColor else { return logo }
+        return NSImage(size: logo.size, flipped: false) { rect in
+            logo.draw(in: rect)
+            let side = (rect.width * 0.4).rounded()
+            accent.setFill()
+            NSBezierPath(ovalIn: NSRect(x: rect.maxX - side, y: rect.minY, width: side, height: side)).fill()
+            return true
+        }
+    }
+
     static func mark(_ provider: AgentChatProvider) -> AppIcon {
         switch provider {
         case .claude: return .claude
         case .codex: return .codex
+        case .antigravity: return .antigravity
+        case .gemini: return .brain
+        case .openCode: return .opencode
+        case .grok: return .grok
+        case .kiro: return .kiro
+        case .acp: return .brain
         }
     }
 }

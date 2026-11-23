@@ -239,3 +239,92 @@ final class AgentAttachmentPasteboardTests: XCTestCase {
 
     private func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
 }
+
+
+@MainActor
+final class AgentComposerAttachmentTests: XCTestCase {
+    private func pasteboard() -> NSPasteboard {
+        let board = NSPasteboard.withUniqueName()
+        board.clearContents()
+        return board
+    }
+
+    func testWholeAgentPaneHighlightsAndAcceptsDropsAcrossBodyAndComposer() throws {
+        _ = NSApplication.shared
+        let surface = AgentPaneView(frame: NSRect(x: 0, y: 0, width: 680, height: 500))
+        surface.layoutSubtreeIfNeeded()
+
+        var attached: [[URL]] = []
+        surface.composer.onAttachFiles = { attached.append($0) }
+
+        let board = pasteboard()
+        let url = URL(fileURLWithPath: "/Users/example/diagram.png")
+        board.writeObjects([url as NSURL])
+        let drag = FakeAgentDrag(pasteboard: board)
+
+        XCTAssertFalse(surface.isHighlightingAttachmentDrop)
+        XCTAssertEqual(surface.draggingEntered(drag), .copy)
+        XCTAssertTrue(surface.isHighlightingAttachmentDrop)
+
+        // Moving into the composer input keeps the pane highlighted.
+        XCTAssertEqual(surface.composer.draggingEntered(drag), .copy)
+        surface.draggingExited(drag)
+        XCTAssertTrue(surface.isHighlightingAttachmentDrop)
+
+        // Leaving clears the highlight.
+        surface.composer.draggingExited(drag)
+        XCTAssertFalse(surface.isHighlightingAttachmentDrop)
+
+        // Dropping on the body or composer attaches files and clears the highlight.
+        XCTAssertEqual(surface.draggingEntered(drag), .copy)
+        XCTAssertTrue(surface.performDragOperation(drag))
+        XCTAssertFalse(surface.isHighlightingAttachmentDrop)
+
+        XCTAssertEqual(surface.composer.draggingEntered(drag), .copy)
+        XCTAssertTrue(surface.composer.performDragOperation(drag))
+        XCTAssertFalse(surface.isHighlightingAttachmentDrop)
+
+        XCTAssertEqual(attached, [[url], [url]])
+    }
+
+    func testPlainTextDragDoesNotHighlightAgentPaneAndTranscriptDoesNotInterceptDrops() throws {
+        _ = NSApplication.shared
+        let surface = AgentPaneView(frame: NSRect(x: 0, y: 0, width: 680, height: 500))
+
+        let board = pasteboard()
+        board.setString("Just text", forType: .string)
+        let drag = FakeAgentDrag(pasteboard: board)
+
+        XCTAssertTrue(surface.draggingEntered(drag).isEmpty)
+        _ = surface.composer.draggingEntered(drag)
+        XCTAssertFalse(surface.isHighlightingAttachmentDrop)
+
+        let richText = AgentRichTextView(frame: .zero)
+        XCTAssertTrue(richText.registeredDraggedTypes.isEmpty)
+    }
+}
+
+private final class FakeAgentDrag: NSObject, NSDraggingInfo {
+    let draggingPasteboard: NSPasteboard
+    var draggingFormation: NSDraggingFormation = .default
+    var animatesToDestination = false
+    var numberOfValidItemsForDrop = 1
+    let springLoadingHighlight: NSSpringLoadingHighlight = .none
+
+    init(pasteboard: NSPasteboard) {
+        self.draggingPasteboard = pasteboard
+    }
+
+    var draggingDestinationWindow: NSWindow? { nil }
+    var draggingSourceOperationMask: NSDragOperation { .copy }
+    var draggingLocation: NSPoint { .zero }
+    var draggedImageLocation: NSPoint { .zero }
+    var draggedImage: NSImage? { nil }
+    var draggingSource: Any? { nil }
+    var draggingSequenceNumber: Int { 1 }
+    func slideDraggedImage(to screenPoint: NSPoint) {}
+    func enumerateDraggingItems(options enumOpts: NSDraggingItemEnumerationOptions, for view: NSView?,
+                                classes classArray: [AnyClass], searchOptions: [NSPasteboard.ReadingOptionKey: Any],
+                                using block: (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void) {}
+    func resetSpringLoading() {}
+}

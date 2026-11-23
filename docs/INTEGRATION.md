@@ -1,12 +1,12 @@
 # Integrate AgentKit
 
-AgentKit embeds a native AI conversation in a macOS app, backed by a locally installed Claude Code or Codex CLI. It includes the conversation UI, provider runtime, application tool calls and persistent session management extracted from [Tab](https://hugocxl.github.io/tab/). This guide is also published at [hugocxl.github.io/agentkit/docs.html](https://hugocxl.github.io/agentkit/docs.html).
+AgentKit embeds a native AI conversation in a macOS app, backed by a locally installed Claude Code or Codex CLI, or by Antigravity, Gemini CLI, OpenCode, Grok, Kiro or another Agent Client Protocol agent. It includes the conversation UI, provider runtime, application tool calls and persistent session management extracted from [Tab](https://hugocxl.github.io/tab/). This guide is also published at [hugocxl.github.io/agentkit/docs.html](https://hugocxl.github.io/agentkit/docs.html).
 
 ## Requirements
 
 AgentKit requires macOS 14 or later on Apple silicon. Build with Xcode 26 or later and Swift 6; the package uses Swift 5 language mode.
 
-The runtime launches installed provider executables. Install and sign in to the provider CLI before using a real conversation. AgentKit does not bundle a model or manage provider accounts.
+The runtime launches installed provider executables. Install and sign in to the provider CLI before using a real conversation; the runtime can check, install and update supported CLIs, but sign-in stays with each CLI. AgentKit does not bundle a model.
 
 ## Modules
 
@@ -25,7 +25,7 @@ One Swift package, three library products:
 Add `https://github.com/hugocxl/agentkit.git` in Xcode's package dependencies, or add:
 
 ```swift
-.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.4.3")
+.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.5.0")
 ```
 
 Select the products your target needs:
@@ -138,6 +138,18 @@ let conversation = AgentConversationViewController(connection: connection, host:
 Local connections supply file reads and file suggestions automatically. Remote hosts can supply their own asynchronous file service. Navigation, repository metadata, pull request previews, workspace labels and notices are optional callbacks; without `showNotice`, notices appear in an AgentKit notice stack in the window, if it has one.
 
 Repository metadata is read once per connection: an error with an `AgentCodedError` code, such as a folder outside Git, holds until `connectionChanged()`, while an uncoded failure is retried. Bind menus and shortcuts by passing an `AgentShortcut` to `conversation.perform(_:)`; map your own command identifiers explicitly, since `AgentShortcut`'s raw values are AgentKit's.
+
+## Choose providers
+
+Each `AgentChatProvider` kind describes its CLI through `spec`: executable, wire protocol, install and sign-in commands. Claude Code and Codex use their own streaming protocols; the other kinds speak the Agent Client Protocol, and `.acp` runs any ACP agent you name.
+
+`workspace.providers`, an `AgentProviderStore`, keeps the configured providers in the storage directory's `agent-providers.json`. Every kind has a built-in provider; `write` adds more, such as a second Claude account with its own home folder, or changes executables, arguments, environment, accent colors and model preferences. `check()` and `refreshingState()` report whether each CLI is installed, its version and sign-in, and `maintain` installs or updates it. Pass a provider's ID to start a conversation on it:
+
+```swift
+let connection = workspace.connect(provider: .claude, providerID: "claude-work", session: savedSessionID)
+```
+
+The model menu lists enabled providers and explains why one can't run. `workspace.usageLimits()` reads Claude and Codex plan limits; a custom transport offers both through `AgentConnection.providers` and `usageLimits`.
 
 ## Themes
 

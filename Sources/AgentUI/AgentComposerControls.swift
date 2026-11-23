@@ -14,9 +14,18 @@ final class AgentComposerTextView: NSTextView {
     var onPasteContext: ((NSPasteboard) -> Bool)?
     /// Takes a long pasted text as an attachment; false pastes it inline.
     var onPasteLongText: ((String) -> Bool)?
+    /// Items added to the message box's context menu, such as stashing the draft.
+    var extraMenuItems: (() -> [NSMenuItem])?
+    /// Reports whether an attachment drag is currently active over the text view.
+    var onAttachmentDropHighlightChange: ((Bool) -> Void)?
     var planning = false { didSet { needsDisplay = true } }
     var placeholderColor = NSColor.secondaryLabelColor
-    private var acceptingAttachmentDrop = false { didSet { needsDisplay = true } }
+    private var acceptingAttachmentDrop = false {
+        didSet {
+            guard acceptingAttachmentDrop != oldValue else { return }
+            onAttachmentDropHighlightChange?(acceptingAttachmentDrop)
+        }
+    }
     private let ownedStorage: NSTextStorage?
 
     override init(frame frameRect: NSRect = .zero, textContainer container: NSTextContainer? = nil) {
@@ -80,11 +89,12 @@ final class AgentComposerTextView: NSTextView {
         AgentAttachmentPasteboard.receive(pasteboard, onFiles: onAttachFiles, onImage: onAttachImage)
     }
 
-    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { updateAttachmentDrop(sender) }
-    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { updateAttachmentDrop(sender) }
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { updateAttachmentDrop(sender, entered: true) }
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { updateAttachmentDrop(sender, entered: false) }
     override func draggingExited(_ sender: NSDraggingInfo?) { acceptingAttachmentDrop = false; super.draggingExited(sender) }
+    override func draggingEnded(_ sender: NSDraggingInfo) { acceptingAttachmentDrop = false; super.draggingEnded(sender) }
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        if AgentAttachmentPasteboard.canRead(sender.draggingPasteboard) { return updateAttachmentDrop(sender) == .copy }
+        if AgentAttachmentPasteboard.canRead(sender.draggingPasteboard) { return updateAttachmentDrop(sender, entered: false) == .copy }
         return super.prepareForDragOperation(sender)
     }
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
@@ -97,10 +107,10 @@ final class AgentComposerTextView: NSTextView {
         super.concludeDragOperation(sender)
     }
 
-    private func updateAttachmentDrop(_ sender: NSDraggingInfo) -> NSDragOperation {
+    private func updateAttachmentDrop(_ sender: NSDraggingInfo, entered: Bool) -> NSDragOperation {
         guard AgentAttachmentPasteboard.canRead(sender.draggingPasteboard) else {
             acceptingAttachmentDrop = false
-            return super.draggingUpdated(sender)
+            return entered ? super.draggingEntered(sender) : super.draggingUpdated(sender)
         }
         acceptingAttachmentDrop = sender.draggingSourceOperationMask.contains(.copy)
         return acceptingAttachmentDrop ? .copy : []
@@ -114,14 +124,6 @@ final class AgentComposerTextView: NSTextView {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        if acceptingAttachmentDrop {
-            NSColor.controlAccentColor.withAlphaComponent(0.10).setFill()
-            let outline = NSBezierPath(roundedRect: visibleRect.insetBy(dx: 2, dy: 2), xRadius: 6, yRadius: 6)
-            outline.fill()
-            NSColor.controlAccentColor.setStroke()
-            outline.lineWidth = 2
-            outline.stroke()
-        }
         guard string.isEmpty, !hasMarkedText() else { return }
         ((planning ? "Plan changes" : "Ask anything · @ for context, / for commands") as NSString).draw(at: textContainerOrigin, withAttributes: [
             .font: font ?? AppFont.system(14, weight: .light), .foregroundColor: placeholderColor,
@@ -135,7 +137,7 @@ class AgentTextPopUp: NSPopUpButton {
     var chatTheme: AgentTheme = .shared { didSet { refreshLogos(); needsDisplay = true } }
     var icon: AppIcon = .cpu { didSet { needsDisplay = true } }
     var providerLogo: AgentChatProvider? { didSet { refreshLogos(); needsDisplay = true } }
-    var menuLogos: [Int: AgentChatProvider] = [:] { didSet { refreshLogos() } }
+    var menuLogos: [Int: AgentProviderConfig] = [:] { didSet { refreshLogos() } }
     private var brandImage: NSImage?
 
     private func refreshLogos() {
@@ -275,7 +277,7 @@ final class AgentRoundButton: AgentComposerButton {
     let kind: Kind
     var onPress: (() -> Void)?
     var chatTheme: AgentTheme = .shared { didSet { needsDisplay = true } }
-    /// Dictation is listening: the accent fill shows that a click finishes it.
+    /// Dictation is listening: the accent ink shows that a click finishes it.
     var active = false { didSet { if active != oldValue { needsDisplay = true } } }
 
     init(kind: Kind) {
@@ -298,27 +300,21 @@ final class AgentRoundButton: AgentComposerButton {
 
     override var isEnabled: Bool { didSet { needsDisplay = true } }
 
-    /// Send is the one solid button; Stop and an idle Dictate are quieter, so the
+    /// Send is the one bright button; Stop and an idle Dictate are quieter, so the
     /// primary action stands out beside them.
     private var quiet: Bool { kind == .stop || (kind == .dictate && !active) }
 
     override func draw(_ dirtyRect: NSRect) {
-        let circle = NSBezierPath(ovalIn: bounds)
-        let solid = chatTheme.agentComposer.withAlphaComponent(1)
-        let fill = !isEnabled ? chatTheme.fg.withAlphaComponent(0.10) : active ? chatTheme.accent
-            : quiet ? chatTheme.fg.withAlphaComponent(0.10) : chatTheme.fg
-        fill.setFill()
-        circle.fill()
         if isEnabled && (hovered || isHighlighted) {
-            (quiet ? chatTheme.fg : solid).withAlphaComponent(isHighlighted ? 0.14 : 0.07).setFill()
-            circle.fill()
+            chatTheme.fg.withAlphaComponent(isHighlighted ? 0.10 : 0.06).setFill()
+            NSBezierPath(ovalIn: bounds).fill()
         }
-        let ink = !isEnabled ? chatTheme.fgDim : active ? chatTheme.accentForeground : quiet ? chatTheme.fg : solid
+        let ink = !isEnabled ? chatTheme.fgDim : active ? chatTheme.accent : quiet ? chatTheme.fgMuted : chatTheme.fg
         let icon: AppIcon
         let size: CGFloat
         switch kind {
-        case .send: icon = .arrowUp; size = 16
-        case .stop: icon = .stop; size = 11
+        case .send: icon = .circleArrowUp; size = 24
+        case .stop: icon = .square; size = 16
         case .dictate: icon = .microphone; size = 16
         }
         icon.image(size: size, color: ink)?.draw(
@@ -496,8 +492,6 @@ final class AgentIconButton: AgentComposerButton {
     var onPress: (() -> Void)?
     var chatTheme: AgentTheme = .shared { didSet { needsDisplay = true } }
     var icon: AppIcon { didSet { needsDisplay = true } }
-    /// A resting disc behind the icon, as on the composer's attach button.
-    var filled = false { didSet { needsDisplay = true } }
     private let iconSize: CGFloat
 
     init(icon: AppIcon, label: String, iconSize: CGFloat = 16) {
@@ -519,13 +513,11 @@ final class AgentIconButton: AgentComposerButton {
     override var contentTintColor: NSColor? { didSet { needsDisplay = true } }
 
     override func draw(_ dirtyRect: NSRect) {
-        let resting: CGFloat = filled ? 0.08 : 0
-        let alpha = isEnabled && (hovered || isHighlighted) ? resting + (isHighlighted ? 0.10 : 0.05) : resting
-        if alpha > 0 {
-            chatTheme.fg.withAlphaComponent(alpha).setFill()
+        if isEnabled && (hovered || isHighlighted) {
+            chatTheme.fg.withAlphaComponent(isHighlighted ? 0.10 : 0.05).setFill()
             NSBezierPath(ovalIn: bounds).fill()
         }
-        let ink = isEnabled ? (contentTintColor ?? (filled ? chatTheme.fg : chatTheme.fgMuted)) : chatTheme.fgDim.withAlphaComponent(0.6)
+        let ink = isEnabled ? (contentTintColor ?? chatTheme.fgMuted) : chatTheme.fgDim.withAlphaComponent(0.6)
         icon.image(size: iconSize, color: ink)?.draw(
             in: NSRect(x: floor(bounds.midX - iconSize / 2), y: floor(bounds.midY - iconSize / 2), width: iconSize, height: iconSize),
             from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)

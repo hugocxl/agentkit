@@ -112,7 +112,7 @@ final class AgentPaneTests: XCTestCase {
             case .submit, .editQueued, .updateQueued, .moveQueued, .removeQueued, .deliverQueued, .resumeQueue, .answer, .decide, .retryTurn, .scheduleRetry: break
             case .create, .fork:
                 if failCreate { throw NSError(domain: "Offline", code: 1) }
-            case .send(_, let text, let model, let effort, let provider, _):
+            case .send(_, let text, let model, let effort, let provider, _, _):
                 if gateNextSend {
                     gateNextSend = false
                     await withCheckedContinuation { sendGate = $0 }
@@ -267,7 +267,7 @@ final class AgentPaneTests: XCTestCase {
         pane.send()
         try await wait { pane.errorMessage != nil }
         XCTAssertEqual(pane.draftAttachments.first?.data, bytes)
-        guard case .send(_, let text, _, _, _, let attachments) = backend.requests.last else { return XCTFail("Missing send") }
+        guard case .send(_, let text, _, _, _, let attachments, _) = backend.requests.last else { return XCTFail("Missing send") }
         XCTAssertEqual(text, "")
         XCTAssertEqual(attachments?.first?.data, bytes)
         XCTAssertEqual(attachments?.first?.name, file.lastPathComponent)
@@ -675,7 +675,7 @@ final class AgentPaneTests: XCTestCase {
         pane.surface.composer.string = "Use the discovered model"
         pane.send()
         try await wait { pane.surface.composer.string.isEmpty }
-        guard case .send(_, _, let model, let effort, let provider, _) = backend.requests.last else { return XCTFail("Missing send") }
+        guard case .send(_, _, let model, let effort, let provider, _, _) = backend.requests.last else { return XCTFail("Missing send") }
         XCTAssertEqual(model, "future-codex-model")
         XCTAssertEqual(provider, .codex)
         XCTAssertEqual(effort?.rawValue, "next-generation")
@@ -1684,7 +1684,9 @@ extension AgentPaneTests {
     /// history a stopped, failed or incomplete search covered.
     func testFindSearchesArchivedHistoryAndDescribesItsScope() async throws {
         let backend = Backend()
-        backend.snapshot.items = [AgentChatItem(id: "now", kind: .assistant, text: "Latest answer")]
+        // Enough retained messages that the pane opens far below the start, where earlier
+        // pages don't load by themselves.
+        backend.snapshot.items = (0..<80).map { AgentChatItem(id: "now\($0)", kind: .assistant, text: "Latest answer \($0)") }
         backend.snapshot.omittedItems = 260
         backend.snapshot.status = .idle
         let archive: [AgentChatItem] = (0..<250).map { index in

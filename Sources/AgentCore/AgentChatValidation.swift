@@ -26,8 +26,9 @@ extension AgentChatRequest {
                 for value in values { try AgentValidation.message(value, limit: 16 * 1024) }
             }
 
-        case .send(_, let text, let model, let effort, _, let attachments):
+        case .send(_, let text, let model, let effort, _, let attachments, let providerID):
             try AgentChatAttachment.validate(attachments ?? [])
+            if let providerID { try AgentValidation.message(providerID, limit: 64) }
             if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !(attachments ?? []).isEmpty {
                 guard text.utf8.count <= 64 * 1024 else { throw .badRequest }
             } else {

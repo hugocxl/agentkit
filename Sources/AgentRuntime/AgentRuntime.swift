@@ -310,7 +310,9 @@ internal final class AgentRuntime: @unchecked Sendable {
         environment.removeValue(forKey: "CLAUDECODE")
         // Only terminals are Tab sessions; an inherited one isn't this agent's.
         environment.removeValue(forKey: "TAB_SESSION_ID")
-        environment.merge(launch.environment) { _, tab in tab }
+        let config = launch.provider ?? .builtIn(provider)
+        environment = AgentProviderLaunch.environment(config, base: environment)
+        environment.merge(launch.environment) { _, host in host }
 
         if let path = launch.path { environment["PATH"] = [path, environment["PATH"]].compactMap { $0 }.joined(separator: ":") }
         let forking = launch.forkSource != nil && resumeSession == launch.forkSource
@@ -336,11 +338,13 @@ internal final class AgentRuntime: @unchecked Sendable {
             self.model = model
             self.reasoningEffort = reasoningEffort
         }
+        if provider == .codex { try AgentProviderLaunch.prepareShadowHome(config) }
         if provider == .codex, applicationOnly {
             arguments += ["-c", "features.shell_tool=false", "-c", "features.multi_agent=false", "-c", "web_search=\"disabled\""]
         }
+        arguments += AgentProviderLaunch.homeArguments(config) + config.arguments
         let launch = try launchBuilder?(arguments) ?? launchOverride ?? AgentProcess.Launch(
-            executable: suppliedExecutable ?? AgentProcess.resolve(provider == .claude ? "claude" : "codex", environment: environment),
+            executable: suppliedExecutable ?? AgentProviderLaunch.executable(config, environment: environment),
             arguments: arguments, environment: environment)
         let generation = processGeneration
         // One physical folder per launch: the identity recorded, the process's folder and the
