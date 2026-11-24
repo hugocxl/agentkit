@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.6.1 - 2026-11-24
+
+### Fixed
+
+- Align package version metadata with the changelog.
+
 ## 1.6.0 - 2026-11-24
 
 ### Added
