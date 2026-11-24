@@ -1676,6 +1676,36 @@ extension AgentPaneTests {
         XCTAssertEqual(timeline.items, [], "A cleared conversation starts over")
         XCTAssertFalse(timeline.merge(older: page(["a"], 0), before: nil, resetID: nil, basis: 6), "A page read before the clear is dropped")
     }
+
+    func testTrimmedItemsKeepTheirTurnsAndTheLeadStaysUnchanged() {
+        func item(_ id: String, _ kind: AgentChatItem.Kind = .assistant) -> AgentChatItem { AgentChatItem(id: id, kind: kind, text: id) }
+        func turn(_ user: String) -> AgentChatTurn {
+            AgentChatTurn(userItemID: user, startedAt: Date(timeIntervalSince1970: 1), completedAt: Date(timeIntervalSince1970: 2), status: .idle)
+        }
+        func window(_ items: [AgentChatItem], _ turns: [AgentChatTurn], omitted: Int) -> AgentChatSnapshot {
+            var snapshot = AgentChatSnapshot(session: SessionId(), project: ProjectId(), provider: .claude)
+            snapshot.items = items
+            snapshot.turns = turns
+            snapshot.omittedItems = omitted
+            return snapshot
+        }
+        var timeline = AgentEarlierTimeline()
+        let first = window([item("u1", .user), item("a1"), item("u2", .user), item("a2")], [turn("u1"), turn("u2")], omitted: 2)
+        timeline.observe(first)
+        XCTAssertTrue(timeline.merge(older: AgentEarlierItems(items: [item("x"), item("y")], start: 0, total: 2), before: nil, resetID: nil, basis: 2))
+        timeline.observe(first)
+        XCTAssertEqual(timeline.unchangedLead, 0, "A loaded page comes before everything shown")
+        XCTAssertEqual(timeline.displayed(first).items.map(\.id), ["x", "y", "u1", "a1", "u2", "a2"])
+        // The server trims the first turn out of its window, and its turn with it.
+        let trimmed = window([item("u2", .user), item("a2"), item("u3", .user)], [turn("u2"), turn("u3")], omitted: 4)
+        timeline.observe(trimmed)
+        let shown = timeline.displayed(trimmed)
+        XCTAssertEqual(shown.items.map(\.id), ["x", "y", "u1", "a1", "u2", "a2", "u3"])
+        XCTAssertEqual(shown.turns?.map(\.userItemID), ["u1", "u2", "u3"], "The carried turn keeps its shape")
+        XCTAssertEqual(timeline.unchangedLead, 2, "What was shown first is still shown first")
+        timeline.observe(trimmed)
+        XCTAssertEqual(timeline.unchangedLead, 4)
+    }
 }
 
 extension AgentPaneTests {

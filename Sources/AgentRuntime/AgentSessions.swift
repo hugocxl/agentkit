@@ -267,8 +267,8 @@ final class AgentSessions: @unchecked Sendable {
     }
 
     private let queue = DispatchQueue(label: "tab.agents.sessions", qos: .userInitiated)
-    /// Writes records and removes files, in the order asked.
-    private let writer: DispatchQueue
+    /// Writes records and removes files, in the order asked. Internal so tests can hold it.
+    let writer: DispatchQueue
     /// Closed once the store is released to its next owner: nothing is written after.
     private let fence = AgentStoreFence()
     /// Line indexes of the archives of dropped items, so paging back stays cheap at any length.

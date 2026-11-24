@@ -378,6 +378,9 @@ public enum AppIcon: String, CaseIterable, Sendable {
         }
     }
 
+    /// Whether @hugocxl/icons draws this glyph as an outline.
+    var hasStrokeArtwork: Bool { StrokeIcon(rawValue: rawValue) != nil }
+
     /// The glyph from the chosen set. Brand and language logos have no
     /// stroke version, so they keep their single mark.
     private func source(_ artwork: Artwork) -> NSImage? {

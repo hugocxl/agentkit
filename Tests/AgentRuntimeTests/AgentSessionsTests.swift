@@ -4457,3 +4457,81 @@ extension AgentSessionsTests {
         XCTAssertFalse(FileManager.default.fileExists(atPath: AgentChildTranscripts.directory(root: root, session: archive).path))
     }
 }
+
+extension AgentSessionsTests {
+    func testSentAttachmentPreviewsBeforeItIsWrittenToDisk() async throws {
+        let root = try root()
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: { _, _, _, callback in
+            let runtime = FakeAgentRuntime(callback)
+            runtime.onSend = { callback(.status(.idle)) }
+            return runtime
+        })
+        defer { sessions.shutdown() }
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        // Hold the writer, so the sent file can't reach the disk yet; the hold ends on its own
+        // so a read that waits for the disk fails instead of hanging.
+        let hold = DispatchSemaphore(value: 0)
+        sessions.writer.async { _ = hold.wait(timeout: .now() + 5) }
+        let png = AgentChatAttachment(name: "Screenshot.png", mimeType: "image/png", data: Data([0x89, 0x50, 0x4E, 0x47, 1, 2, 3]))
+        let send = Task { try await sessions.handle(.send(session: id, text: "Look", model: nil, attachments: [png])) }
+        let user = try await waitForUserItem(sessions, id)
+        let started = Date()
+        // The message is on screen while its file still waits to be written.
+        let early = try await sessions.attachment(.init(session: id, item: user.id, attachment: png.id))
+        XCTAssertEqual(early.attachment.data, png.data)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2, "The preview came from memory, not after the write")
+        hold.signal()
+        _ = try await send.value
+        let stored = try await sessions.attachment(.init(session: id, item: user.id, attachment: png.id))
+        XCTAssertEqual(stored.attachment.data, png.data)
+    }
+
+    func testAConversationKeepsTheProviderItChoseAndStartsWithItsSettings() async throws {
+        let root = try root()
+        let box = AgentRuntimeBox()
+        let settings = AgentProviderSettings(providers: [
+            AgentProviderConfig(id: "claude-2", kind: .claude, arguments: ["--chrome"]),
+            AgentProviderConfig(id: "off", kind: .claude, enabled: false),
+        ])
+        let sessions = try AgentSessions(root: root, projectDirectory: { _ in root.path }, factory: { _, _, _, callback in
+            let runtime = FakeAgentRuntime(callback)
+            runtime.onSend = { callback(.status(.idle)) }
+            box.install(runtime)
+            return runtime
+        })
+        sessions.providers = { id, kind in settings.provider(id, kind: kind) }
+        defer { sessions.shutdown() }
+
+        let id = SessionId()
+        _ = try await sessions.handle(.create(session: id, project: ProjectId(), provider: .claude))
+        let started = try await sessions.handle(.send(session: id, text: "Start", model: nil, provider: .claude, providerID: "claude-2"))
+        XCTAssertEqual(started.providerID, "claude-2")
+        XCTAssertEqual(box.runtime?.launches.last?.provider?.arguments, ["--chrome"])
+
+        // A prompt without a provider ID, as from an older host, carries on with the same provider.
+        let next = try await sessions.handle(.send(session: id, text: "Next", model: nil, provider: .claude))
+        XCTAssertEqual(next.providerID, "claude-2")
+        do {
+            _ = try await sessions.handle(.send(session: id, text: "Other account", model: nil, provider: .claude, providerID: "claude"))
+            XCTFail("An established conversation must not move to another account")
+        } catch {}
+
+        let fresh = SessionId()
+        _ = try await sessions.handle(.create(session: fresh, project: ProjectId(), provider: .claude))
+        do {
+            _ = try await sessions.handle(.send(session: fresh, text: "Hi", model: nil, provider: .claude, providerID: "off"))
+            XCTFail("A disabled provider starts no conversation")
+        } catch {
+            XCTAssertTrue("\(error)".contains("disabled"), "\(error)")
+        }
+    }
+
+    private func waitForUserItem(_ sessions: AgentSessions, _ id: SessionId) async throws -> AgentChatItem {
+        for _ in 0..<300 {
+            if let user = try? await sessions.handle(.read(session: id)).items.first(where: { $0.kind == .user }) { return user }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        throw AgentRuntimeError("The message never appeared.")
+    }
+}
