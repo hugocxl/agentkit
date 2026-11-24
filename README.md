@@ -2,37 +2,40 @@
 
 ### A native AI conversation, inside your Mac app.
 
-**A Swift package that puts a full AI conversation inside your macOS app**, powered by the Claude Code, Codex or other agent CLI already installed on the Mac, from Gemini CLI to any Agent Client Protocol agent. It is the conversation from [Tab](https://hugocxl.github.io/tab/), with its interface, runtime and saved sessions, made into something any app can use.
+**A Swift package that puts a full AI conversation inside your macOS app**, powered by the Claude Code, Codex, or Agent Client Protocol CLI already installed on the Mac. Extracted from [Tab](https://hugocxl.github.io/tab/) and used by Tab and Filmatte.
 
-[Read the docs](https://hugocxl.github.io/agentkit/docs.html) · [See the changelog](CHANGELOG.md) · [Visit the website](https://hugocxl.github.io/agentkit/)
+[Read the docs](https://hugocxl.github.io/agentkit/docs.html) · [Changelog](CHANGELOG.md) · [Visit the website](https://hugocxl.github.io/agentkit/)
 
 [![AgentKit's home page: a native conversation, your app's tools and local CLIs](.github/preview.png)](https://hugocxl.github.io/agentkit/)
 
-## Built for AI-first apps
+## Highlights
 
-Your app describes what it can do, and the agent does it through your own tools. AgentKit brings the conversation, streaming, model selection, tool results and sessions, and the same tools work with both Claude Code and Codex.
+- **Built for AI-first apps.** Expose your app's typed tools to Claude Code and Codex while keeping provider tools read-only or off so every change goes through your app's undo path.
+- **Complete conversation UI.** Streaming Markdown, code, tables, math, diagrams, attachments, model/reasoning pickers, approvals, prompt queue, search, and persisted sessions.
+- **Truly native.** Drawn in AppKit with a SwiftUI wrapper — no web view, no bundled model, and an offline demo in the example app.
 
-Your app stays in charge. When it hands the agent its own tools, the provider's built-in tools are switched off or kept read-only, and every change goes through your app's own editing and undo.
+## Development
 
-## Everything a conversation needs
+Requires macOS 14+ on Apple silicon and Xcode 27.
 
-Streaming replies with Markdown, code, tables, math and diagrams. A composer with attachments, model and reasoning choices, approvals, questions and a prompt queue. Search, citations, subagent activity, file changes and checkpoints you can review.
+```sh
+scripts/validate.sh               # warnings-as-errors build, tests, example bundle
+scripts/bundle-example.sh         # bundle build/AgentKit Example.app
+scripts/stop.sh                   # quit this checkout's example app
+```
 
-Conversations and drafts are saved, so people pick up where they left off after a relaunch.
+Website (self-contained in `website/`):
 
-## At work in Tab and Filmatte
+```sh
+cd website && npm ci && npm run build:site && npm run check:site
+```
 
-Tab runs its agent panes on AgentKit, and Filmatte, a native video editor, lets an agent add text and cut the timeline through the editor's own tools. The [docs](https://hugocxl.github.io/agentkit/docs.html) show how to connect it to your app, from a single window to a server that hosts many projects.
+Linked Git worktrees isolate `AgentKit Example.app` with a checkout-unique bundle ID so parallel worktrees never collide.
 
-## Made to feel at home
+## Releases
 
-- **Truly native.** Drawn in AppKit rather than a web view, with a SwiftUI wrapper when you need one.
-- **Runs on what is already there.** The CLI and account people already use. No bundled model, no accounts to manage.
-- **Try it without an account.** The example app runs an offline demo that makes no model requests.
-- **Free to use.** Open source, for personal and commercial work.
+Commits follow `<Added|Changed|Removed|Improved|Fixed>: <One user-facing sentence.>` — `.githooks/` automatically updates `CHANGELOG.md` and creates the matching `vX.Y.Z` tag. Pushing to `main` runs validation and publishes the GitHub Release automatically.
 
 ## License
 
-AgentKit is [MIT licensed](LICENSE). Code and artwork adapted from T3 Code, Pierre's icons, Simple Icons, LobeHub Icons, Devicon and iTerm2-Color-Schemes keep their own licenses, and brand marks belong to their owners. [Third-party notices](THIRD_PARTY_NOTICES.md) has the details.
-
-Made by [Hugo](https://github.com/hugocxl), growing out of the conversation in [Tab](https://hugocxl.github.io/tab/). Ideas and contributions are welcome: [open an issue](https://github.com/hugocxl/agentkit/issues).
+AgentKit is [MIT licensed](LICENSE). Third-party attributions are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Made by [Hugo](https://github.com/hugocxl).

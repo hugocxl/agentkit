@@ -8,7 +8,7 @@ import { JSDOM } from "jsdom";
 const site = "_site";
 const pages = ["index.html", "docs.html", "commands.html", "validation.html", "changelog.html"];
 const docs = new Map(pages.map((name) => [name, new JSDOM(readFileSync(`${site}/${name}`, "utf8")).window.document]));
-const version = readFileSync("Sources/AgentCore/AgentKitVersion.swift", "utf8").match(/current = "([^"]+)"/)[1];
+const version = readFileSync("../Sources/AgentCore/AgentKitVersion.swift", "utf8").match(/current = "([^"]+)"/)[1];
 const local = (href) => !/^(https?:|mailto:|data:)/.test(href);
 let links = 0;
 
@@ -150,14 +150,14 @@ assert.ok(docs.get("commands.html").querySelectorAll(".ds-section > h2").length 
 // The changelog starts with the package's version, and every release has its own anchor.
 const releases = [...docs.get("changelog.html").querySelectorAll(".ds-section[id]")];
 assert.equal(releases[0]?.id, `v${version.replaceAll(".", "-")}`, "changelog starts with the current version");
-assert.equal(releases.length, (readFileSync("CHANGELOG.md", "utf8").match(/^## /gm) ?? []).length, "changelog releases");
+assert.equal(releases.length, (readFileSync("../CHANGELOG.md", "utf8").match(/^## /gm) ?? []).length, "changelog releases");
 // Docs links to the other Markdown files stay on the site.
 for (const a of docsPage.querySelectorAll("a[href]")) {
   assert.doesNotMatch(a.getAttribute("href"), /\/(commands|VALIDATION|CHANGELOG)\.md/, `docs: ${a.getAttribute("href")} should link to its page`);
 }
 
 // Site CSS stays inside the design system's tokens.
-const css = readFileSync("website/site.css", "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+const css = readFileSync("site.css", "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
 assert.doesNotMatch(css, /#[0-9a-f]{3,8}\b|rgba?\(|hsla?\(|oklch\(/i, "site.css: literal color");
 assert.doesNotMatch(css, /box-shadow|text-shadow|gradient|font-family|font-weight|border-radius:\s*\d/i, "site.css: off-token style");
 for (const [, property] of css.matchAll(/var\((--[\w-]+)/g)) assert.match(property, /^--ds-/, `site.css: ${property}`);

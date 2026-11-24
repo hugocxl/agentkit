@@ -434,3 +434,33 @@ extension AgentSubagentPaneTests {
         unsaved.close()
     }
 }
+
+extension AgentSubagentPaneTests {
+    func testSwitchingAnEstablishedConversationToAnotherProviderAsksFirst() async throws {
+        _ = NSApplication.shared
+        let session = SessionId(), project = ProjectId()
+        let snapshot = AgentChatSnapshot(session: session, project: project, provider: .claude, providerSession: "p",
+                                         status: .idle, revision: 2, items: [AgentChatItem(kind: .user, text: "Hi")])
+        let pane = AgentPaneController(session: session, project: project, provider: .claude) { _ in snapshot }
+        defer { pane.dispose() }
+        var asked: [String] = []
+        var answer = false
+        pane.confirmProviderHandoff = { provider in asked.append(provider); return answer }
+        pane.refresh()
+        try await wait { pane.snapshot != nil }
+        pane.selectModel(provider: .claude, model: "claude-opus-5-5")
+        try await wait { pane.selection.model == "claude-opus-5-5" }
+        XCTAssertTrue(asked.isEmpty, "Another model of the same provider carries on without a handoff")
+        pane.selectModel(provider: .codex, model: "gpt-6.1-sol")
+        try await wait { !asked.isEmpty }
+        XCTAssertEqual(asked, ["Codex"])
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(pane.selection.provider, .claude, "Cancelling keeps the provider")
+        answer = true
+        pane.selectModel(provider: .codex, model: "gpt-6.1-sol")
+        try await wait { pane.selection.provider == .codex }
+        pane.selectModel(provider: .codex, model: "gpt-6.1-luna")
+        try await wait { pane.selection.model == "gpt-6.1-luna" }
+        XCTAssertEqual(asked.count, 2, "Once switched, other models of the new provider don't ask again")
+    }
+}

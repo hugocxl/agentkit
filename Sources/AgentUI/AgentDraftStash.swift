@@ -372,7 +372,7 @@ extension AgentPaneController {
         reviewComments = entry.reviewComments ?? []
         refreshReviewComments()
         lastSubmission = nil
-        if let provider = entry.provider, provider == selection.provider || canChangeProvider, canEditSelection,
+        if let provider = entry.provider, provider == selection.provider || !switchingHandsOff, canEditSelection,
            entry.model != selection.model || provider != selection.provider {
             selectModel(provider: provider, model: entry.model)
         }

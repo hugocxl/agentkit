@@ -2,6 +2,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+git config core.hooksPath .githooks 2>/dev/null || true
 mkdir -p build/validation
 swift build --build-tests -Xswiftc -warnings-as-errors > build/validation/build.log 2>&1 || { tail -80 build/validation/build.log; exit 1; }
 if [ "$#" -gt 0 ]; then

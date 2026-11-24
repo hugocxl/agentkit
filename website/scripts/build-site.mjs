@@ -12,9 +12,9 @@ const escape = (text) =>
   String(text).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 
 // ─── Facts from the package ─────────────────────────────────────────────
-const version = read("Sources/AgentCore/AgentKitVersion.swift").match(/current = "([^"]+)"/)?.[1];
+const version = read("../Sources/AgentCore/AgentKitVersion.swift").match(/current = "([^"]+)"/)?.[1];
 if (!version) throw new Error("No version in AgentKitVersion.swift");
-const release = read("CHANGELOG.md").match(/^## (\S+) - (\d{4}-\d{2}-\d{2})$/m);
+const release = read("../CHANGELOG.md").match(/^## (\S+) - (\d{4}-\d{2}-\d{2})$/m);
 if (!release || release[1] !== version) throw new Error(`CHANGELOG.md does not start with ${version}`);
 const date = new Date(`${release[2]}T00:00:00Z`);
 const facts = {
@@ -44,13 +44,13 @@ const slug = (text) => text.toLowerCase().replace(/[^\w\s-]/g, "").trim().replac
 const github = "https://github.com/hugocxl/agentkit/blob/main/";
 // Markdown files with a page of their own; links to them stay on the site.
 const pages = {
-  "docs/INTEGRATION.md": "docs.html",
-  "docs/commands.md": "commands.html",
-  "docs/VALIDATION.md": "validation.html",
-  "CHANGELOG.md": "changelog.html",
+  "content/INTEGRATION.md": "docs.html",
+  "content/commands.md": "commands.html",
+  "content/VALIDATION.md": "validation.html",
+  "../CHANGELOG.md": "changelog.html",
 };
 // A link from a file in docs/: `../X.md` is at the root, `X.md` beside it.
-const pageFor = (href) => (href.startsWith("../") ? pages[href.slice(3)] : pages[`docs/${href}`]);
+const pageFor = (href) => (href.startsWith("../") ? pages[href] : pages[`content/${href}`]);
 const renderer = new marked.Renderer();
 renderer.code = ({ text }) =>
   `<div class="ds-code"><pre tabindex="0"><code>${escape(text)}</code></pre><button type="button">Copy</button></div>\n`;
@@ -64,7 +64,7 @@ renderer.link = function ({ href, title, tokens }) {
   const target = href.startsWith("https://hugocxl.github.io/agentkit/docs.html")
     ? "docs.html"
     : pageFor(path) ? pageFor(path) + (hash ? `#${hash}` : "")
-    : href.replace(/^\.\.\/(.+)$/, `${github}$1`).replace(/^([\w-]+\.md)$/, `${github}docs/$1`);
+    : href.replace(/^\.\.\/(.+)$/, `${github}$1`).replace(/^([\w-]+\.md)$/, `${github}website/content/$1`);
   return `<a href="${escape(target)}"${title ? ` title="${escape(title)}"` : ""}>${this.parser.parseInline(tokens)}</a>`;
 };
 
@@ -94,14 +94,14 @@ function renderMarkdown(path, { subheadings = false, id = slug } = {}) {
   return { title, html };
 }
 
-const integration = renderMarkdown("docs/INTEGRATION.md");
-const commands = renderMarkdown("docs/commands.md");
-const validation = renderMarkdown("docs/VALIDATION.md");
+const integration = renderMarkdown("content/INTEGRATION.md");
+const commands = renderMarkdown("content/commands.md");
+const validation = renderMarkdown("content/VALIDATION.md");
 // Each release is a section named for its version, such as #v1-5-0.
-const changelog = renderMarkdown("CHANGELOG.md", { subheadings: true, id: (text) => `v${text.split(" ")[0].replaceAll(".", "-")}` });
+const changelog = renderMarkdown("../CHANGELOG.md", { subheadings: true, id: (text) => `v${text.split(" ")[0].replaceAll(".", "-")}` });
 
 // ─── Templates ──────────────────────────────────────────────────────────
-const partial = (name) => read(`website/partials/${name}.html`).replace(/\n$/, "");
+const partial = (name) => read(`partials/${name}.html`).replace(/\n$/, "");
 // Inline artwork after the partials go in, since the masthead carries an icon.
 const replaceAsync = async (text, pattern, replace) => {
   const parts = await Promise.all([...text.matchAll(pattern)].map((match) => replace(...match)));
@@ -126,7 +126,7 @@ async function render(template, values) {
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
 cpSync(join(designSystem, "system"), `${out}/system`, { recursive: true, filter: (path) => !path.endsWith(".DS_Store") });
-cpSync("website/site.css", `${out}/site.css`);
+cpSync("site.css", `${out}/site.css`);
 
 const values = {
   ...facts,
@@ -139,7 +139,7 @@ const values = {
   changelog: changelog.html,
 };
 for (const page of ["index.html", ...Object.values(pages)]) {
-  writeFileSync(`${out}/${page}`, await render(read(`website/${page}`), values));
+  writeFileSync(`${out}/${page}`, await render(read(page), values));
 }
 writeFileSync(`${out}/.nojekyll`, "");
 console.log(`Built the AgentKit ${version} site.`);

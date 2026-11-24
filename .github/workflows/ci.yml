@@ -1,68 +1,16 @@
-name: Validate
+name: CI
+
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
   pull_request:
+  workflow_dispatch:
+
 permissions:
   contents: read
+
 concurrency:
-  group: validate-${{ github.ref }}
+  group: agentkit-ci-${{ github.ref }}
   cancel-in-progress: true
+
 jobs:
   validate:
-    runs-on: xcode-27
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-      - name: Select the development toolchain
-        run: |
-          test "$(uname -m)" = arm64
-          sudo xcode-select -s /Applications/Xcode_27.1.app
-          xcodebuild -version
-          swift --version
-      - name: Build, test, and bundle the standalone example
-        run: scripts/validate.sh
-      - uses: actions/upload-artifact@v6
-        if: failure()
-        with:
-          name: validation-logs
-          path: build/validation
-  # Once a push to main validates, every CHANGELOG.md version since the newest
-  # tag is tagged vX.Y.Z at the commit that adds it and published with its
-  # changelog section, so a cancelled run is caught up by the next one. Tags
-  # this job pushes don't start workflows again.
-  release:
-    needs: validate
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    concurrency:
-      group: agentkit-release
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - name: Tag and publish new versions
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898283+github-actions[bot]@users.noreply.github.com'
-          NEW="$(scripts/release-tags.sh tag "$GITHUB_SHA")"
-          [ -n "$NEW" ] || { echo 'No new version to release'; exit 0; }
-          mapfile -t TAGS <<< "$NEW"
-          # One push per tag: GitHub refuses this token a tag on a commit whose
-          # workflows differ from main's, and that mustn't hold back the others.
-          FAILED=0
-          for TAG in "${TAGS[@]}"; do
-            git push origin "refs/tags/$TAG" || { FAILED=1; continue; }
-            if gh release view "$TAG" > /dev/null 2>&1; then continue; fi
-            scripts/release-tags.sh notes "${TAG#v}" > "$RUNNER_TEMP/notes.md"
-            gh release create "$TAG" --verify-tag --title "AgentKit ${TAG#v}" --notes-file "$RUNNER_TEMP/notes.md"
-          done
-          exit "$FAILED"
+    uses: hugocxl/stack/.github/workflows/reusable-ci.yml@main

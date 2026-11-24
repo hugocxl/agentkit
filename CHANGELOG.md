@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.6.0 - 2026-11-24
+
+### Added
+
+- Switch a conversation that has already begun to another provider or account. After a confirmation that warns about the cost, the next message sends the new provider the whole conversation so far, and each message carries it until the new provider names its own conversation. Earlier turns can't be rewound after the switch.
+
+### Changed
+
+- Show each provider's logo in the model menu, and put reasoning effort in an Effort submenu that marks the model's default.
+
 ## 1.5.0 - 2026-11-23
 
 ### Added
