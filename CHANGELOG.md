@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.8.0 - 2026-11-27
+
+### Added
+
+- Let host apps draw conversations in the system's colors and accent with AgentStyle.Colors.system.
+
 ## 1.7.0 - 2026-11-27
 
 ### Added

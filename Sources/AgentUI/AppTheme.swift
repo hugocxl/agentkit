@@ -91,11 +91,25 @@ public final class AgentTheme: ObservableObject {
         let layoutChanged = AgentStyle.current != style
         AgentStyle.current = style
         if self.style != style { self.style = style }
-        // Recolor the scheme in use, which a host may have resolved itself.
-        let palette = style.colors.apply(to: ChromePalette(scheme: scheme))
-        if self.palette != palette { self.palette = palette }
+        recolor()
         if layoutChanged { AgentTextScale.invalidate() }
+        if !style.colors.followsSystem {
+            systemColorsObserver = nil
+        } else if systemColorsObserver == nil {
+            systemColorsObserver = SystemColorsObserver { [weak self] in
+                Task { @MainActor in self?.recolor() }
+            }
+        }
     }
+
+    /// Recolors the scheme in use, which a host may have resolved itself.
+    private func recolor() {
+        let palette = style.colors.apply(to: ChromePalette(scheme: scheme), dark: interfaceIsDark)
+        if self.palette != palette { self.palette = palette }
+    }
+
+    /// Recolors when the user changes the accent or another system color, while the style follows them.
+    private(set) var systemColorsObserver: SystemColorsObserver?
 
     public var glassEnabled: Bool { interface.interfaceStyle == .glass && !accessibility.reduceTransparency }
     public var glassPanes: Bool { glassEnabled && interface.glassPanes }
@@ -175,7 +189,7 @@ public final class AgentTheme: ObservableObject {
     public func setResolvedScheme(_ scheme: ColorScheme, interface: Appearance) {
         if self.interface != interface { self.interface = interface }
         if self.scheme != scheme { self.scheme = scheme }
-        let palette = style.colors.apply(to: ChromePalette(scheme: scheme))
+        let palette = style.colors.apply(to: ChromePalette(scheme: scheme), dark: interfaceIsDark)
         if self.palette != palette { self.palette = palette }
         refreshAccessibility()
     }
@@ -206,7 +220,7 @@ public final class AgentTheme: ObservableObject {
 
     private func apply() {
         let (scheme, resolved) = Self.resolve(catalog: catalog, darkTheme: darkTheme, lightTheme: lightTheme, dark: interfaceIsDark)
-        let palette = style.colors.apply(to: resolved)
+        let palette = style.colors.apply(to: resolved, dark: interfaceIsDark)
         if scheme != self.scheme { self.scheme = scheme }
         if palette != self.palette { self.palette = palette }
     }

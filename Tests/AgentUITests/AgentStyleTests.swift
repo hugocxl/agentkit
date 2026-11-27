@@ -92,6 +92,49 @@ final class AgentStyleTests: XCTestCase {
         XCTAssertEqual(theme.palette, original)
     }
 
+    func testSystemColorsFollowTheAppearanceUnderExplicitOverrides() throws {
+        func resolved(_ color: NSColor, dark: Bool) throws -> ChromeColor {
+            var result: ChromeColor?
+            try XCTUnwrap(NSAppearance(named: dark ? .darkAqua : .aqua)).performAsCurrentDrawingAppearance {
+                let rgb = color.usingColorSpace(.sRGB) ?? color
+                result = ChromeColor(red: rgb.redComponent, green: rgb.greenComponent, blue: rgb.blueComponent, alpha: rgb.alphaComponent)
+            }
+            return try XCTUnwrap(result)
+        }
+        for dark in [true, false] {
+            let theme = AgentTheme(systemIsDark: dark)
+            theme.setStyle(AgentStyle(colors: .system))
+            XCTAssertEqual(theme.palette.bg, try resolved(.windowBackgroundColor, dark: dark))
+            XCTAssertEqual(theme.palette.fg, try resolved(.labelColor, dark: dark))
+            XCTAssertEqual(theme.palette.fgMuted, try resolved(.secondaryLabelColor, dark: dark))
+            XCTAssertEqual(theme.palette.accent, try resolved(.controlAccentColor, dark: dark))
+            XCTAssertEqual(theme.palette.warning, try resolved(.systemOrange, dark: dark))
+            XCTAssertEqual(theme.isLight, !dark, "The window background keeps the theme's lightness")
+        }
+
+        let theme = AgentTheme(systemIsDark: true)
+        let accent = ChromeColor(hex: 0xFF_00_FF)
+        var colors = AgentStyle.Colors.system
+        colors.dark.accent = accent
+        theme.setStyle(AgentStyle(colors: colors))
+        XCTAssertEqual(theme.palette.accent, accent, "An explicit override wins over the system's color")
+        XCTAssertEqual(theme.palette.fg, try resolved(.labelColor, dark: true))
+    }
+
+    func testSystemColorsObserveSystemColorChangesOnlyWhileFollowed() {
+        let theme = AgentTheme(systemIsDark: true)
+        theme.setStyle(AgentStyle(colors: .system))
+        XCTAssertNotNil(theme.systemColorsObserver, "An accent change recolors the theme")
+        theme.setStyle(AgentStyle())
+        XCTAssertNil(theme.systemColorsObserver)
+
+        let changed = expectation(description: "system colors changed")
+        let observer = SystemColorsObserver { changed.fulfill() }
+        NotificationCenter.default.post(name: NSColor.systemColorsDidChangeNotification, object: nil)
+        wait(for: [changed], timeout: 1)
+        withExtendedLifetime(observer) {}
+    }
+
     func testStyleChangeNotifiesThemedViews() {
         _ = NSApplication.shared
         let theme = AgentTheme(systemIsDark: true)

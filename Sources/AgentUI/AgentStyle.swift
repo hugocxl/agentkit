@@ -149,10 +149,16 @@ public struct AgentStyle: Equatable, Sendable {
     public struct Colors: Equatable, Sendable {
         public var light: ChromePaletteOverrides
         public var dark: ChromePaletteOverrides
+        /// Draws with the system's semantic colors and the user's accent color,
+        /// following changes to them, beneath the `light` and `dark` overrides.
+        /// See `ChromePaletteOverrides.system(dark:)`.
+        public var followsSystem: Bool
 
-        public init(light: ChromePaletteOverrides = ChromePaletteOverrides(), dark: ChromePaletteOverrides = ChromePaletteOverrides()) {
+        public init(light: ChromePaletteOverrides = ChromePaletteOverrides(), dark: ChromePaletteOverrides = ChromePaletteOverrides(),
+                    followsSystem: Bool = false) {
             self.light = light
             self.dark = dark
+            self.followsSystem = followsSystem
         }
 
         /// The same overrides for light and dark themes, such as a brand accent.
@@ -160,9 +166,16 @@ public struct AgentStyle: Equatable, Sendable {
             self.init(light: both, dark: both)
         }
 
-        /// `palette` with the overrides for its lightness applied.
-        public func apply(to palette: ChromePalette) -> ChromePalette {
-            palette.applying(palette.isLight ? light : dark)
+        /// The system's colors and the user's accent, so the conversation
+        /// matches a native Mac app around it.
+        public static var system: Colors { Colors(followsSystem: true) }
+
+        /// `palette` with the system's colors for the `dark` or light appearance
+        /// when the style follows them, then the overrides for its lightness.
+        /// Without `dark`, the palette's own lightness picks the appearance.
+        @MainActor public func apply(to palette: ChromePalette, dark: Bool? = nil) -> ChromePalette {
+            let base = followsSystem ? palette.applying(.system(dark: dark ?? !palette.isLight)) : palette
+            return base.applying(base.isLight ? light : self.dark)
         }
     }
 
@@ -261,4 +274,40 @@ extension AgentStyle.Typography.SystemDesign {
         case .serif: .serif
         }
     }
+}
+
+extension ChromePaletteOverrides {
+    /// The system's semantic colors and the user's accent color as AppKit
+    /// draws them in the light or dark appearance: the window background,
+    /// label colors, separators, and the system's red, orange and green.
+    @MainActor public static func system(dark: Bool) -> ChromePaletteOverrides {
+        guard let appearance = NSAppearance(named: dark ? .darkAqua : .aqua) else { return ChromePaletteOverrides() }
+        var overrides = ChromePaletteOverrides()
+        appearance.performAsCurrentDrawingAppearance {
+            func chrome(_ color: NSColor) -> ChromeColor {
+                let rgb = color.usingColorSpace(.sRGB) ?? color
+                return ChromeColor(red: rgb.redComponent, green: rgb.greenComponent, blue: rgb.blueComponent, alpha: rgb.alphaComponent)
+            }
+            overrides = ChromePaletteOverrides(
+                background: chrome(.windowBackgroundColor), foreground: chrome(.labelColor),
+                accent: chrome(.controlAccentColor), danger: chrome(.systemRed), warning: chrome(.systemOrange),
+                success: chrome(.systemGreen), foregroundMuted: chrome(.secondaryLabelColor),
+                foregroundDim: chrome(.tertiaryLabelColor), border: chrome(.separatorColor)
+            )
+        }
+        return overrides
+    }
+}
+
+/// Calls back when the user changes the accent or another system color, until released.
+final class SystemColorsObserver {
+    private let token: any NSObjectProtocol
+
+    init(_ changed: @escaping @Sendable () -> Void) {
+        token = NotificationCenter.default.addObserver(
+            forName: NSColor.systemColorsDidChangeNotification, object: nil, queue: .main
+        ) { _ in changed() }
+    }
+
+    deinit { NotificationCenter.default.removeObserver(token) }
 }

@@ -25,7 +25,7 @@ One Swift package, three library products:
 Add `https://github.com/hugocxl/agentkit.git` in Xcode's package dependencies, or add:
 
 ```swift
-.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.7.0")
+.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.8.0")
 ```
 
 Select the products your target needs:
@@ -174,6 +174,8 @@ style.colors = .init(
 )
 theme.setStyle(style)
 ```
+
+To match a native Mac app, set `style.colors = .system`: the conversation draws with the system's semantic colors (window background, label colors, separators, red, orange and green) and the user's accent color, resolved for the theme's light or dark appearance, and recolors when the user changes the accent. Light and dark overrides still apply on top, such as `colors.dark.accent`.
 
 Overriding a base color (`background`, `foreground` or `accent`) derives its tints again (muted text, borders, hover, the accent's soft fill and the text drawn on it) unless you override those too. Light overrides apply while the theme in use is light, and dark ones while it is dark.
 
