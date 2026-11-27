@@ -18,6 +18,7 @@ public final class AgentSettingsWindowController: NSWindowController, NSWindowDe
         let controller = shared ?? AgentSettingsWindowController()
         shared = controller
         controller.configure(management, theme: theme ?? .shared, runCommand: runCommand)
+        controller.forgetBackend()
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -69,6 +70,18 @@ public final class AgentSettingsWindowController: NSWindowController, NSWindowDe
     }
 
     required init?(coder: NSCoder) { nil }
+
+    /// Drops what another backend's providers showed, so reopening never shows them.
+    private func forgetBackend() {
+        state = nil
+        selectedID = nil
+        models = [:]
+        modelsUnavailable = []
+        error = nil
+        shownSignature = nil
+        reloadList()
+        rebuildDetail(force: true)
+    }
 
     private func configure(_ management: AgentProviderManagement, theme: AgentTheme, runCommand: ((String) -> Void)?) {
         self.management = management

@@ -89,8 +89,8 @@ final class AgentSettingsWindowTests: XCTestCase {
         let backend = FakeProviders(AgentProviderSettings())
         let settings = AgentSettingsWindowController.show(backend.management)
         defer { settings.close() }
-        try await wait { settings.state != nil }
-        XCTAssertTrue(texts(in: settings.detail).contains("Add Provider…"))
+        try await wait { settings.state != nil && self.texts(in: settings.detail).contains("Add Provider…") }
+        XCTAssertEqual(settings.table.numberOfRows, 0, "another backend's providers never show")
 
         var added: AgentProviderConfig?
         let form = AgentAddProviderSheet(state: backend.state, theme: .shared, probe: backend.management.probe) { added = $0 }

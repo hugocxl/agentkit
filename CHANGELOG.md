@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.10.1 - 2026-11-27
+
+### Fixed
+
+- Reopening agent settings for another backend no longer shows the previous backend's providers.
+
 ## 1.10.0 - 2026-11-27
 
 ### Added
