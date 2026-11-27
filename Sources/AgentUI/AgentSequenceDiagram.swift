@@ -496,7 +496,7 @@ extension AgentSequenceDiagram {
     static let barWidth: CGFloat = 10
 
     static func smallFont(_ style: AgentDiagramStyle) -> NSFont {
-        NSFont.systemFont(ofSize: max(style.font.pointSize - 1, 9))
+        AgentFontFactory.text(max(style.font.pointSize - 1, 9))
     }
 
     static func boldFont(_ font: NSFont) -> NSFont {
@@ -880,7 +880,7 @@ private extension AgentSequenceDiagram {
             context.setFillColor(style.accent.cgColor)
             context.fillEllipse(in: circle)
             context.restoreGState()
-            let numberFont = NSFont.systemFont(ofSize: max(small.pointSize - 2, 8), weight: .semibold)
+            let numberFont = AgentFontFactory.text(max(small.pointSize - 2, 8), weight: .semibold)
             AgentDiagramText.draw(String(number), centeredAt: center, font: numberFont, color: style.surface)
         }
     }

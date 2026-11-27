@@ -6,7 +6,7 @@ struct AgentTranscriptLayout {
     private(set) var heights: [CGFloat] = []
     private var sums: [CGFloat] = [0]
     var leading: CGFloat = 28
-    let spacing: CGFloat = 26
+    var spacing: CGFloat { AgentStyle.current.spacing.message }
     private var trailingSpaces: [CGFloat] = []
     func spacing(at index: Int) -> CGFloat { trailingSpaces.indices.contains(index) ? trailingSpaces[index] : spacing }
 

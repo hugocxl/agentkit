@@ -97,7 +97,7 @@ final class AgentToolDisclosure: NSView, NSTextViewDelegate {
         scroll.autohidesScrollers = true
         scroll.borderType = .noBorder
         scroll.documentView = body
-        box.cornerRadius = 8
+        box.cornerRadius = Metrics.radiusLarge
         box.layer?.borderWidth = 1
         box.isHidden = true
         addSubview(box)

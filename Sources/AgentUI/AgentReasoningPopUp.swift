@@ -90,7 +90,7 @@ private final class AgentReasoningPickerView: NSView {
         focusedIndex = items.firstIndex(where: { $0 === selectedItem }) ?? 0
         super.init(frame: NSRect(x: 0, y: 0, width: 240, height: 42 + CGFloat(items.count) * 34 + 8))
         let heading = NSTextField(labelWithString: "Reasoning")
-        heading.font = .systemFont(ofSize: 12, weight: .semibold)
+        heading.font = AppFont.system(12, weight: .semibold)
         heading.textColor = theme.fgMuted
         heading.frame = NSRect(x: 16, y: 13, width: 208, height: 18)
         addSubview(heading)
@@ -193,7 +193,7 @@ private final class AgentReasoningRow: NSButton {
         }
         let ink = selected ? theme.fg : theme.fgMuted
         drawIcon(icon, in: NSRect(x: 10, y: 9, width: 16, height: 16), color: ink)
-        let font = NSFont.systemFont(ofSize: 13, weight: selected ? .medium : .regular)
+        let font = AppFont.system(13, weight: selected ? .medium : .regular)
         let titleWidth = (title as NSString).size(withAttributes: [.font: font]).width
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineBreakMode = .byTruncatingTail
@@ -204,7 +204,7 @@ private final class AgentReasoningRow: NSButton {
             theme.fg.withAlphaComponent(0.07).setFill()
             NSBezierPath(roundedRect: badge, xRadius: 4, yRadius: 4).fill()
             ("Default" as NSString).draw(at: NSPoint(x: badge.minX + 6, y: badge.minY + 2),
-                                       withAttributes: [.font: NSFont.systemFont(ofSize: 10, weight: .medium), .foregroundColor: theme.fgMuted])
+                                       withAttributes: [.font: AppFont.system(10, weight: .medium), .foregroundColor: theme.fgMuted])
         }
         if selected {
             drawIcon(.check, in: NSRect(x: bounds.width - 25, y: 10, width: 14, height: 14), color: theme.accent)

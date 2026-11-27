@@ -2,7 +2,7 @@ import AgentCore
 import AppKit
 
 extension Notification.Name {
-    /// Posted when the agent text scale changes, so open conversations render again.
+    /// Posted when the agent text scale or the style changes, so open conversations render again.
     static let agentTextScaleDidChange = Notification.Name("TabAgentTextScaleDidChange")
 }
 
@@ -11,17 +11,24 @@ extension Notification.Name {
 /// Changed only on the main thread; renderers read it while they draw.
 enum AgentTextScale {
     static let steps: [CGFloat] = [0.8, 0.9, 1, 1.1, 1.2, 1.35, 1.5, 1.7]
-    nonisolated(unsafe) private(set) static var factor: CGFloat = 1
+    /// The step the user chose.
+    nonisolated(unsafe) private(set) static var chosenStep: CGFloat = 1
+    /// Counts every change to the scale or the style, so a renderer can tell its output is stale.
+    nonisolated(unsafe) private(set) static var revision = 0
+
+    /// The chosen step at the style's conversation font size.
+    static var factor: CGFloat { chosenStep * AgentStyle.current.typography.conversationScale }
 
     /// `base` points at the current scale, on a half-point grid.
     static func size(_ base: CGFloat) -> CGFloat {
-        factor == 1 ? base : (base * factor * 2).rounded() / 2
+        let factor = factor
+        return factor == 1 ? base : (base * factor * 2).rounded() / 2
     }
 
     /// Steps the scale up or down; false at either end.
     @MainActor @discardableResult
     static func step(larger: Bool) -> Bool {
-        let index = steps.firstIndex(of: factor) ?? steps.firstIndex(of: 1) ?? 0
+        let index = steps.firstIndex(of: chosenStep) ?? steps.firstIndex(of: 1) ?? 0
         let next = index + (larger ? 1 : -1)
         guard steps.indices.contains(next) else { return false }
         set(steps[next])
@@ -30,8 +37,15 @@ enum AgentTextScale {
 
     @MainActor
     static func set(_ value: CGFloat) {
-        guard value != factor else { return }
-        factor = value
+        guard value != chosenStep else { return }
+        chosenStep = value
+        invalidate()
+    }
+
+    /// Renders open conversations again, after the scale or the style changed.
+    @MainActor
+    static func invalidate() {
+        revision &+= 1
         NotificationCenter.default.post(name: .agentTextScaleDidChange, object: nil)
     }
 }
@@ -39,11 +53,16 @@ enum AgentTextScale {
 /// Agent conversation fonts at the current text scale.
 enum AgentFont {
     static func system(_ size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
-        AppFont.system(AgentTextScale.size(size), weight: weight)
+        AgentFontFactory.text(AgentTextScale.size(size), weight: weight)
+    }
+
+    /// Text whose digits keep one width, such as ordered list markers.
+    static func digits(_ size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
+        AgentFontFactory.text(AgentTextScale.size(size), weight: weight, monospacedDigits: true)
     }
 
     static func mono(_ size: CGFloat = 12, weight: NSFont.Weight = .regular) -> NSFont {
-        AppFont.mono(AgentTextScale.size(size), weight: weight)
+        AgentFontFactory.mono(AgentTextScale.size(size), weight: weight)
     }
 }
 
@@ -59,7 +78,7 @@ final class AgentMarkdownRenderCache {
         var lineBreaks: Bool
         var rawHTML: Bool
         var listIndents: [Int: CGFloat]
-        var scale: CGFloat
+        var revision: Int
     }
 
     struct Key: Equatable {

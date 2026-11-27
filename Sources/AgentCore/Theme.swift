@@ -203,6 +203,11 @@ public struct ChromeColor: Equatable, Sendable {
         self.init(red: color.red, green: color.green, blue: color.blue, alpha: alpha)
     }
 
+    /// `0xRRGGBB` in sRGB, such as `ChromeColor(hex: 0x3B82F6)`.
+    public init(hex: UInt32, alpha: Double = 1) {
+        self.init(RGBColor(hex & 0xFF_FF_FF), alpha: alpha)
+    }
+
     public func withAlpha(_ alpha: Double) -> ChromeColor {
         ChromeColor(red: red, green: green, blue: blue, alpha: alpha)
     }
@@ -248,10 +253,21 @@ public struct ChromePalette: Equatable, Sendable {
     private static let fallbackAccent = RGBColor(0xCD_A7_6B)
 
     public init(scheme: ColorScheme) {
-        let background = ChromeColor(scheme.background ?? Self.fallbackBackground)
-        let foreground = ChromeColor(scheme.foreground ?? Self.fallbackForeground)
-        let accent = ChromeColor(scheme.paletteColor(4) ?? Self.fallbackAccent)
-        let danger = ChromeColor(scheme.paletteColor(1) ?? RGBColor(0xEC_7B_79))
+        self.init(
+            background: ChromeColor(scheme.background ?? Self.fallbackBackground),
+            foreground: ChromeColor(scheme.foreground ?? Self.fallbackForeground),
+            accent: ChromeColor(scheme.paletteColor(4) ?? Self.fallbackAccent),
+            danger: ChromeColor(scheme.paletteColor(1) ?? RGBColor(0xEC_7B_79)),
+            warning: ChromeColor(scheme.paletteColor(3) ?? RGBColor(0xE3_D1_70)),
+            success: ChromeColor(scheme.paletteColor(2) ?? RGBColor(0x9A_BE_87)),
+            hunk: scheme.paletteColor(6).map { ChromeColor($0) }
+        )
+    }
+
+    /// A palette from its base roles; text tints, surfaces, borders and the
+    /// accent's companions derive from them.
+    public init(background: ChromeColor, foreground: ChromeColor, accent: ChromeColor,
+                danger: ChromeColor, warning: ChromeColor, success: ChromeColor, hunk: ChromeColor? = nil) {
         bg = background
         fg = foreground
         fgMuted = foreground.withAlpha(0.65)
@@ -261,12 +277,56 @@ public struct ChromePalette: Equatable, Sendable {
         hover = foreground.withAlpha(0.06)
         self.accent = accent
         accentSoft = accent.withAlpha(0.1)
-        accentForeground = accent.luminance > 0.6 ? ChromeColor(red: 0, green: 0, blue: 0) : ChromeColor(red: 1, green: 1, blue: 1)
-        warning = ChromeColor(scheme.paletteColor(3) ?? RGBColor(0xE3_D1_70))
+        accentForeground = Self.foreground(on: accent)
+        self.warning = warning
         self.danger = danger
-        diffAdd = ChromeColor(scheme.paletteColor(2) ?? RGBColor(0x9A_BE_87))
+        diffAdd = success
         diffRemove = danger
-        diffHunk = scheme.paletteColor(6).map { ChromeColor($0) } ?? accent
+        diffHunk = hunk ?? accent
+    }
+
+    /// Black or white, whichever reads on `fill`.
+    public static func foreground(on fill: ChromeColor) -> ChromeColor {
+        fill.luminance > 0.6 ? ChromeColor(red: 0, green: 0, blue: 0) : ChromeColor(red: 1, green: 1, blue: 1)
+    }
+
+    /// The palette with `overrides` applied. Overriding a base role such as the
+    /// background, foreground or accent derives its tints again, unless those
+    /// are overridden too.
+    public func applying(_ overrides: ChromePaletteOverrides) -> ChromePalette {
+        guard overrides != ChromePaletteOverrides() else { return self }
+        let hunkFollowsAccent = diffHunk == accent
+        var palette = ChromePalette(
+            background: overrides.background ?? bg,
+            foreground: overrides.foreground ?? fg,
+            accent: overrides.accent ?? accent,
+            danger: overrides.danger ?? danger,
+            warning: overrides.warning ?? warning,
+            success: overrides.success ?? diffAdd,
+            hunk: hunkFollowsAccent ? nil : diffHunk
+        )
+        if overrides.foreground == nil {
+            palette.fgMuted = fgMuted
+            palette.fgDim = fgDim
+            palette.surface = surface
+            palette.hover = hover
+            if overrides.background == nil { palette.border = border }
+        }
+        if overrides.accent == nil {
+            palette.accentSoft = accentSoft
+            palette.accentForeground = accentForeground
+        }
+        if overrides.danger == nil { palette.diffRemove = diffRemove }
+        if let value = overrides.foregroundMuted { palette.fgMuted = value }
+        if let value = overrides.foregroundDim { palette.fgDim = value }
+        if let value = overrides.surface { palette.surface = value }
+        if let value = overrides.border { palette.border = value }
+        if let value = overrides.hover { palette.hover = value }
+        if let value = overrides.accentSoft { palette.accentSoft = value }
+        if let value = overrides.accentForeground { palette.accentForeground = value }
+        if let value = overrides.diffAdd { palette.diffAdd = value }
+        if let value = overrides.diffRemove { palette.diffRemove = value }
+        return palette
     }
 
     /// Whether the background is light, so dark-on-light assets apply.
@@ -277,6 +337,56 @@ public struct ChromePalette: Equatable, Sendable {
 
     /// A surface drawn opaque over the background, for raised cards.
     public var raised: ChromeColor { surface.blended(over: bg, amount: surface.alpha) }
+}
+
+/// Colors that replace a theme's chrome colors, so an embedded conversation
+/// can match its host app. Every color left nil keeps the theme's own.
+public struct ChromePaletteOverrides: Equatable, Sendable {
+    /// The canvas behind the conversation.
+    public var background: ChromeColor?
+    /// Body text; muted and dim text, surfaces, hover and borders derive from it.
+    public var foreground: ChromeColor?
+    /// Links, selection and primary buttons; its soft tint and the text drawn on it derive from it.
+    public var accent: ChromeColor?
+    public var danger: ChromeColor?
+    public var warning: ChromeColor?
+    /// Completed work and added lines.
+    public var success: ChromeColor?
+    public var foregroundMuted: ChromeColor?
+    public var foregroundDim: ChromeColor?
+    /// Pills, chips and raised fills.
+    public var surface: ChromeColor?
+    public var border: ChromeColor?
+    public var hover: ChromeColor?
+    public var accentSoft: ChromeColor?
+    /// Text and glyphs drawn on the accent.
+    public var accentForeground: ChromeColor?
+    public var diffAdd: ChromeColor?
+    public var diffRemove: ChromeColor?
+
+    public init(
+        background: ChromeColor? = nil, foreground: ChromeColor? = nil, accent: ChromeColor? = nil,
+        danger: ChromeColor? = nil, warning: ChromeColor? = nil, success: ChromeColor? = nil,
+        foregroundMuted: ChromeColor? = nil, foregroundDim: ChromeColor? = nil, surface: ChromeColor? = nil,
+        border: ChromeColor? = nil, hover: ChromeColor? = nil, accentSoft: ChromeColor? = nil,
+        accentForeground: ChromeColor? = nil, diffAdd: ChromeColor? = nil, diffRemove: ChromeColor? = nil
+    ) {
+        self.background = background
+        self.foreground = foreground
+        self.accent = accent
+        self.danger = danger
+        self.warning = warning
+        self.success = success
+        self.foregroundMuted = foregroundMuted
+        self.foregroundDim = foregroundDim
+        self.surface = surface
+        self.border = border
+        self.hover = hover
+        self.accentSoft = accentSoft
+        self.accentForeground = accentForeground
+        self.diffAdd = diffAdd
+        self.diffRemove = diffRemove
+    }
 }
 
 /// A theme by name with its colors.

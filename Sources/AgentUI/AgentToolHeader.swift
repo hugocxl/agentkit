@@ -26,7 +26,7 @@ final class AgentToolHeader: NSButton {
     var timestamp: Date? { didSet { if oldValue != timestamp { updateTimestamp() } } }
     private(set) var timestampTooltip: String?
 
-    static let chipFont = AppFont.mono(12)
+    static var chipFont: NSFont { AppFont.mono(12) }
     static let maximumChipWidth: CGFloat = 560
     /// The gap before the icon, inside the hover plate. Rows place the header this far
     /// left of their edge so the icon lines up with the transcript's text.

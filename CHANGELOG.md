@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.7.0 - 2026-11-27
+
+### Added
+
+- Let host apps customize fonts, sizes, spacing, corner radii and colors with AgentStyle.
+
 ## 1.6.2 - 2026-11-24
 
 ### Fixed

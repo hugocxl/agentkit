@@ -54,7 +54,7 @@ enum AgentMarkdown {
         let listIndents = AgentListLayout.indents(blocks, font: AgentFont.system(compact ? 12 : 14, weight: .light)).merging(suppliedListIndents) { _, supplied in supplied }
         let context = AgentMarkdownRenderCache.Context(palette: theme.palette, scheme: theme.scheme, fileLinks: fileLinks, references: references,
                                                        compact: compact, lineBreaks: lineBreaks, rawHTML: rawHTML, listIndents: listIndents,
-                                                       scale: AgentTextScale.factor)
+                                                       revision: AgentTextScale.revision)
         let reusable = cache?.context == context ? cache?.parts ?? [] : []
         var rendered: [AgentMarkdownRenderCache.Part] = []
         defer { cache?.context = context; cache?.parts = rendered }
@@ -94,7 +94,7 @@ enum AgentMarkdown {
                 text = inline(content, theme: theme, font: AgentFont.system(size, weight: .semibold), color: level == 6 ? colors.muted : colors.heading, fileLinks: fileLinks, references: references, lineBreaks: lineBreaks, rawHTML: rawHTML)
             case .list(let marker, let content, let depth, let structure):
                 paragraph.headIndent = listIndents[blockIndex] ?? CGFloat(depth + 1) * 20
-                let markerFont = marker.hasSuffix(".") ? NSFont.monospacedDigitSystemFont(ofSize: AgentTextScale.size(compact ? 12 : 14), weight: .light) : AgentFont.system(compact ? 12 : 14, weight: .light)
+                let markerFont = marker.hasSuffix(".") ? AgentFont.digits(compact ? 12 : 14, weight: .light) : AgentFont.system(compact ? 12 : 14, weight: .light)
                 let markerWidth = ((marker + " ") as NSString).size(withAttributes: [.font: markerFont]).width
                 paragraph.firstLineHeadIndent = paragraph.headIndent - markerWidth
                 paragraph.tabStops = [NSTextTab(textAlignment: .left, location: paragraph.headIndent)]

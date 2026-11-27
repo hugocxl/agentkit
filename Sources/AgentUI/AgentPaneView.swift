@@ -96,9 +96,9 @@ final class AgentPaneView: ThemedView {
     /// Images, video and audio of assistant Markdown, cached for this conversation.
     let mediaLoader = AgentMediaLoader()
 
-    private let composerCard = AgentSurfaceCard(style: .agentComposer)
+    private let composerCard = AgentSurfaceCard(.composer)
     /// Errors and status notes, in a glass card just above the composer.
-    private let notice = AgentSurfaceCard(style: .agentPanel)
+    private let notice = AgentSurfaceCard(.panel)
     private let emptyTitle = makeLabel("What can I help with?", font: AppFont.system(21, weight: .medium))
     private let emptyDetail = makeLabel("Ask a question or make something new.", font: AppFont.body)
     /// What the agent waits for; pressing it scrolls to the request.
@@ -160,7 +160,7 @@ final class AgentPaneView: ThemedView {
     let retryTurn = PillButton("Retry", style: .plain)
     /// Asks the owning backend to send a usage-limited turn's prompt again at the reset time, or cancels that.
     let resumeAtReset = PillButton("Resume at Reset", style: .plain)
-    static let readableWidth: CGFloat = 896
+    static var readableWidth: CGFloat { AgentStyle.current.spacing.readableWidth }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)

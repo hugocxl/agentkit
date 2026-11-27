@@ -197,7 +197,7 @@ extension AgentXYChartDiagram {
     static let plotHeight: CGFloat = 240
 
     static func smallFont(_ style: AgentDiagramStyle) -> NSFont {
-        NSFont.systemFont(ofSize: max(style.font.pointSize - 1, 9))
+        AgentFontFactory.text(max(style.font.pointSize - 1, 9))
     }
 
     static func boldFont(_ font: NSFont) -> NSFont {

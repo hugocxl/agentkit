@@ -5,13 +5,17 @@ import AppKit
 /// The transcript scrolls behind it, blurred by the glass and dimmed by a theme fill.
 @MainActor
 final class AgentSurfaceCard: ThemedView {
+    enum Role { case composer, panel }
+
+    let role: Role
     let style: GlassView.Style
     private let glass: GlassView
     /// Sits above the glass: a layer's own background would draw beneath it.
     private let fill = NSView()
 
-    init(style: GlassView.Style) {
-        self.style = style
+    init(_ role: Role) {
+        self.role = role
+        style = role == .composer ? .agentComposer : .agentPanel
         glass = GlassView(style: style)
         super.init(frame: .zero)
         fill.wantsLayer = true
@@ -33,7 +37,7 @@ final class AgentSurfaceCard: ThemedView {
         // Enough of the theme's composer color to keep text legible over a busy transcript,
         // while the conversation still reads through the glass. The panels above the
         // composer let more of it through, so they read as messages over the conversation.
-        let glassOpacity: CGFloat = style.cornerRadius == GlassView.Style.agentComposer.cornerRadius ? 0.45 : 0.3
+        let glassOpacity: CGFloat = role == .composer ? 0.45 : 0.3
         fill.layer?.backgroundColor = theme.agentComposer.withAlphaComponent(theme.glassEnabled ? glassOpacity : 0.82).cgColor
     }
 
@@ -59,7 +63,7 @@ enum AgentPanelMetrics {
     /// A card of one row.
     static let compactHeight: CGFloat = rowHeight + inset * 2
     /// A row's hover fill, concentric with its card's corners.
-    static let rowRadius: CGFloat = GlassView.Style.agentPanel.cornerRadius - inset
+    static var rowRadius: CGFloat { max(0, GlassView.Style.agentPanel.cornerRadius - inset) }
     static let iconSide: CGFloat = 16
     static let glyphSize: CGFloat = 15
     /// A row's leading icon and text, from the row's edge.
@@ -69,10 +73,10 @@ enum AgentPanelMetrics {
     static let textGap: CGFloat = 8
     /// Between stacked cards.
     static let gap: CGFloat = 8
-    static let titleFont = AppFont.body
-    static let detailFont = AppFont.small
+    static var titleFont: NSFont { AppFont.body }
+    static var detailFont: NSFont { AppFont.small }
     /// Running times and counts, in digits that keep their width as they tick.
-    static let metaFont = NSFont.monospacedDigitSystemFont(ofSize: AppFont.small.pointSize, weight: .regular)
+    static var metaFont: NSFont { AppFont.digits(12) }
 }
 
 /// A glass card of one row above the composer, such as what the agent waits for or
@@ -82,7 +86,7 @@ final class AgentPanelLine: ThemedView {
     /// How the icon reads: the accent asks for the user, muted only informs.
     enum Tone { case accent, muted }
     var onPress: (() -> Void)?
-    private let card = AgentSurfaceCard(style: .agentPanel)
+    private let card = AgentSurfaceCard(.panel)
     private let highlight = NSView()
     private let icon = NoticeIcon()
     private let title = makeLabel("", font: AgentPanelMetrics.titleFont)
@@ -209,7 +213,7 @@ final class AgentQueueView: ThemedView {
     private static let headerHeight = AgentPanelMetrics.rowHeight
     private static let rowHeight = AgentPanelMetrics.rowHeight
     private static let visibleRows = 4
-    private let card = AgentSurfaceCard(style: .agentPanel)
+    private let card = AgentSurfaceCard(.panel)
     /// The paused queue's header: a pause mark in the rows' icon column, then why.
     private let pauseIcon = NSImageView()
     private let title = makeLabel("", font: AgentPanelMetrics.detailFont)
@@ -449,7 +453,7 @@ final class AgentQuestionView: ThemedView, NSTextFieldDelegate {
     /// Lines the form's text up with the other panels' icon column.
     private static let inset = AgentPanelMetrics.inset + AgentPanelMetrics.iconX
     private static let footerHeight: CGFloat = 48
-    private let card = AgentSurfaceCard(style: .agentPanel)
+    private let card = AgentSurfaceCard(.panel)
     private let scroll = NSScrollView()
     private let content = AgentFlippedView()
     private let submit = PillButton("Submit answers", style: .primary)

@@ -64,7 +64,7 @@ final class NoticeView: ThemedView {
     private static let trailingInset: CGFloat = 8
     /// Narrower than this, the message hides and stays in the tooltip.
     private static let minimumTextWidth: CGFloat = 24
-    static let font = AppFont.system(13, weight: .medium)
+    static var font: NSFont { AppFont.system(13, weight: .medium) }
 
     private let glass = GlassView(style: .chip)
     private let icon = NoticeIcon()

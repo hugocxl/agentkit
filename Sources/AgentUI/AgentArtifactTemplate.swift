@@ -148,10 +148,10 @@ final class AgentResponseTemplate: AgentResponseSection {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.cornerRadius = 10
+        layer?.cornerRadius = Metrics.cardRadius
         layer?.borderWidth = 1
         iconBox.wantsLayer = true
-        iconBox.layer?.cornerRadius = 7
+        iconBox.layer?.cornerRadius = max(0, Metrics.radiusLarge - 1)
         iconBox.layer?.borderWidth = 1
         iconBox.addSubview(icon)
         for child in [iconBox, title, subtitle, use] as [NSView] {

@@ -412,7 +412,7 @@ extension AgentClassDiagram {
     }
 
     static func annotationFont(_ style: AgentDiagramStyle) -> NSFont {
-        NSFont.systemFont(ofSize: max(style.font.pointSize - 2, 9))
+        AgentFontFactory.text(max(style.font.pointSize - 2, 9))
     }
 
     /// Heights of the name, field and method compartments of a class.

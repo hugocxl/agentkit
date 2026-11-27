@@ -184,7 +184,7 @@ final class AgentResponseContainer: AgentResponseSection {
                 AgentListBullet.draw(bullet, rect: AgentListBullet.rect(textX: leading, baseline: baseline, font: AgentFont.system(compactProse ? 12 : 14)), color: marker.textColor ?? .labelColor)
             }
             if let orderedMarker {
-                let font = NSFont.monospacedDigitSystemFont(ofSize: compactProse ? 12 : 14, weight: .regular)
+                let font = AgentFont.digits(compactProse ? 12 : 14)
                 let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: marker.textColor ?? .labelColor]
                 let width = ((orderedMarker + " ") as NSString).size(withAttributes: attributes).width
                 (orderedMarker as NSString).draw(at: NSPoint(x: leading - width, y: baseline - font.ascender), withAttributes: attributes)

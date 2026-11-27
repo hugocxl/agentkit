@@ -4,6 +4,7 @@ import AppKit
 /// Reserves CSS inline-code borders and padding without inserting clipboard characters.
 enum AgentInlineCodeLayout {
     static func font(size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
+        guard AgentFontFactory.usesSystemMono else { return AgentFontFactory.mono(size, weight: weight) }
         // The source renderer's ui-monospace/SF Mono stack resolves to this face on macOS. The
         // system UI monospace face has similar advances but different ascenders.
         // Descriptor weights may use Float precision; compare between named weights.

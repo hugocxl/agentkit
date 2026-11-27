@@ -84,7 +84,7 @@ public final class FindBar: NSView, NSTextFieldDelegate {
         wantsLayer = true
         clipsToBounds = true
         fieldBox.wantsLayer = true
-        fieldBox.layer?.cornerRadius = 6
+        fieldBox.layer?.cornerRadius = Metrics.radiusMedium
         fieldBox.layer?.borderWidth = 1
         field.isBezeled = false
         field.drawsBackground = false
@@ -196,19 +196,19 @@ public final class FindBar: NSView, NSTextFieldDelegate {
     private func applyStyle() {
         fieldBox.layer?.backgroundColor = style.fieldBackground.cgColor
         fieldBox.layer?.borderColor = style.fieldBorder.cgColor
-        field.font = .systemFont(ofSize: style.fontSize)
+        field.font = AgentFontFactory.text(style.fontSize)
         field.textColor = style.text
         field.setAccessibilityLabel(placeholder.trimmingCharacters(in: CharacterSet(charactersIn: "…")))
         field.placeholderAttributedString = NSAttributedString(
             string: placeholder,
-            attributes: [.foregroundColor: style.muted, .font: NSFont.systemFont(ofSize: style.fontSize)])
-        counterLabel.font = .systemFont(ofSize: style.captionSize)
+            attributes: [.foregroundColor: style.muted, .font: AgentFontFactory.text(style.fontSize)])
+        counterLabel.font = AgentFontFactory.text(style.captionSize)
         counterLabel.textColor = style.muted
         for button in [previousButton, nextButton, closeButton] { button.contentTintColor = style.muted }
         caseButton.attributedTitle = NSAttributedString(
             string: "Aa",
             attributes: [.foregroundColor: isCaseSensitive ? style.accent : style.muted,
-                         .font: NSFont.systemFont(ofSize: style.fontSize, weight: .medium)])
+                         .font: AgentFontFactory.text(style.fontSize, weight: .medium)])
         caseButton.setAccessibilityValue(isCaseSensitive ? "on" : "off")
         needsDisplay = true
     }

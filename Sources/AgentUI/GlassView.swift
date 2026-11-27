@@ -38,9 +38,9 @@ public final class GlassView: NSView {
         /// goes flat, and the panes' glass must find the desktop beneath it.
         public static let window = Style(cornerRadius: 0, fallbackMaterial: .hudWindow, usesLiquidGlass: false)
         /// A pane's continuous glass surface, underneath its header and content.
-        public static let pane = Style(cornerRadius: Metrics.cardRadius, regular: true)
+        public static var pane: Style { Style(cornerRadius: Metrics.cardRadius, regular: true) }
         /// The selected sidebar card's glass surface.
-        public static let card = Style(cornerRadius: 8, opacity: 0.4)
+        public static var card: Style { Style(cornerRadius: Metrics.radiusLarge, opacity: 0.4) }
 
         /// Always-on, diffused material for the command palette.
         public static let commandPalette = Style(cornerRadius: 20, fallbackMaterial: .popover, regular: true)
@@ -52,15 +52,15 @@ public final class GlassView: NSView {
         /// A mode chip beside the command palette's search field.
         public static let paletteChip = Style(cornerRadius: 14, fallbackMaterial: .popover, regular: true)
         /// The chrome's tooltip capsule.
-        public static let tooltip = Style(cornerRadius: 10, fallbackMaterial: .toolTip)
+        public static var tooltip: Style { Style(cornerRadius: AgentStyle.current.radii.popover, fallbackMaterial: .toolTip) }
         /// Popups anchored to a control, such as the agent composer's suggestions.
-        public static let popover = Style(cornerRadius: 10, fallbackMaterial: .menu)
+        public static var popover: Style { Style(cornerRadius: AgentStyle.current.radii.popover, fallbackMaterial: .menu) }
         /// The agent composer, floating over the conversation that scrolls behind it.
-        public static let agentComposer = Style(cornerRadius: 20, fallbackMaterial: .popover, regular: true)
+        public static var agentComposer: Style { Style(cornerRadius: AgentStyle.current.radii.composer, fallbackMaterial: .popover, regular: true) }
         /// Panels stacked above the agent composer: the prompt queue, questions and notices.
-        public static let agentPanel = Style(cornerRadius: 16, fallbackMaterial: .popover, regular: true)
+        public static var agentPanel: Style { Style(cornerRadius: AgentStyle.current.radii.panel, fallbackMaterial: .popover, regular: true) }
         /// The agent's activity capsule above those panels.
-        public static let agentActivity = Style(cornerRadius: 13, fallbackMaterial: .popover, regular: true)
+        public static var agentActivity: Style { Style(cornerRadius: AgentStyle.current.radii.panel * 13 / 16, fallbackMaterial: .popover, regular: true) }
     }
 
     private let material: NSView

@@ -1,26 +1,28 @@
 import AgentCore
 import AppKit
 
-/// The desktop style's geometry: one
+/// The desktop style's geometry: by default one
 /// 8pt gutter, 10pt card radius, 1pt border, 36pt headers and 8pt control
 /// gaps. Views use these instead of literal numbers so the chrome stays one
-/// system.
+/// system, and `AgentStyle` can change them together.
 public enum Metrics {
+    private static var style: AgentStyle { AgentStyle.current }
+
     /// Window inset, gaps between cards, sidebar and panel padding.
-    public static let gutter: CGFloat = 8
-    public static let cardRadius: CGFloat = 10
-    public static let border: CGFloat = 1
-    public static let headerHeight: CGFloat = 36
-    public static let controlGap: CGFloat = 8
+    public static var gutter: CGFloat { style.spacing.gutter }
+    public static var cardRadius: CGFloat { style.radii.card }
+    public static var border: CGFloat { style.controls.borderWidth }
+    public static var headerHeight: CGFloat { style.controls.headerHeight }
+    public static var controlGap: CGFloat { style.spacing.controlGap }
     /// Header and toolbar glyphs.
     public static let glyph: CGFloat = 16
 
-    public static let radiusSmall: CGFloat = 4
-    public static let radiusMedium: CGFloat = 6
-    public static let radiusLarge: CGFloat = 8
+    public static var radiusSmall: CGFloat { style.radii.small }
+    public static var radiusMedium: CGFloat { style.radii.medium }
+    public static var radiusLarge: CGFloat { style.radii.large }
 
     /// Standard control height: buttons, fields, pop-ups, segmented pills.
-    public static let controlHeight: CGFloat = 24
+    public static var controlHeight: CGFloat { style.controls.height }
     /// Width of text fields and pop-ups in settings rows.
     public static let controlWidth: CGFloat = 210
     public static let sliderWidth: CGFloat = 220
@@ -33,24 +35,37 @@ public enum Metrics {
     public static let keycap: CGFloat = 20
 }
 
-/// The app's fonts: SF for the chrome, SF Mono where text lines up.
+/// The app's fonts: SF for the chrome, SF Mono where text lines up, or the
+/// families of `AgentStyle.current`. Sizes are given at the default 13pt
+/// body and scale with the style's font size.
 public enum AppFont {
     /// Card and pane headers: 13pt semibold.
-    public static var header: NSFont { .systemFont(ofSize: 13, weight: .semibold) }
-    public static var body: NSFont { .systemFont(ofSize: 13) }
-    public static var bodyMedium: NSFont { .systemFont(ofSize: 13, weight: .medium) }
-    public static var small: NSFont { .systemFont(ofSize: 12) }
-    public static var footnote: NSFont { .systemFont(ofSize: 11) }
-    public static var footnoteMedium: NSFont { .systemFont(ofSize: 11, weight: .medium) }
-    public static var caption: NSFont { .systemFont(ofSize: 10) }
-    public static var micro: NSFont { .systemFont(ofSize: 8, weight: .bold) }
-    public static var title: NSFont { .systemFont(ofSize: 17, weight: .semibold) }
+    public static var header: NSFont { system(13, weight: .semibold) }
+    public static var body: NSFont { system(13) }
+    public static var bodyMedium: NSFont { system(13, weight: .medium) }
+    public static var small: NSFont { system(12) }
+    public static var footnote: NSFont { system(11) }
+    public static var footnoteMedium: NSFont { system(11, weight: .medium) }
+    public static var caption: NSFont { system(10) }
+    public static var micro: NSFont { system(8, weight: .bold) }
+    public static var title: NSFont { system(17, weight: .semibold) }
 
     public static func system(_ size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
-        .systemFont(ofSize: size, weight: weight)
+        AgentFontFactory.text(scaled(size), weight: weight)
+    }
+
+    /// Text whose digits keep one width, for counters and times that tick.
+    public static func digits(_ size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
+        AgentFontFactory.text(scaled(size), weight: weight, monospacedDigits: true)
     }
 
     public static func mono(_ size: CGFloat = 12, weight: NSFont.Weight = .regular) -> NSFont {
-        .monospacedSystemFont(ofSize: size, weight: weight)
+        AgentFontFactory.mono(scaled(size), weight: weight)
+    }
+
+    /// `size` at the style's chrome scale, on a half-point grid.
+    static func scaled(_ size: CGFloat) -> CGFloat {
+        let scale = AgentStyle.current.typography.chromeScale
+        return scale == 1 ? size : (size * scale * 2).rounded() / 2
     }
 }

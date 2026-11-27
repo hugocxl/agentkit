@@ -18,7 +18,7 @@ final class AgentFileAttachmentCard: ThemedView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        iconBackground.cornerRadius = 8
+        iconBackground.cornerRadius = Metrics.radiusLarge
         name.lineBreakMode = .byTruncatingMiddle
         detail.lineBreakMode = .byTruncatingTail
         for child in [iconBackground, icon, name, detail, preview, download] { child.translatesAutoresizingMaskIntoConstraints = true; addSubview(child) }

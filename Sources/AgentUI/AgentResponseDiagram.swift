@@ -209,7 +209,7 @@ final class AgentResponseDiagram: AgentResponseSection {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.cornerRadius = 8
+        layer?.cornerRadius = Metrics.radiusLarge
         layer?.borderWidth = 1
         scroll.drawsBackground = false
         scroll.hasHorizontalScroller = true
@@ -227,7 +227,7 @@ final class AgentResponseDiagram: AgentResponseSection {
         for button in [diagramButton, sourceButton] {
             button.font = AppFont.footnote
             button.wantsLayer = true
-            button.layer?.cornerRadius = 5
+            button.layer?.cornerRadius = max(0, Metrics.radiusMedium - 1)
         }
         diagramButton.setAccessibilityLabel("Show diagram")
         sourceButton.setAccessibilityLabel("Show source")
@@ -237,7 +237,7 @@ final class AgentResponseDiagram: AgentResponseSection {
             button.imagePosition = .imageOnly
             button.imageScaling = .scaleProportionallyDown
             button.wantsLayer = true
-            button.layer?.cornerRadius = 5
+            button.layer?.cornerRadius = max(0, Metrics.radiusMedium - 1)
         }
         expand.image = AppIcon.maximize.image(size: 12, scale: AppIcon.inlineScale)
         expand.toolTip = "Expand diagram"

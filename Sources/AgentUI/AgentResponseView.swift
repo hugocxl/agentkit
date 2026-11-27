@@ -48,7 +48,7 @@ final class AgentResponseView: NSView, NSTextViewDelegate {
     private var scheme: ColorScheme?
     /// The theme the content was last made with: its views keep using it.
     private weak var renderedTheme: AgentTheme?
-    private var scale: CGFloat = 1
+    private var scale = -1
     private var sections: [AgentResponseSection] = []
     private var sectionGaps: [CGFloat] = []
     private var leadingBlockMargin: CGFloat = 0
@@ -104,11 +104,11 @@ final class AgentResponseView: NSView, NSTextViewDelegate {
     var streamingLastTailBytes: Int { streamingParser.lastParsedTailBytes }
 
     func setContent(_ source: String, theme: AgentTheme) {
-        let themeChanged = renderedTheme !== theme || palette != theme.palette || scheme != theme.scheme || scale != AgentTextScale.factor
+        let themeChanged = renderedTheme !== theme || palette != theme.palette || scheme != theme.scheme || scale != AgentTextScale.revision
         guard self.source != source || themeChanged || renderedCardHosts != cardHosts else { return }
         self.source = source
         renderedTheme = theme
-        scale = AgentTextScale.factor
+        scale = AgentTextScale.revision
         preparedBlocks = nil
         palette = theme.palette
         scheme = theme.scheme
@@ -119,9 +119,9 @@ final class AgentResponseView: NSView, NSTextViewDelegate {
     }
 
     func setPreparedContent(_ blocks: [AgentMarkdown.Block], theme: AgentTheme) {
-        guard preparedBlocks != blocks || renderedTheme !== theme || palette != theme.palette || scheme != theme.scheme || scale != AgentTextScale.factor || source == nil || renderedCardHosts != cardHosts else { return }
+        guard preparedBlocks != blocks || renderedTheme !== theme || palette != theme.palette || scheme != theme.scheme || scale != AgentTextScale.revision || source == nil || renderedCardHosts != cardHosts else { return }
         renderedTheme = theme
-        scale = AgentTextScale.factor
+        scale = AgentTextScale.revision
         preparedBlocks = blocks
         streamingParser.reset()
         source = ""
@@ -537,7 +537,7 @@ class AgentResponseSection: NSView {
     private var scheme: ColorScheme?
     /// The theme this section was last made with: its views keep using it.
     private weak var renderedTheme: AgentTheme?
-    private var scale: CGFloat = 1
+    private var scale = -1
     private var measurementWidth: CGFloat?
     private var measurementHeight: CGFloat = 0
     private var childLayoutDirty = true
@@ -547,9 +547,9 @@ class AgentResponseSection: NSView {
     var kind: Int { -1 }
 
     final func apply(_ part: AgentResponsePart, theme: AgentTheme, delegate: NSTextViewDelegate, references: [String: String] = [:], compactProse: Bool = false, lineBreaks: Bool = false, rawHTML: Bool = false) {
-        guard self.part != part || renderedTheme !== theme || palette != theme.palette || scheme != theme.scheme || scale != AgentTextScale.factor || self.references != references || self.compactProse != compactProse || self.lineBreaks != lineBreaks || self.rawHTML != rawHTML else { return }
+        guard self.part != part || renderedTheme !== theme || palette != theme.palette || scheme != theme.scheme || scale != AgentTextScale.revision || self.references != references || self.compactProse != compactProse || self.lineBreaks != lineBreaks || self.rawHTML != rawHTML else { return }
         renderedTheme = theme
-        scale = AgentTextScale.factor
+        scale = AgentTextScale.revision
         self.lineBreaks = lineBreaks
         self.rawHTML = rawHTML
         self.compactProse = compactProse
@@ -740,12 +740,12 @@ final class AgentResponseCode: AgentResponseSection {
     private(set) var incrementalUpdateCount = 0
     private var styledPalette: ChromePalette?
     private var styledScheme: ColorScheme?
-    private var styledScale: CGFloat = 1
+    private var styledScale = -1
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.cornerRadius = 8
+        layer?.cornerRadius = Metrics.radiusLarge
         layer?.borderWidth = 1
         scroll.drawsBackground = false
         scroll.hasHorizontalScroller = true
@@ -776,7 +776,7 @@ final class AgentResponseCode: AgentResponseSection {
             button.imagePosition = .imageOnly
             button.imageScaling = .scaleProportionallyDown
             button.wantsLayer = true
-            button.layer?.cornerRadius = 5
+            button.layer?.cornerRadius = max(0, Metrics.radiusMedium - 1)
         }
         wrap.image = AppIcon.wrap.image(size: 12, scale: AppIcon.inlineScale)
         run.image = AppIcon.play.image(size: 12, scale: AppIcon.inlineScale)
@@ -855,7 +855,7 @@ final class AgentResponseCode: AgentResponseSection {
             && nextLanguage == language
             && styledPalette == theme.palette
             && styledScheme == theme.scheme
-            && styledScale == AgentTextScale.factor
+            && styledScale == AgentTextScale.revision
             && text.textStorage?.length == code.utf16.count
         let paragraph = NSMutableParagraphStyle()
         paragraph.minimumLineHeight = lineHeight
@@ -920,7 +920,7 @@ final class AgentResponseCode: AgentResponseSection {
         code = source
         styledPalette = theme.palette
         styledScheme = theme.scheme
-        styledScale = AgentTextScale.factor
+        styledScale = AgentTextScale.revision
         let trimmed = source.hasSuffix("\n") ? source.dropLast() : Substring(source)
         lineCount = trimmed.isEmpty ? 0 : trimmed.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
         refreshFold()

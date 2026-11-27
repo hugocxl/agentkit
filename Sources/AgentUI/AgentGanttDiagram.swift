@@ -263,7 +263,7 @@ extension AgentGanttDiagram {
     }
 
     static func smallFont(_ style: AgentDiagramStyle) -> NSFont {
-        NSFont.systemFont(ofSize: max(style.font.pointSize - 1, 9))
+        AgentFontFactory.text(max(style.font.pointSize - 1, 9))
     }
 
     var timeRange: (low: Double, high: Double) {

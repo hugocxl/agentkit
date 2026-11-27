@@ -442,8 +442,8 @@ private final class AgentAnimatedImageView: NSImageView {
 
 @MainActor
 enum AgentMessageShape {
-    /// A user message's corner radius, the same as a sidebar card's.
-    nonisolated static let radius = Metrics.radiusLarge
+    /// A user message's corner radius: the style's message radius.
+    nonisolated static var radius: CGFloat { AgentStyle.current.radii.message }
     /// The tighter corner where a message's images meet its text bubble.
     nonisolated static let joinedRadius: CGFloat = 3
 

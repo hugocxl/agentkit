@@ -25,7 +25,7 @@ One Swift package, three library products:
 Add `https://github.com/hugocxl/agentkit.git` in Xcode's package dependencies, or add:
 
 ```swift
-.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.6.2")
+.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.7.0")
 ```
 
 Select the products your target needs:
@@ -154,6 +154,30 @@ The model menu lists enabled providers with their logos and explains why one can
 ## Themes
 
 Use `AgentTheme` to select light/dark palettes and appearance. Each controller can receive its own theme, and its provider marks, link icons and controls follow it; `followSystem()` observes appearance changes without polling. An application with one theme can apply it to `AgentTheme.shared` and pass that to every controller.
+
+## Match your app's style
+
+`AgentStyle` adapts the conversation to the app around it: font families and sizes, spacing, corner radii, control sizes and color overrides. Apply it with `setStyle(_:)` before building controllers:
+
+```swift
+var style = AgentStyle()
+style.typography.fontFamily = "Inter"              // nil keeps SF; a missing family falls back to it
+style.typography.monospacedFontFamily = "JetBrains Mono"
+style.typography.fontSize = 13                     // chrome body; other chrome sizes scale with it
+style.typography.conversationFontSize = 15         // message body; headings and code scale with it
+style.spacing.message = 20                         // between turns
+style.spacing.readableWidth = 720                  // widest conversation column
+style.radii.composer = 12                          // or .uniform(0) for square corners
+style.colors = .init(
+    light: ChromePaletteOverrides(background: ChromeColor(hex: 0xFFFFFF), accent: ChromeColor(hex: 0x4F46E5)),
+    dark: ChromePaletteOverrides(accent: ChromeColor(hex: 0x818CF8))
+)
+theme.setStyle(style)
+```
+
+Overriding a base color (`background`, `foreground` or `accent`) derives its tints again (muted text, borders, hover, the accent's soft fill and the text drawn on it) unless you override those too. Light overrides apply while the theme in use is light, and dark ones while it is dark.
+
+Typography, spacing and radii are app-wide: the last style set wins, so give every theme the same one. Color overrides belong to the theme they are set on. Conversation text, spacing and colors update live; chrome fonts and radii apply to views built after the change.
 
 ## Own the lifecycle
 

@@ -89,13 +89,13 @@ final class AgentResponsePullRequest: AgentResponseSection {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.cornerRadius = 10
+        layer?.cornerRadius = Metrics.cardRadius
         pill.alignment = .center
         pill.wantsLayer = true
-        pill.layer?.cornerRadius = 4
+        pill.layer?.cornerRadius = Metrics.radiusSmall
         avatar.alignment = .center
         avatar.wantsLayer = true
-        avatar.layer?.cornerRadius = 7
+        avatar.layer?.cornerRadius = max(0, Metrics.radiusLarge - 1)
         for child in [title, detail, pill, avatar, linkIcon] as [NSView] {
             child.translatesAutoresizingMaskIntoConstraints = true
             addSubview(child)

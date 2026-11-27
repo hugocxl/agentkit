@@ -14,7 +14,7 @@ final class AgentSubagentsView: ThemedView {
     private static let inset = AgentPanelMetrics.inset
     private static let rowHeight = AgentPanelMetrics.rowHeight
     private static let visibleRows = 3
-    private let card = AgentSurfaceCard(style: .agentPanel)
+    private let card = AgentSurfaceCard(.panel)
     private let scroll = NSScrollView()
     private let rows = AgentSubagentRows()
     private var subagents: [AgentSubagent] = []

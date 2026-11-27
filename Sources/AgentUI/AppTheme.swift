@@ -82,6 +82,20 @@ public final class AgentTheme: ObservableObject {
     public private(set) var lightTheme: String
 
     @Published public private(set) var interface = Appearance()
+    /// Typography, spacing, radii and color overrides; see `AgentStyle`.
+    @Published public private(set) var style = AgentStyle()
+
+    /// Applies `style`: its color overrides to this theme, and its typography,
+    /// spacing and radii to every view. Open conversations render again.
+    public func setStyle(_ style: AgentStyle) {
+        let layoutChanged = AgentStyle.current != style
+        AgentStyle.current = style
+        if self.style != style { self.style = style }
+        // Recolor the scheme in use, which a host may have resolved itself.
+        let palette = style.colors.apply(to: ChromePalette(scheme: scheme))
+        if self.palette != palette { self.palette = palette }
+        if layoutChanged { AgentTextScale.invalidate() }
+    }
 
     public var glassEnabled: Bool { interface.interfaceStyle == .glass && !accessibility.reduceTransparency }
     public var glassPanes: Bool { glassEnabled && interface.glassPanes }
@@ -161,7 +175,7 @@ public final class AgentTheme: ObservableObject {
     public func setResolvedScheme(_ scheme: ColorScheme, interface: Appearance) {
         if self.interface != interface { self.interface = interface }
         if self.scheme != scheme { self.scheme = scheme }
-        let palette = ChromePalette(scheme: scheme)
+        let palette = style.colors.apply(to: ChromePalette(scheme: scheme))
         if self.palette != palette { self.palette = palette }
         refreshAccessibility()
     }
@@ -191,7 +205,8 @@ public final class AgentTheme: ObservableObject {
     }
 
     private func apply() {
-        let (scheme, palette) = Self.resolve(catalog: catalog, darkTheme: darkTheme, lightTheme: lightTheme, dark: interfaceIsDark)
+        let (scheme, resolved) = Self.resolve(catalog: catalog, darkTheme: darkTheme, lightTheme: lightTheme, dark: interfaceIsDark)
+        let palette = style.colors.apply(to: resolved)
         if scheme != self.scheme { self.scheme = scheme }
         if palette != self.palette { self.palette = palette }
     }

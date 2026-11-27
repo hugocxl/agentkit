@@ -339,7 +339,7 @@ final class AgentTranscriptDocument: ThemedView {
         if entry.items.first?.kind == .assistant, next?.kind == .activity { return 8 }
         // A user message already reserves room below it for its hover actions.
         if entry.kind == .message, entry.items.first?.kind == .user { return 10 }
-        return 26
+        return AgentStyle.current.spacing.message
     }
 
     private typealias Reuse = (items: Int, entries: Int, typed: Set<String>)
@@ -664,6 +664,8 @@ final class AgentTranscriptDocument: ThemedView {
 
     override func themeDidChange() {
         themeEpoch &+= 1
+        // The style's message spacing may have changed with the theme.
+        geometry.reset(heights: geometry.heights, trailingSpaces: entries.indices.map(trailingSpace(at:)))
         earlier.textColor = theme.fgDim
         reflow(viewportWidth: viewportWidth)
     }

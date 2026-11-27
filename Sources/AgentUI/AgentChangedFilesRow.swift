@@ -28,7 +28,7 @@ final class AgentChangedFilesRow: AgentTimelineRow {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.cornerRadius = 8
+        layer?.cornerRadius = Metrics.radiusLarge
         for view in [heading, totals, openDiff, revert, toggleAll, more, statusNote, retryCapture] {
             view.translatesAutoresizingMaskIntoConstraints = true
             addSubview(view)

@@ -270,7 +270,7 @@ final class AgentTodoCardRow: AgentCardRow {
     override init(frame frameRect: NSRect) {
         icon = NSImageView()
         title = makeLabel("Todo", font: AppFont.header)
-        progress = makeLabel("", font: .monospacedDigitSystemFont(ofSize: 12, weight: .regular))
+        progress = makeLabel("", font: AppFont.digits(12))
         super.init(frame: frameRect)
         progress.alignment = .right
         for view in [icon, title, progress, explanation, steps] as [NSView] {

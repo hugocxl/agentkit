@@ -750,7 +750,7 @@ final class AgentWorkingRow: AgentTimelineRow {
     /// tick only formats the time.
     var activity: String? { didSet { if oldValue != activity { refresh() } } }
     private let glyph = ActivityGlyph()
-    private let label = makeLabel("", font: .monospacedDigitSystemFont(ofSize: 13, weight: .regular))
+    private let label = makeLabel("", font: AppFont.digits(13))
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         label.translatesAutoresizingMaskIntoConstraints = true
