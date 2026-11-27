@@ -1235,8 +1235,12 @@ final class AgentRuntimeTests: XCTestCase {
         }
         let environment = AgentProcess.environment()
         XCTAssertTrue(environment["PATH"]?.contains("/.local/bin") == true)
+        // The inherited folders keep their order ahead of the added ones; macOS's own go last.
         if let inherited = ProcessInfo.processInfo.environment["PATH"], !inherited.isEmpty {
-            XCTAssertTrue(environment["PATH"]?.hasPrefix(inherited) == true)
+            let own = inherited.split(separator: ":").map(String.init).filter { !AgentProcess.systemPaths.contains($0) }
+            var seen = Set<String>()
+            let expected = own.filter { !$0.isEmpty && seen.insert($0).inserted }
+            XCTAssertEqual(Array(environment["PATH"]?.split(separator: ":").map(String.init).prefix(expected.count) ?? []), expected)
         }
     }
 

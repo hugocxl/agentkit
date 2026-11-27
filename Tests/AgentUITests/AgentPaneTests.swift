@@ -702,6 +702,92 @@ final class AgentPaneTests: XCTestCase {
         XCTAssertFalse(backend.requests.contains { if case .send = $0 { return true }; return false })
     }
 
+    func testSavedModelCatalogFollowsUpWithLiveRefresh() async throws {
+        let backend = Backend()
+        let pane = backend.controller()
+        defer { pane.dispose() }
+        var refreshes: [Bool] = []
+        pane.loadProviderModelCatalog = { provider, force in
+            guard provider.kind == .claude else { return .init(models: []) }
+            refreshes.append(force)
+            if !force {
+                return .init(models: [.init(id: "opus", title: "Opus", reasoningEfforts: [.high], isDefault: true)],
+                             source: "saved")
+            }
+            return .init(models: [.init(id: "opus", title: "Opus 5.5", reasoningEfforts: [.high], isDefault: true),
+                                  .init(id: "sonnet", title: "Sonnet 5.5", reasoningEfforts: [.high])],
+                         source: "live")
+        }
+        pane.refresh()
+        try await wait { pane.snapshot != nil && modelItems(pane).map(\.title).contains("Opus 5.5") }
+        XCTAssertEqual(refreshes, [false, true])
+        XCTAssertTrue(modelItems(pane).map(\.title).contains("Sonnet 5.5"))
+        XCTAssertFalse(modelItems(pane).map(\.title).contains("Opus"))
+    }
+
+    func testForcedModelRefreshCancelsInFlightRefresh() async throws {
+        let backend = Backend()
+        let pane = backend.controller()
+        defer { pane.dispose() }
+        var codexStarted = false
+        pane.loadProviderModelCatalog = { provider, force in
+            if provider.kind == .codex && !force {
+                codexStarted = true
+                try await Task.sleep(for: .seconds(10))
+                return .init(models: [], source: "live")
+            }
+            guard provider.kind == .claude else { return .init(models: [], source: "live") }
+            return .init(models: [.init(id: force ? "fresh" : "stale", title: force ? "Fresh" : "Stale",
+                                        reasoningEfforts: [.high])], source: "live")
+        }
+        pane.refresh()
+        try await wait { pane.snapshot != nil && codexStarted && modelItems(pane).map(\.title).contains("Stale") }
+        pane.surface.model.selectItem(withTitle: "Refresh models…")
+        _ = (pane.surface.model.target as? NSObject)?.perform(try XCTUnwrap(pane.surface.model.action), with: pane.surface.model)
+        try await wait { modelItems(pane).map(\.title).contains("Fresh") }
+        XCTAssertFalse(modelItems(pane).map(\.title).contains("Stale"))
+    }
+
+    func testANewConversationWithoutProvidersOffersToAddOneWhenTheHostCan() async throws {
+        let backend = Backend()
+        let pane = backend.controller()
+        defer { pane.dispose() }
+        var added = 0, opened: [String?] = []
+        pane.loadProviders = { AgentProvidersState(settings: AgentProviderSettings()) }
+        pane.openAgentSettings = { opened.append($0) }
+        pane.addAgentProvider = { added += 1 }
+        pane.refresh()
+        try await wait { pane.snapshot != nil && pane.surface.providerGap == .noneAdded }
+        XCTAssertFalse(pane.canSend, "Nothing can run until a provider is added")
+        XCTAssertEqual(pane.surface.model.labelText, "No Provider")
+        pane.surface.configureProviders.onPress?()
+        XCTAssertEqual(added, 1)
+
+        pane.loadProviders = { AgentProvidersState(settings: AgentProviderSettings(providers: [
+            AgentProviderConfig(id: "claude-work", kind: .claude, name: "Work", enabled: false)])) }
+        pane.providerSettingsChanged()
+        try await wait { pane.surface.providerGap == .allOff }
+        pane.surface.configureProviders.onPress?()
+        XCTAssertEqual(opened, [nil], "With every provider off, the settings open instead of the form")
+
+        pane.loadProviders = { AgentProvidersState(settings: AgentProviderSettings(providers: [
+            AgentProviderConfig(id: "claude-work", kind: .claude, name: "Work")])) }
+        pane.providerSettingsChanged()
+        try await wait { pane.surface.providerGap == nil && pane.canSend }
+        XCTAssertEqual(pane.selection.providerKey, "claude-work", "A new conversation starts on an added provider")
+    }
+
+    func testAHostWithoutAgentSettingsKeepsTheBuiltInProviders() async throws {
+        let backend = Backend()
+        let pane = backend.controller()
+        defer { pane.dispose() }
+        pane.loadProviders = { AgentProvidersState(settings: AgentProviderSettings()) }
+        pane.refresh()
+        try await wait { pane.snapshot != nil && modelItems(pane).map(\.title).contains("Claude Sonnet 5.5") }
+        XCTAssertNil(pane.surface.providerGap)
+        XCTAssertTrue(pane.canSend)
+    }
+
     func testRefreshCoalescesAndFiltersOtherSessionsAndOldRevisions() async throws {
         let backend = Backend()
         backend.snapshot.revision = 10

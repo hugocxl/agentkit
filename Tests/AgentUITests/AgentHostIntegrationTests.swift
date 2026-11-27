@@ -118,7 +118,7 @@ final class AgentHostIntegrationTests: XCTestCase {
         func pixels(_ image: NSImage?) throws -> Data { try XCTUnwrap(XCTUnwrap(image).tiffRepresentation) }
 
         XCTAssertNotEqual(try pixels(AgentLogo.image(for: .claude, theme: light)), try pixels(AgentLogo.image(for: .claude, theme: dark)))
-        XCTAssertEqual(try pixels(AgentLogo.image(for: .claude, theme: dark)), try pixels(AppIcon.claude.image(size: 64, theme: dark)))
+        XCTAssertEqual(try pixels(AgentLogo.image(for: .claude, theme: dark)), try pixels(AppIcon.claude.image(size: 64, theme: dark, artwork: .mark)))
 
         let github = try XCTUnwrap(URL(string: "https://github.com/example/project/pull/1"))
         let favicons = AgentLinkFavicon(fetch: { _ in throw URLError(.badURL) })

@@ -200,8 +200,10 @@ final class AgentQueuedPromptTests: XCTestCase {
         try await h.startWorking(a)
         a.surface.composer.string = "Also check the tests"
         XCTAssertTrue(a.canSendNow)
+        // One action shows at a time: the draft offers Send, and Send Now comes from its key.
         a.surface.updatePrimaryAction()
-        XCTAssertFalse(a.surface.sendNow.isHidden)
+        XCTAssertFalse(a.surface.send.isHidden)
+        XCTAssertTrue(a.surface.stop.isHidden)
         a.sendNow()
         try await h.until { !a.composerWork.sendNowOutcomes.isEmpty }
         XCTAssertEqual(a.composerWork.sendNowOutcomes, [.steered])
@@ -264,7 +266,6 @@ final class AgentQueuedPromptTests: XCTestCase {
         a.capabilities.remove(.steering)
         a.updateControls()
         XCTAssertFalse(a.canSendNow)
-        XCTAssertTrue(a.surface.sendNow.isHidden)
         XCTAssertFalse(a.performConversationShortcut(.sendAgentPromptNow))
     }
 }

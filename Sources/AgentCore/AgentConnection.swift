@@ -59,6 +59,10 @@ public struct AgentConnection: Sendable {
     public var models: (@Sendable (AgentChatProvider, Bool) async throws -> [AgentModelDescriptor])?
     /// Lists models for a specific configured provider ID; falls back to `models` when nil.
     public var modelsForProvider: (@Sendable (AgentChatProvider, String?, Bool) async throws -> [AgentModelDescriptor])?
+    /// A configured provider's models with where they came from: a `saved` reply is
+    /// returned at once while the backend refreshes, and a forced request waits for it.
+    /// Preferred over `modelsForProvider` when both are set.
+    public var modelCatalog: (@Sendable (AgentModelCatalogRequest) async throws -> AgentModelCatalogReply)?
     /// The backend's configured providers and their last health checks.
     public var providers: (@Sendable () async throws -> AgentProvidersState)?
     /// Subscription usage limits for signed-in providers.

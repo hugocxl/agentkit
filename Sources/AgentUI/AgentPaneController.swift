@@ -13,7 +13,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     var capabilities: AgentCapabilities = .all
     var view: NSView { surface }
     var title: String {
-        snapshot?.items.first(where: { $0.kind == .user && !$0.isProviderTurn })?.text
+        snapshot?.items.first(where: { $0.kind == .user && !$0.isAutomaticTurn })?.text
             .split(whereSeparator: \.isNewline).first.map { String($0.prefix(160)) } ?? "Agent"
     }
     /// The provider's logo, as a terminal running the same agent shows it.
@@ -150,13 +150,25 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     private lazy var composerCoordinator = AgentComposerCoordinator(surface: surface)
     var loadModelCatalog: ((AgentChatProvider, Bool) async throws -> [AgentModelDescriptor])?
     /// A provider's models as its menu offers them: the user's order, hidden ones left out.
-    var loadProviderModelCatalog: ((AgentProviderConfig, Bool) async throws -> [AgentModelDescriptor])?
+    /// A `saved` reply came from disk while the backend refreshes; the menu then joins
+    /// that live refresh so stale models are replaced.
+    var loadProviderModelCatalog: ((AgentProviderConfig, Bool) async throws -> AgentModelCatalogReply)?
     /// The backend's providers with their last checks.
     var loadProviders: (() async throws -> AgentProvidersState)?
     /// Runs a command, such as a provider's sign-in, in a terminal.
     var openTerminal: ((String) -> Void)?
-    /// The providers the model menu offers.
-    private var providers = AgentProviderSettings().providers
+    /// Opens the agent settings, on a provider's page when one is named, so the user can
+    /// add, configure, install or update providers. Nil when the host offers none; a
+    /// conversation then never asks the user to add a provider.
+    var openAgentSettings: ((String?) -> Void)?
+    /// Opens the agent settings with the Add Provider form.
+    var addAgentProvider: (() -> Void)?
+    /// The providers the model menu offers: the backend's configured ones, or each
+    /// built-in kind when the backend predates provider settings.
+    private var providers: [AgentProviderConfig] = AgentChatProvider.builtIn.map(AgentProviderConfig.builtIn)
+    /// Whether the backend's provider list has been loaded at least once.
+    private var providersLoaded = false
+    private var providerSettingsObserver: NSObjectProtocol?
     /// What each provider's last check found, by provider ID.
     private var providerHealth: [String: AgentProviderHealth] = [:]
     /// The unavailable provider and reason the composer last warned about, so it warns once.
@@ -164,6 +176,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     /// Each provider's models, by provider ID.
     private var modelCatalogs: [String: [AgentModelDescriptor]] = [:]
     private var modelCatalogTask: Task<Void, Never>?
+    private var modelCatalogTaskID = UUID()
     private var modelCatalogLoadedAt = Date.distantPast
     private var unavailableModelCatalogs = Set<String>()
     private var modelMenuOpen = false
@@ -191,6 +204,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         surface.citationEnvironmentId = project.description
         surface.citationThreadId = session.description
         surface.composer.delegate = self
+        surface.configureProviders.onPress = { [weak self] in self?.setUpProviders() }
         surface.model.target = self
         surface.model.action = #selector(modelSelected(_:))
         surface.effort.target = self
@@ -223,7 +237,6 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         surface.questions.onChange = { [weak self] in self?.saveDraft() }
         surface.plan.onPress = { [weak self] in self?.togglePlanMode() }
         surface.send.onPress = { [weak self] in self?.send() }
-        surface.sendNow.onPress = { [weak self] in self?.sendNow() }
         surface.stop.onPress = { [weak self] in try? self?.surface.actions.interrupt() }
         surface.retry.onPress = { [weak self] in self?.refresh() }
         surface.retryTurn.onPress = { [weak self] in self?.retryLastTurn() }
@@ -343,6 +356,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     /// wants the key: the suggestion list, Find, the selection toolbar or an input method.
     /// False lets the key go on.
     func performKeyboardStop() -> Bool {
+        guard !surface.stop.isHidden else { return false }
         guard let responder = surface.window?.firstResponder as? NSView,
               responder === surface.composer || responder === surface || responder.isDescendant(of: surface.transcriptScroll),
               surface.stop.isEnabled, surface.suggestions.isHidden, !surface.isFindOpen, surface.selectionToolbar.isHidden,
@@ -374,7 +388,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
               let turn = snapshot.turns?.last, turn.completedAt != nil,
               turn.outcome == .failed || turn.outcome == .interrupted,
               let item = snapshot.items.last(where: { $0.id == turn.userItemID }),
-              item.kind == .user, !item.isProviderTurn else { return nil }
+              item.kind == .user, !item.isAutomaticTurn else { return nil }
         return item
     }
 
@@ -532,7 +546,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         let agent = snapshot.provider.name
         return snapshot.items.compactMap { item -> String? in
             switch item.kind {
-            case .user where item.isProviderTurn: return "_\(item.text)_"
+            case .user where item.isAutomaticTurn: return "_\(item.text)_"
             case .user: return "**You**\n\n" + item.text + (item.attachments ?? []).map { "\n\nAttachment: " + $0.name }.joined()
             case .assistant: return "**\(agent)**\n\n" + item.text
             case .tool:
@@ -1010,6 +1024,8 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
     }
 
     func dispose() {
+        if let providerSettingsObserver { NotificationCenter.default.removeObserver(providerSettingsObserver) }
+        providerSettingsObserver = nil
         voice.stop()
         historyPicker?.close()
         helpPicker?.close()
@@ -1647,7 +1663,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
                          detail: (conversation.origin == .cleared ? "Cleared" : "Archived") + " · " + conversation.provider.name + closed + expires)
         }
         picker.update(keptEntries + reply.entries.map { entry in
-            .init(id: entry.id, title: entry.title, detail: entry.provider.name + " · " + formatter.localizedString(for: entry.updatedAt, relativeTo: Date()))
+            .init(id: entry.id, title: entry.title, detail: historySource(entry) + " · " + formatter.localizedString(for: entry.updatedAt, relativeTo: Date()))
         }, note: reply.truncated ? "Showing the newest 200 conversations. Older results were omitted by the server."
             : reply.entries.isEmpty && keptEntries.isEmpty ? "No other saved conversations in this folder."
             : keptEntries.isEmpty ? "Conversations saved for this folder" : "Archived conversations first, then provider sessions for this folder")
@@ -1923,7 +1939,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         let composer = surface.composer
         let walking = recall.map { composer.string == $0.text } ?? false
         guard walking || (older && composer.string.isEmpty && draftAttachments.isEmpty) else { recall = nil; return false }
-        let prompts = (snapshot?.items ?? []).reversed().filter { $0.kind == .user && !$0.isProviderTurn && !$0.text.isEmpty }.map(\.text)
+        let prompts = (snapshot?.items ?? []).reversed().filter { $0.kind == .user && !$0.isAutomaticTurn && !$0.text.isEmpty }.map(\.text)
         let next = (recall?.index ?? -1) + (older ? 1 : -1)
         if next < 0 {
             recall = nil
@@ -1940,8 +1956,33 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         return true
     }
 
+    /// Why a conversation that hasn't started has no provider to start with; nil once one
+    /// can, or when the host offers no settings to add one in.
+    private var providerGap: AgentPaneView.ProviderGap? {
+        guard providersLoaded, openAgentSettings != nil, snapshot?.providerSession == nil else { return nil }
+        if providers.isEmpty { return .noneAdded }
+        return providers.contains(where: \.enabled) ? nil : .allOff
+    }
+
+    /// The Add Provider form when none is added, else the agent settings.
+    private func setUpProviders() {
+        if providers.isEmpty || providerGap == .noneAdded, let addAgentProvider {
+            addAgentProvider()
+        } else {
+            openAgentSettings?(nil)
+        }
+    }
+
+    /// Who saved a past conversation: its provider's name, with the kind's when the name is the account's own.
+    private func historySource(_ entry: AgentHistoryEntry) -> String {
+        guard let config = providers.first(where: { $0.id == entry.providerID }), config.title != entry.provider.name else {
+            return entry.provider.name
+        }
+        return "\(entry.provider.name) · \(config.title)"
+    }
+
     var canSend: Bool {
-        guard !needsAuthoritativeSnapshot, let snapshot else { return false }
+        guard providerGap == nil, !needsAuthoritativeSnapshot, let snapshot else { return false }
         if !capabilities.contains(.promptQueue), snapshot.status == .working || snapshot.status == .waiting { return false }
         return !restoringDraft && (snapshot.status == .idle || snapshot.status == .failed || snapshot.status == .working || snapshot.status == .waiting)
     }
@@ -1979,7 +2020,6 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         surface.microphone.toolTip = voice.state == .idle ? "Dictate a message on this Mac" : "Finish dictation"
         surface.dictating = voice.state != .idle
         surface.send.isEnabled = canSendDraft
-        updateSendNow()
         surface.stop.isEnabled = !disposed && !needsAuthoritativeSnapshot && stopTask == nil && !stopRequested &&
             (submitting || snapshot?.status == .working || snapshot?.status == .waiting || hasActiveQueue)
         surface.stop.toolTip = "Stop this turn" + (keyDisplay?(.stopAgent).map { " (\($0))" } ?? "")
@@ -1989,6 +2029,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
             : "Send message"
         surface.model.isEnabled = canEditSelection && !needsAuthoritativeSnapshot
         surface.effort.isEnabled = surface.model.isEnabled && !supportedEfforts.isEmpty
+        surface.providerGap = providerGap
         surface.contextIndicator.update(usedTokens: snapshot?.contextUsage?.usedTokens,
                                         contextWindow: snapshot?.contextUsage?.contextWindow)
         let canCompact = composerCoordinator.providerCommands.contains("compact") && snapshot?.status == .idle && commandTask == nil
@@ -2114,7 +2155,6 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         // A keystroke changes only what depends on the draft; the conversation's own
         // controls wait for the conversation to change.
         surface.send.isEnabled = canSendDraft
-        surface.sendNow.isEnabled = canSendNow
         surface.refreshComposer()
         composerCoordinator.changed()
     }
@@ -2140,39 +2180,88 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         descriptor(for: choice)?.title ?? choice.title
     }
 
+    /// Reloads the providers and their models, as after they change in the agent settings.
+    func providerSettingsChanged() {
+        modelCatalogLoadedAt = .distantPast
+        refreshModelCatalog(force: false)
+    }
+
+    private var modelCatalogLoader: ((AgentProviderConfig, Bool) async throws -> AgentModelCatalogReply)? {
+        loadProviderModelCatalog
+            ?? loadModelCatalog.map { fn in { config, force in AgentModelCatalogReply(models: try await fn(config.kind, force)) } }
+    }
+
     private func refreshModelCatalog(force: Bool = false) {
-        let loader: ((AgentProviderConfig, Bool) async throws -> [AgentModelDescriptor])? = loadProviderModelCatalog
-            ?? loadModelCatalog.map { fn in { config, force in try await fn(config.kind, force) } }
-        guard modelCatalogTask == nil, force || Date().timeIntervalSince(modelCatalogLoadedAt) > 60,
-              let loader else { return }
+        if force {
+            modelCatalogTask?.cancel()
+            modelCatalogTask = nil
+        } else {
+            guard modelCatalogTask == nil, Date().timeIntervalSince(modelCatalogLoadedAt) > 60 else { return }
+        }
+        guard modelCatalogLoader != nil else { return }
         modelCatalogLoadedAt = Date()
         let generation = connectionGeneration
+        let taskID = UUID()
+        modelCatalogTaskID = taskID
         modelCatalogTask = Task { [weak self] in
             guard let self else { return }
-            defer { if generation == self.connectionGeneration { self.modelCatalogTask = nil } }
+            defer {
+                if generation == self.connectionGeneration, self.modelCatalogTaskID == taskID {
+                    self.modelCatalogTask = nil
+                }
+            }
             if let state = try? await self.loadProviders?() {
                 guard !Task.isCancelled, !self.disposed, generation == self.connectionGeneration else { return }
-                self.providers = state.settings.providers
+                self.providersLoaded = true
+                // A host without settings to add providers in keeps offering the built-in kinds.
+                self.providers = state.settings.providers.isEmpty && self.openAgentSettings == nil
+                    ? AgentChatProvider.builtIn.map(AgentProviderConfig.builtIn) : state.settings.providers
                 self.providerHealth = Dictionary(state.health.map { ($0.provider, $0) }, uniquingKeysWith: { _, last in last })
+                if !self.providers.isEmpty, self.snapshot?.providerSession == nil, !self.selectionEdited,
+                   !self.providers.contains(where: { $0.id == self.selection.providerKey && $0.enabled }),
+                   let preferred = self.providers.first(where: { $0.enabled && $0.kind == self.selection.provider })
+                       ?? self.providers.first(where: \.enabled) ?? self.providers.first {
+                    self.selection = AgentModelSelection(provider: preferred.kind, providerID: preferred.id, model: nil)
+                }
                 self.menuState = nil
                 self.updateControls()
                 self.warnIfUnavailable()
             }
-            for provider in self.menuProviders {
-                do {
-                    let models = try await loader(provider, force)
-                    guard !Task.isCancelled, !self.disposed, generation == self.connectionGeneration else { return }
-                    self.modelCatalogs[provider.id] = models
-                    self.unavailableModelCatalogs.remove(provider.id)
-                    self.menuState = nil
-                    self.updateControls()
-                } catch {
-                    guard !Task.isCancelled, !self.disposed, generation == self.connectionGeneration else { return }
-                    self.unavailableModelCatalogs.insert(provider.id)
-                    self.menuState = nil
-                    self.updateControls()
+            let providers = self.menuProviders
+            await withTaskGroup(of: Void.self) { group in
+                for provider in providers {
+                    group.addTask { @MainActor [weak self] in
+                        await self?.fetchModelCatalog(provider: provider, force: force, generation: generation)
+                    }
                 }
             }
+        }
+    }
+
+    private func fetchModelCatalog(provider: AgentProviderConfig, force: Bool, generation: UInt64) async {
+        guard let loader = modelCatalogLoader else { return }
+        do {
+            let reply = try await loader(provider, force)
+            guard !Task.isCancelled, !disposed, generation == connectionGeneration else { return }
+            modelCatalogs[provider.id] = reply.models
+            unavailableModelCatalogs.remove(provider.id)
+            menuState = nil
+            updateControls()
+            // A saved reply came back at once while the backend refreshes; join that live
+            // refresh so stale models are replaced once it finishes.
+            if !force, reply.source == "saved", let live = try? await loader(provider, true) {
+                guard !Task.isCancelled, !disposed, generation == connectionGeneration else { return }
+                if !live.models.isEmpty {
+                    modelCatalogs[provider.id] = live.models
+                    menuState = nil
+                    updateControls()
+                }
+            }
+        } catch {
+            guard !Task.isCancelled, !disposed, generation == connectionGeneration else { return }
+            unavailableModelCatalogs.insert(provider.id)
+            menuState = nil
+            updateControls()
         }
     }
 
@@ -2181,10 +2270,10 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
             ?? modelCatalogs[selection.providerKey]?.first(where: \.isDefault)?.id
     }
 
-    /// The providers the model menu lists: the enabled ones whose CLI was found, and the
-    /// chosen one even when turned off or missing.
+    /// The providers the model menu lists: the enabled ones, and the conversation's own
+    /// once it has started even when turned off.
     private var menuProviders: [AgentProviderConfig] {
-        providers.filter { ($0.enabled && providerHealth[$0.id]?.installed != false) || $0.id == selection.providerKey }
+        providers.filter { $0.enabled || (snapshot?.providerSession != nil && $0.id == selection.providerKey) }
     }
 
     /// Why a provider can't start a conversation now, as its last check found.
@@ -2330,7 +2419,14 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
             modelCatalogLoadedAt = .distantPast
             menuState = nil
             refreshModelCatalog(force: true)
+        } else if item.representedObject as? String == "open-agent-settings" {
+            setUpProviders()
         }
+    }
+
+    @objc private func setUpSelected(_ sender: NSMenuItem) {
+        guard let provider = sender.representedObject as? String else { return }
+        openAgentSettings?(provider)
     }
 
     @objc private func signInSelected(_ sender: NSMenuItem) {
@@ -2394,6 +2490,12 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
                     signIn.representedObject = command
                     signIn.toolTip = "Runs \(command)"
                     models.addItem(signIn)
+                } else if openAgentSettings != nil {
+                    let setUp = NSMenuItem(title: unavailable.setUpTitle, action: #selector(setUpSelected(_:)), keyEquivalent: "")
+                    setUp.target = self
+                    setUp.representedObject = key
+                    setUp.toolTip = "Opens \(config.title) in Agent Settings"
+                    models.addItem(setUp)
                 }
                 models.addItem(.separator())
             }
@@ -2429,17 +2531,31 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
                 models.addItem(item)
             }
         }
+        let noProvider = menuProviders.isEmpty && providersLoaded
+        if noProvider {
+            let empty = NSMenuItem(title: providers.isEmpty ? "No providers added" : "Every provider is off", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+            if openAgentSettings != nil {
+                let title = providers.isEmpty && addAgentProvider != nil ? "Add Provider…" : "Open Agent Settings…"
+                let open = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                open.representedObject = "open-agent-settings"
+                menu.addItem(open)
+            }
+        }
         menu.addItem(.separator())
         let refreshModels = NSMenuItem(title: "Refresh models…", action: nil, keyEquivalent: "")
         refreshModels.representedObject = "refresh-models"
         menu.addItem(refreshModels)
         surface.model.menu = menu
         surface.model.menuLogos = menuLogos
-        surface.model.providerLogo = selection.provider
+        surface.model.providerLogo = noProvider ? nil : selection.provider
         surface.model.select(nil)
-        surface.model.displayedTitle = modelTitle(displayedSelection)
+        surface.model.displayedTitle = noProvider ? "No Provider" : modelTitle(displayedSelection)
         surface.model.icon = selection.provider == .claude ? .sparkles : .cpu
-        surface.model.toolTip = "Model · \(providerConfig(selection.providerKey, kind: selection.provider).title). Changes apply to the next message."
+        surface.model.toolTip = noProvider
+            ? (providers.isEmpty ? "Add a provider in Agent Settings to choose a model." : "Turn a provider on in Agent Settings to choose a model.")
+            : "Model · \(providerConfig(selection.providerKey, kind: selection.provider).title). Changes apply to the next message."
 
         surface.effort.removeAllItems()
         surface.effort.addItem(withTitle: selectedModelDescriptor?.reasoningEfforts.isEmpty == true ? "Off" : "Auto")
@@ -2624,13 +2740,26 @@ extension AgentPaneController {
             }
         }
         loadModelCatalog = connection.models
-        if let modelsForProvider = connection.modelsForProvider {
+        if let catalog = connection.modelCatalog {
+            let project = connection.project
             loadProviderModelCatalog = { config, force in
-                try await modelsForProvider(config.kind, config.id, force)
+                try await catalog(AgentModelCatalogRequest(project: project, provider: config.kind, forceRefresh: force, providerID: config.id))
+            }
+        } else if let modelsForProvider = connection.modelsForProvider {
+            loadProviderModelCatalog = { config, force in
+                AgentModelCatalogReply(models: try await modelsForProvider(config.kind, config.id, force))
             }
         }
         loadProviders = connection.providers
         openTerminal = host.runCommand
+        openAgentSettings = host.openAgentSettings
+        addAgentProvider = host.addAgentProvider
+        if providerSettingsObserver == nil {
+            providerSettingsObserver = NotificationCenter.default.addObserver(
+                forName: .agentProviderSettingsDidChange, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.providerSettingsChanged() }
+            }
+        }
         if let providerID = connection.providerID {
             selection = AgentModelSelection(provider: connection.provider, providerID: providerID, model: selection.model)
         }

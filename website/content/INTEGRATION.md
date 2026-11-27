@@ -25,7 +25,7 @@ One Swift package, three library products:
 Add `https://github.com/hugocxl/agentkit.git` in Xcode's package dependencies, or add:
 
 ```swift
-.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.8.0")
+.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.9.0")
 ```
 
 Select the products your target needs:
@@ -113,7 +113,7 @@ Filmatte, a native macOS video editor, is the first local consumer: its tool cat
 - Recorded file changes, Git checkpoints, diff review, and guarded revert operations.
 - Local file and media previews, including revision-checked ranged reads.
 
-Provider features vary. The adapters retain each provider's behavior rather than simulating unsupported operations. `AgentConnection.capabilities` controls optional UI features; `.steering` offers Send Now, which hands a draft to the running turn instead of queueing it. Host-specific actions such as opening another conversation, launching a terminal, or previewing a pull request require host services.
+Provider features vary. The adapters retain each provider's behavior rather than simulating unsupported operations. `AgentConnection.capabilities` controls optional UI features; `.steering` offers Send Now, which hands a queued prompt or a draft, through the `sendAgentPromptNow` shortcut, to the running turn instead of queueing it. The composer shows one action at a time: Send while there is a draft, Stop while the agent works, else Dictate. Host-specific actions such as opening another conversation, launching a terminal, or previewing a pull request require host services.
 
 ## Connect your app
 
@@ -143,13 +143,13 @@ Repository metadata is read once per connection: an error with an `AgentCodedErr
 
 Each `AgentChatProvider` kind describes its CLI through `spec`: executable, wire protocol, install and sign-in commands. Claude Code and Codex use their own streaming protocols; the other kinds speak the Agent Client Protocol, and `.acp` runs any ACP agent you name.
 
-`workspace.providers`, an `AgentProviderStore`, keeps the configured providers in the storage directory's `agent-providers.json`. Every kind has a built-in provider; `write` adds more, such as a second Claude account with its own home folder, or changes executables, arguments, environment, accent colors and model preferences. `check()` and `refreshingState()` report whether each CLI is installed, its version and sign-in, and `maintain` installs or updates it. Pass a provider's ID to start a conversation on it:
+`workspace.providers`, an `AgentProviderStore`, keeps the configured providers in the storage directory's `agent-providers.json`. It lists only the providers the person added; a file older builds filled with every built-in kind keeps just the ones they changed. `write` adds providers, such as a second Claude account with its own home folder, or changes executables, arguments, environment, accent colors and model preferences. `check()` and `refreshingState()` report whether each CLI is installed, its version and sign-in, and `maintain` installs or updates it. Pass a provider's ID to start a conversation on it:
 
 ```swift
 let connection = workspace.connect(provider: .claude, providerID: "claude-work", session: savedSessionID)
 ```
 
-The model menu lists enabled providers with their logos and explains why one can't run. Choosing another provider for a conversation that has begun hands it over: after the person confirms, the next message sends the new provider the conversation so far, because one provider can't resume another's. `workspace.usageLimits()` reads Claude and Codex plan limits; a custom transport offers both through `AgentConnection.providers` and `usageLimits`.
+The model menu lists enabled providers with their logos and explains why one can't run. When the host supplies `AgentHostServices.openAgentSettings`, a new conversation with no provider added offers to add one, and the menu links each problem to its provider's settings; without it, a backend with no providers keeps offering the built-in kinds. Post `Notification.Name.agentProviderSettingsDidChange` after changing providers elsewhere so open conversations reload their menus. Choosing another provider for a conversation that has begun hands it over: after the person confirms, the next message sends the new provider the conversation so far, because one provider can't resume another's. `workspace.usageLimits()` reads Claude and Codex plan limits; a custom transport offers both through `AgentConnection.providers` and `usageLimits`.
 
 ## Themes
 
@@ -191,7 +191,7 @@ Before application termination:
 2. Dispose the conversation controllers.
 3. Run `workspace.shutdown()` off the main actor and wait for it to return.
 
-Shutdown interrupts running work, saves state, finishes observers, and releases the workspace lock. It is idempotent. The example demonstrates an AppKit termination handler that keeps the main run loop available while the draft is saved. An agent cannot outlive its host process without an application-owned helper or daemon.
+Shutdown interrupts running work, saves state, finishes observers, and releases the workspace lock. It is idempotent. A turn it cut short carries on by itself the next time the workspace opens, as one cut short by a crash does, unless the person was stopping it or three such resumes in a row made no progress. The example demonstrates an AppKit termination handler that keeps the main run loop available while the draft is saved. An agent cannot outlive its host process without an application-owned helper or daemon.
 
 ## Use your own transport
 

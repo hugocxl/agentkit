@@ -21,14 +21,10 @@ final class AgentPaneView: ThemedView {
     let questions = AgentQuestionView(frame: .zero)
     var citationEnvironmentId: String?
     var citationThreadId: String?
+    /// Send, Stop and Dictate share one slot, and only one shows: see `updatePrimaryAction`.
     let send = AgentRoundButton(kind: .send)
     let stop = AgentRoundButton(kind: .stop)
-    /// Hands the draft to the running turn rather than queueing it, where the backend can steer.
-    let sendNow = PillButton("Send Now", style: .plain)
-    /// Whether Send Now applies: the agent works and its backend can take a follow-up.
-    var sendNowAvailable = false { didSet { if sendNowAvailable != oldValue { updatePrimaryAction(); needsLayout = true } } }
     let contextIndicator = AgentContextIndicator(frame: .zero)
-    /// Dictation shares the send and stop slot: it shows while the draft is empty and idle.
     let microphone = AgentRoundButton(kind: .dictate)
     let attach = AgentIconButton(icon: .plus, label: "Attach files", iconSize: 18)
     /// The model and reasoning effort, chosen together; `model` and `effort` hold the menus.
@@ -101,6 +97,11 @@ final class AgentPaneView: ThemedView {
     private let notice = AgentSurfaceCard(.panel)
     private let emptyTitle = makeLabel("What can I help with?", font: AppFont.system(21, weight: .medium))
     private let emptyDetail = makeLabel("Ask a question or make something new.", font: AppFont.body)
+    /// Why a new conversation has no provider to start with: none added in the agent settings, or every one turned off.
+    enum ProviderGap: Equatable { case noneAdded, allOff }
+    /// Shown, with its button, in place of the composer of a new conversation that has no provider to start with.
+    var providerGap: ProviderGap? { didSet { if providerGap != oldValue { needsLayout = true } } }
+    let configureProviders = PillButton("Add Provider…", style: .primary)
     /// What the agent waits for; pressing it scrolls to the request.
     private let activity = AgentPanelLine(accessibilityLabel: "Agent activity")
     private var busy = false
@@ -234,16 +235,13 @@ final class AgentPaneView: ThemedView {
         // The pop-ups keep the menus and selection; the combined picker presents them.
         model.isHidden = true
         effort.isHidden = true
-        for child in [composerScroll, attachmentStrip, attach, plan, model, effort, modelPicker, contextIndicator, microphone, send, stop, sendNow] {
+        attach.filled = true
+        for child in [composerScroll, attachmentStrip, attach, plan, model, effort, modelPicker, contextIndicator, microphone, send, stop] {
             composerCard.addSubview(child)
             // This surface uses measured frames: controls must not bring their own size constraints.
             child.translatesAutoresizingMaskIntoConstraints = true
         }
         stop.isHidden = true
-        sendNow.isHidden = true
-        sendNow.font = AppFont.small
-        sendNow.toolTip = "Send this message into the current response instead of queueing it"
-        sendNow.setAccessibilityLabel("Send now")
         model.toolTip = "Choose the provider and model for the next message"
         effort.toolTip = "Choose the reasoning effort for the next message"
         activity.onPress = { [weak self] in self?.revealPendingRequest() }
@@ -267,9 +265,11 @@ final class AgentPaneView: ThemedView {
         emptyDetail.maximumNumberOfLines = 3
         emptyDetail.lineBreakMode = .byWordWrapping
         emptyDetail.cell?.wraps = true
+        configureProviders.translatesAutoresizingMaskIntoConstraints = true
+        configureProviders.isHidden = true
         // Suggestions sit behind the composer card so their lower edge tucks under it.
         // The transcript scrolls under everything that floats over its lower edge.
-        for child in [transcriptScroll, emptyTitle, emptyDetail, endButton, suggestions, composerCard, notice, panelScroll, activity] {
+        for child in [transcriptScroll, emptyTitle, emptyDetail, configureProviders, endButton, suggestions, composerCard, notice, panelScroll, activity] {
             addSubview(child)
         }
         panelScroll.documentView = panelDocument
@@ -329,9 +329,11 @@ final class AgentPaneView: ThemedView {
         let editorTop: CGFloat = attachmentHeight > 0 ? 10 + attachmentHeight : 10
         let controlsTop = editorTop + editorHeight + 2
         layoutComposerControls(width: width, top: controlsTop)
-        let cardHeight = controlsTop + Self.controlSize + 10
+        let cardHeight = controlsTop + Self.controlSize + AgentComposerMetrics.padding
         let empty = isEmptyConversation
+        let showNoProviders = empty && providerGap != nil
         let cardY = empty ? floor((bounds.height - cardHeight) / 2) + 40 : bounds.height - 12 - cardHeight
+        composerCard.isHidden = showNoProviders
         composerCard.frame = NSRect(x: left, y: max(0, cardY), width: width, height: cardHeight)
         attachmentStrip.frame = NSRect(x: editorX, y: 8, width: editorWidth, height: attachmentHeight)
         attachmentStrip.isHidden = attachmentHeight == 0
@@ -339,15 +341,38 @@ final class AgentPaneView: ThemedView {
         composer.frame.size.height = max(editorHeight, ceil(usedHeight) + 12)
         emptyTitle.isHidden = !empty
         emptyDetail.isHidden = !empty
-        if empty {
-            let place = workspaceDescription?() ?? ""
-            let detail = place.isEmpty ? "Ask a question or make something new." : "Ask a question or make something new in \(place)."
+        configureProviders.isHidden = !showNoProviders
+        if showNoProviders {
+            let none = providerGap == .noneAdded
+            let title = none ? "Add a coding agent to get started" : "Every provider is off"
+            let detail = none ? "Connect Claude Code, Codex or another agent, with as many accounts as you need."
+                : "Turn one on in Agent Settings to start a conversation."
+            let action = none ? "Add Provider…" : "Open Agent Settings…"
+            if configureProviders.title != action { configureProviders.title = action }
+            if emptyTitle.stringValue != title { emptyTitle.stringValue = title }
             if emptyDetail.stringValue != detail { emptyDetail.stringValue = detail }
-            emptyDetail.toolTip = "Type / for commands, @ for files, or /resume to continue a past conversation."
+            emptyDetail.toolTip = nil
+            let buttonSize = configureProviders.fittingSize
+            let detailHeight = min(60, max(20, ceil(emptyDetail.cell?.cellSize(forBounds: NSRect(x: 0, y: 0, width: width, height: 60)).height ?? 20)))
+            let blockHeight: CGFloat = 28 + 8 + detailHeight + 18 + buttonSize.height
+            let blockTop = floor((bounds.height - blockHeight) / 2)
+            emptyTitle.frame = NSRect(x: left, y: blockTop, width: width, height: 28)
+            emptyDetail.frame = NSRect(x: left, y: blockTop + 36, width: width, height: detailHeight)
+            configureProviders.frame = NSRect(x: floor((bounds.width - buttonSize.width) / 2),
+                                              y: emptyDetail.frame.maxY + 18, width: buttonSize.width, height: buttonSize.height)
+        } else {
+            if empty {
+                let title = "What can I help with?"
+                if emptyTitle.stringValue != title { emptyTitle.stringValue = title }
+                let place = workspaceDescription?() ?? ""
+                let detail = place.isEmpty ? "Ask a question or make something new." : "Ask a question or make something new in \(place)."
+                if emptyDetail.stringValue != detail { emptyDetail.stringValue = detail }
+                emptyDetail.toolTip = "Type / for commands, @ for files, or /resume to continue a past conversation."
+            }
+            let detailHeight = min(60, max(20, ceil(emptyDetail.cell?.cellSize(forBounds: NSRect(x: 0, y: 0, width: width, height: 60)).height ?? 20)))
+            emptyDetail.frame = NSRect(x: left, y: composerCard.frame.minY - 28 - detailHeight, width: width, height: detailHeight)
+            emptyTitle.frame = NSRect(x: left, y: emptyDetail.frame.minY - 34, width: width, height: 28)
         }
-        let detailHeight = min(60, max(20, ceil(emptyDetail.cell?.cellSize(forBounds: NSRect(x: 0, y: 0, width: width, height: 60)).height ?? 20)))
-        emptyDetail.frame = NSRect(x: left, y: composerCard.frame.minY - 28 - detailHeight, width: width, height: detailHeight)
-        emptyTitle.frame = NSRect(x: left, y: emptyDetail.frame.minY - 34, width: width, height: 28)
 
         // Glass cards stack above the composer, each the composer's width: a notice,
         // then questions, then the queue, then running agents, then task progress, then
@@ -405,7 +430,7 @@ final class AgentPaneView: ThemedView {
         super.layout()
     }
 
-    private static let controlSize: CGFloat = 32
+    private static let controlSize = AgentComposerMetrics.controlHeight
     /// The notice wraps to this many lines before truncating; its tooltip keeps the rest.
     private static let noticeMaximumLines = 3
     private static let noticeMinimumHeight = AgentPanelMetrics.compactHeight
@@ -497,49 +522,39 @@ final class AgentPaneView: ThemedView {
         (snapshot?.items.isEmpty ?? true) && (snapshot?.queuedPrompts?.isEmpty ?? true) && !submitting && activityStatus == .idle
     }
 
-    /// Send queues a draft while working; Stop remains beside it. Dictate appears while idle.
+    /// One action at a time: dictating offers only finishing it; a draft offers only Send
+    /// (it queues while the agent works), so stopping first takes sending or clearing the
+    /// draft; then Stop while the agent works, else Dictate.
     func updatePrimaryAction() {
         let hasDraft = !composer.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || attachmentStrip.hasAttachments
         // While a submission is in flight its draft is still shown, but the slot offers Stop.
         let showSend = hasDraft && !dictating && !submitting
-        let showStop = busy && !dictating
+        let showStop = busy && !dictating && !showSend
         send.isHidden = !showSend
         stop.isHidden = !showStop
-        sendNow.isHidden = !(showSend && sendNowAvailable)
         microphone.isHidden = showSend || showStop
     }
 
     /// Lays out the composer's single control row at `top`: attach and the plan chip on
     /// the left; usage, the model picker and the primary action on the right.
     private func layoutComposerControls(width: CGFloat, top: CGFloat) {
-        let padding: CGFloat = 10, size = Self.controlSize, gap: CGFloat = 6
+        let padding = AgentComposerMetrics.padding, size = Self.controlSize, gap: CGFloat = 6
         let action = NSRect(x: width - padding - size, y: top, width: size, height: size)
         for button in [send, stop, microphone] { button.frame = action }
         var right = action.minX - gap
-        if !send.isHidden && !stop.isHidden {
-            right -= size
-            stop.frame = NSRect(x: right, y: top, width: size, height: size)
-            right -= gap
-        }
-        if !sendNow.isHidden {
-            let pill = ceil(sendNow.fittingSize.width)
-            right -= pill
-            sendNow.frame = NSRect(x: right, y: top + 2, width: pill, height: 28)
-            right -= gap
-        }
         // Usage stays out of the way until the context window is half full.
         contextIndicator.isHidden = (contextIndicator.fractionUsed ?? 0) < 0.5
         if !contextIndicator.isHidden {
-            right -= 28
-            contextIndicator.frame = NSRect(x: right, y: top + 2, width: 28, height: 28)
-            right -= 2
+            right -= size
+            contextIndicator.frame = NSRect(x: right, y: top, width: size, height: size)
+            right -= gap
         }
         var x = padding
         attach.frame = NSRect(x: x, y: top, width: size, height: size)
         if !attach.isHidden { x += size + gap }
         if !plan.isHidden {
             let planWidth = plan.intrinsicContentSize.width
-            plan.frame = NSRect(x: x, y: top + 2, width: planWidth, height: 28)
+            plan.frame = NSRect(x: x, y: top, width: planWidth, height: size)
             x += planWidth + gap
         }
         let pickerWidth = max(0, min(modelPicker.intrinsicContentSize.width, right - x))
@@ -897,7 +912,6 @@ final class AgentPaneView: ThemedView {
         retry.setTitleColor(theme.fg)
         retryTurn.setTitleColor(theme.fg)
         resumeAtReset.setTitleColor(theme.fg)
-        sendNow.setTitleColor(theme.fg)
         newConversation.setTitleColor(theme.fg)
         dismissNotice.chatTheme = theme
         notice.theme = theme

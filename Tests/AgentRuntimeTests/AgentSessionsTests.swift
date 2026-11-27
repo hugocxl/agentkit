@@ -4571,7 +4571,7 @@ extension AgentSessionsTests {
         XCTAssertEqual(next.providerID, "claude-2")
         // Another account takes the conversation over from its transcript, with its own settings.
         let moved = try await sessions.handle(.send(session: id, text: "Other account", model: nil, provider: .claude, providerID: "claude"))
-        XCTAssertNil(moved.providerID)
+        XCTAssertEqual(moved.providerID, "claude")
         XCTAssertEqual(box.runtime?.launches.last?.provider?.arguments, [])
         XCTAssertTrue(box.runtime?.texts.last?.contains("[User]\nNext") == true)
         do {

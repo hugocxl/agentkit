@@ -51,10 +51,7 @@ final class AgentContextIndicator: AgentComposerButton {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        if hovered || isHighlighted {
-            chatTheme.fg.withAlphaComponent(0.06).setFill()
-            NSBezierPath(roundedRect: bounds, xRadius: 5, yRadius: 5).fill()
-        }
+        drawControlFill(chatTheme)
         let center = NSPoint(x: bounds.midX, y: bounds.midY)
         let radius: CGFloat = 8
         guard let fractionUsed else {

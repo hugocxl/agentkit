@@ -3,7 +3,8 @@ import AppKit
 import SwiftUI
 import Icons
 
-/// Tab Icons: signature marks carry their theme hue; UI templates inherit the caller's tint.
+/// AgentKit's icons: SF Symbols for the UI, @hugocxl/icons for provider logos and
+/// file-type icons. Signature marks carry their theme hue; UI templates inherit the caller's tint.
 public enum AppIcon: String, CaseIterable, Sendable {
     case trash
     case microphone
@@ -339,11 +340,14 @@ public enum AppIcon: String, CaseIterable, Sendable {
     /// matching the visible size of the SF Symbols they replaced on the same canvas.
     public static let inlineScale: CGFloat = 0.78
 
-    /// Which of @hugocxl/icons' sets an image comes from.
+    /// Where an image's artwork comes from.
     public enum Artwork: String, Sendable {
-        /// Outlines, used everywhere by default.
+        /// SF Symbol outlines, for every UI glyph.
         case stroke
-        /// The default two-tone set.
+        /// @hugocxl/icons' stroke set, or its default set for brand and language
+        /// marks that have no stroke version: provider logos and file-type icons.
+        case mark
+        /// @hugocxl/icons' default two-tone set.
         case duotone
     }
 
@@ -362,7 +366,229 @@ public enum AppIcon: String, CaseIterable, Sendable {
         return image(size: size, scale: scale, color: tint)
     }
 
-    /// The default set's name for icons whose stroke stand-in has another name.
+    /// The SF Symbol drawn for this icon. Brands and languages have no SF
+    /// Symbol of their own, so each takes a fitting generic symbol and keeps
+    /// its signature hue to tell it apart. Provider logos and file-type icons
+    /// draw from @hugocxl/icons instead, through `.mark` or `.duotone` artwork.
+    var symbolName: String {
+        switch self {
+        case .trash: return "trash"
+        case .microphone: return "mic"
+        case .waveform: return "waveform"
+        case .agents: return "person.2"
+        case .antigravity: return "balloon"
+        case .appWindow: return "macwindow"
+        case .arrowDown: return "arrow.down"
+        case .arrowUp: return "arrow.up"
+        case .astro: return "sparkle"
+        case .babel: return "b.square"
+        case .ban: return "nosign"
+        case .bash: return "terminal"
+        case .bell: return "bell"
+        case .biome: return "leaf"
+        case .bitbucket: return "archivebox"
+        case .bootstrap: return "bold"
+        case .braces: return "curlybraces"
+        case .brain: return "brain"
+        case .browserslist: return "list.bullet.rectangle.portrait"
+        case .bun: return "b.circle"
+        case .c: return "c.square"
+        case .chartLine: return "chart.xyaxis.line"
+        case .check: return "checkmark"
+        case .checkbox: return "checkmark.square"
+        case .chevronDown: return "chevron.down"
+        case .chevronLeft: return "chevron.left"
+        case .chevronRight: return "chevron.right"
+        case .chevronUp: return "chevron.up"
+        case .chevronsIn: return "arrow.down.and.line.horizontal.and.arrow.up"
+        case .chevronsUpDown: return "chevron.up.chevron.down"
+        case .circleAlert: return "exclamationmark.circle"
+        case .circleArrowDown: return "arrow.down.circle"
+        case .circleArrowUp: return "arrow.up.circle"
+        case .circleDashed: return "circle.dashed"
+        case .circle: return "circle"
+        case .circleCheck: return "checkmark.circle"
+        case .circleUser: return "person.crop.circle"
+        case .circleX: return "xmark.circle"
+        case .claude: return "asterisk"
+        case .close: return "xmark"
+        case .code: return "chevron.left.forwardslash.chevron.right"
+        case .codeBlock: return "curlybraces.square"
+        case .codex: return "hexagon"
+        case .columns: return "rectangle.split.2x1"
+        case .command: return "command"
+        case .commentText: return "text.bubble"
+        case .conversation: return "bubble.left.and.bubble.right"
+        case .conversationAdd: return "plus.bubble"
+        case .copilot: return "airplane"
+        case .copy: return "doc.on.doc"
+        case .cpp: return "plus.square"
+        case .cpu: return "cpu"
+        case .csharp: return "number.square"
+        case .css: return "paintbrush"
+        case .cursor: return "cursorarrow"
+        case .dart: return "scope"
+        case .database: return "cylinder"
+        case .deno: return "d.circle"
+        case .diff: return "plusminus"
+        case .docker: return "shippingbox"
+        case .dot: return "circle.fill"
+        case .download: return "square.and.arrow.down"
+        case .droid: return "gearshape.2"
+        case .elixir: return "drop"
+        case .ellipsis: return "ellipsis"
+        case .ellipsisCircle: return "ellipsis.circle"
+        case .envelope: return "envelope"
+        case .epub: return "book"
+        case .eraser: return "eraser"
+        case .eslint: return "checkmark.seal"
+        case .extensions: return "puzzlepiece.extension"
+        case .externalLink: return "arrow.up.right.square"
+        case .eye: return "eye"
+        case .file: return "doc"
+        case .filePlus: return "doc.badge.plus"
+        case .fileSymlink: return "link"
+        case .fileTable: return "tablecells"
+        case .fileText: return "doc.text"
+        case .foldVertical: return "arrow.down.and.line.horizontal.and.arrow.up"
+        case .folder: return "folder"
+        case .folderOpen: return "folder"
+        case .folderPlus: return "folder.badge.plus"
+        case .folderZip: return "archivebox"
+        case .folders: return "rectangle.stack"
+        case .font: return "textformat"
+        case .forgejo: return "hammer"
+        case .gaugeHigh: return "gauge.with.dots.needle.67percent"
+        case .gaugeLow: return "gauge.with.dots.needle.0percent"
+        case .gaugeMax: return "gauge.with.dots.needle.100percent"
+        case .gaugeMedium: return "gauge.with.dots.needle.33percent"
+        case .git: return "arrow.triangle.merge"
+        case .gitBranch: return "arrow.triangle.branch"
+        case .gitcafe: return "cup.and.saucer"
+        case .github: return "cat"
+        case .gitlab: return "flame"
+        case .globe: return "globe"
+        case .go: return "g.square"
+        case .graphql: return "point.3.connected.trianglepath.dotted"
+        case .grok: return "bolt"
+        case .hand: return "hand.raised"
+        case .hash: return "number"
+        case .haskell: return "h.square"
+        case .history: return "clock.arrow.circlepath"
+        case .homebrew: return "mug"
+        case .html: return "chevron.left.slash.chevron.right"
+        case .image: return "photo"
+        case .info: return "info.circle"
+        case .java: return "cup.and.saucer"
+        case .javascript: return "j.square"
+        case .kiro: return "wand.and.stars"
+        case .kotlin: return "k.square"
+        case .kubernetes: return "steeringwheel"
+        case .laptop: return "laptopcomputer"
+        case .layers: return "square.3.layers.3d"
+        case .lightbulb: return "lightbulb"
+        case .listTodo: return "checklist"
+        case .locate: return "location"
+        case .lock: return "lock"
+        case .lockOpen: return "lock.open"
+        case .logs: return "doc.plaintext"
+        case .lua: return "moon"
+        case .markdown: return "m.square"
+        case .maximize: return "arrow.up.left.and.arrow.down.right"
+        case .mcp: return "powerplug"
+        case .minus: return "minus"
+        case .star: return "star"
+        case .minusCircle: return "minus.circle"
+        case .monitor: return "display"
+        case .multiplexer: return "rectangle.split.2x2"
+        case .network: return "network"
+        case .nextjs: return "n.circle"
+        case .node: return "hexagon"
+        case .npm: return "shippingbox"
+        case .objc: return "o.square"
+        case .octagonAlert: return "exclamationmark.octagon"
+        case .ohMyPi: return "function"
+        case .opencode: return "chevron.left.forwardslash.chevron.right"
+        case .oxc: return "o.circle"
+        case .panelLeft: return "sidebar.left"
+        case .panelRight: return "sidebar.right"
+        case .paperclip: return "paperclip"
+        case .pauseCircle: return "pause.circle.fill"
+        case .pdf: return "doc.richtext"
+        case .pencil: return "pencil"
+        case .phone: return "iphone"
+        case .phoneAndroid: return "candybarphone"
+        case .php: return "p.circle"
+        case .pi: return "pi"
+        case .play: return "play"
+        case .plus: return "plus"
+        case .pnpm: return "square.grid.3x3"
+        case .postcss: return "paintbrush.pointed"
+        case .powershell: return "greaterthan.square"
+        case .prettier: return "wand.and.rays"
+        case .python: return "p.square"
+        case .quote: return "quote.opening"
+        case .r: return "r.square"
+        case .react: return "atom"
+        case .refresh: return "arrow.clockwise"
+        case .refreshCircle: return "arrow.clockwise.circle.fill"
+        case .reset: return "arrow.counterclockwise"
+        case .rows: return "rectangle.split.1x2"
+        case .rss: return "dot.radiowaves.up.forward"
+        case .ruby: return "diamond"
+        case .rust: return "gearshape"
+        case .sass: return "paintbrush.pointed"
+        case .scala: return "s.square"
+        case .search: return "magnifyingglass"
+        case .serverRack: return "server.rack"
+        case .settings: return "gearshape"
+        case .shield: return "shield"
+        case .shieldKeyhole: return "lock.shield"
+        case .slides: return "rectangle.inset.filled.and.person.filled"
+        case .sparkles: return "sparkles"
+        case .spinner: return "progress.indicator"
+        case .square: return "square"
+        case .spreadsheet: return "tablecells"
+        case .ssh: return "key"
+        case .stylelint: return "checklist"
+        case .svelte: return "s.circle"
+        case .svg: return "scribble.variable"
+        case .svgo: return "arrow.down.right.and.arrow.up.left"
+        case .swift: return "swift"
+        case .tablet: return "ipad"
+        case .tailwind: return "wind"
+        case .terminal: return "apple.terminal"
+        case .terminalStack: return "rectangle.stack"
+        case .terraform: return "square.stack.3d.up"
+        case .themes: return "paintpalette"
+        case .toml: return "list.dash"
+        case .triangleAlert: return "exclamationmark.triangle"
+        case .typescript: return "t.square"
+        case .viewList: return "list.bullet"
+        case .viewTree: return "list.bullet.indent"
+        case .video: return "film"
+        case .vim: return "v.circle"
+        case .vite: return "bolt.circle"
+        case .vscode: return "chevron.left.forwardslash.chevron.right"
+        case .vue: return "v.square"
+        case .wasm: return "w.square"
+        case .webpack: return "cube.transparent"
+        case .word: return "doc.text"
+        case .wrap: return "arrow.turn.down.left"
+        case .wrench: return "wrench.adjustable"
+        case .xal: return "x.circle"
+        case .xml: return "chevron.left.slash.chevron.right"
+        case .yarn: return "y.circle"
+        case .yml: return "list.bullet.indent"
+        case .zig: return "z.square"
+        case .zip: return "doc.zipper"
+        case .zoomIn: return "plus.magnifyingglass"
+        case .browser: return "safari"
+        case .simulator: return "ipad.and.iphone"
+        }
+    }
+
+    /// @hugocxl/icons' default-set name for icons whose stroke name differs.
     private var duotoneName: String {
         switch self {
         case .bell: return "bell-unread"
@@ -378,14 +604,16 @@ public enum AppIcon: String, CaseIterable, Sendable {
         }
     }
 
-    /// Whether @hugocxl/icons draws this glyph as an outline.
-    var hasStrokeArtwork: Bool { StrokeIcon(rawValue: rawValue) != nil }
+    /// Whether SF Symbols draws this glyph as an outline.
+    var hasStrokeArtwork: Bool { NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) != nil }
 
-    /// The glyph from the chosen set. Brand and language logos have no
-    /// stroke version, so they keep their single mark.
-    private func source(_ artwork: Artwork) -> NSImage? {
+    /// The glyph from the chosen source, sized for `pointSize` when it is an SF Symbol.
+    private func source(_ artwork: Artwork, pointSize: CGFloat) -> NSImage? {
         switch artwork {
-        case .stroke: return StrokeIcon(rawValue: rawValue)?.nsImage ?? Icon(rawValue: rawValue)?.nsImage
+        case .stroke:
+            return NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: max(pointSize, 1), weight: .regular))
+        case .mark: return StrokeIcon(rawValue: rawValue)?.nsImage ?? Icon(rawValue: duotoneName)?.nsImage
         case .duotone: return Icon(rawValue: duotoneName)?.nsImage
         }
     }
@@ -397,7 +625,7 @@ public enum AppIcon: String, CaseIterable, Sendable {
     public func image(size: CGFloat = Metrics.glyph, scale: CGFloat = 1, artwork: Artwork = .stroke) -> NSImage? {
         let key = "template-\(artwork.rawValue)-\(rawValue)-\(size)-\(scale)"
         if let cached = IconCache.images[key] { return cached }
-        guard let source = source(artwork), source.size.width > 0, source.size.height > 0 else { return nil }
+        guard let source = source(artwork, pointSize: size * scale), source.size.width > 0, source.size.height > 0 else { return nil }
         let fit = min(size * scale / source.size.width, size * scale / source.size.height)
         let fitted = NSSize(width: source.size.width * fit, height: source.size.height * fit)
         let image = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
@@ -410,7 +638,7 @@ public enum AppIcon: String, CaseIterable, Sendable {
         return image
     }
 
-    /// A non-template image filled with `color`, preserving the SVG's opacity.
+    /// A non-template image filled with `color`, preserving the symbol's opacity.
     @MainActor
     public func image(size: CGFloat, scale: CGFloat = 1, color: NSColor, artwork: Artwork = .stroke) -> NSImage? {
         let resolved = color.usingColorSpace(.sRGB) ?? color
@@ -513,7 +741,13 @@ public enum AgentLogo {
     /// a generic agent mark for unknown providers.
     @MainActor
     public static func image(for provider: AgentChatProvider, theme: AgentTheme) -> NSImage? {
-        mark(provider).image(size: 64, theme: theme)
+        image(for: provider, size: 64, theme: theme)
+    }
+
+    /// The provider's logo at `size` in `theme`.
+    @MainActor
+    public static func image(for provider: AgentChatProvider, size: CGFloat, theme: AgentTheme) -> NSImage? {
+        mark(provider).image(size: size, theme: theme, artwork: .mark)
     }
 
     /// The provider's mark in the shared theme's hue, whatever `lightBackground` says.
@@ -548,7 +782,8 @@ public enum AgentLogo {
         return image
     }
 
-    static func mark(_ provider: AgentChatProvider) -> AppIcon {
+    /// The provider's mark; draw it with `.mark` artwork.
+    public static func mark(_ provider: AgentChatProvider) -> AppIcon {
         switch provider {
         case .claude: return .claude
         case .codex: return .codex

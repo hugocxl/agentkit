@@ -39,6 +39,18 @@ public enum AgentAccessMode: String, Codable, Hashable, Sendable, CaseIterable {
         }
     }
 
+    /// How much a conversation may do without asking: Ask, then Auto, then Full access.
+    public var rank: Int {
+        switch self {
+        case .ask: 0
+        case .standard: 1
+        case .fullAccess: 2
+        }
+    }
+
+    /// Whether this lets a conversation do more without asking than `other` does.
+    public func exceeds(_ other: AgentAccessMode) -> Bool { rank > other.rank }
+
     public var tooltip: String {
         switch self {
         case .standard:
@@ -135,6 +147,17 @@ extension AgentChatItem {
     public static let providerTurnType = "provider_turn"
 
     public var isProviderTurn: Bool { kind == .user && workContext?.itemType == Self.providerTurnType }
+
+    /// `workContext.itemType` of the user-kind row that opens the turn carrying on work the
+    /// runtime stopping cut short, such as the app quitting mid-turn. The runtime wrote it;
+    /// nobody typed it. Builds that predate it show it as a user message.
+    public static let restartResumeType = "restart_resume"
+
+    public var isRestartResume: Bool { kind == .user && workContext?.itemType == Self.restartResumeType }
+
+    /// A user-kind row that opens a turn nobody typed: one the provider began, or work
+    /// carried on after the runtime restarted. It is shown as a note, not as the user's.
+    public var isAutomaticTurn: Bool { isProviderTurn || isRestartResume }
 }
 
 /// Something holding up the provider that the transcript doesn't show, such as a retry

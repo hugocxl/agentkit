@@ -11,6 +11,9 @@ public enum Metrics {
     /// Window inset, gaps between cards, sidebar and panel padding.
     public static var gutter: CGFloat { style.spacing.gutter }
     public static var cardRadius: CGFloat { style.radii.card }
+    /// Glass cards in the sidebars: the selected tab card, the footer card
+    /// and the usage panel's provider cards.
+    public static var glassCardRadius: CGFloat { style.radii.card }
     public static var border: CGFloat { style.controls.borderWidth }
     public static var headerHeight: CGFloat { style.controls.headerHeight }
     public static var controlGap: CGFloat { style.spacing.controlGap }

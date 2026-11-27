@@ -211,6 +211,9 @@ final class AgentSessions: @unchecked Sendable {
         /// every item counts as changed at the loaded revision.
         var itemRevisions: [String: UInt64] = [:]
         var observedItems: [String: AgentChatItem] = [:]
+        /// The runtime stopped during a turn that carries on when it starts again; see
+        /// `AgentRestartResume`.
+        var resumeAfterRestart = false
 
         init(_ snapshot: AgentChatSnapshot, directory: String) {
             self.snapshot = snapshot
@@ -226,7 +229,7 @@ final class AgentSessions: @unchecked Sendable {
         var message: String
     }
 
-    private struct Saved: Codable {
+    struct Saved: Codable {
         var turnForkPoints: [String: ForkPoint]?
         var alwaysAllowedTools: [String]?
         var snapshot: AgentChatSnapshot
@@ -240,6 +243,8 @@ final class AgentSessions: @unchecked Sendable {
         var archived: Bool?
         /// When it was closed; absent from records saved before close times were kept.
         var closedAt: Date?
+        /// Absent from records saved before interrupted turns carried on after a restart.
+        var resumeAfterRestart: Bool?
     }
 
     /// Where a request's snapshot goes: a waiting caller, or a queued delivery that
@@ -433,6 +438,8 @@ final class AgentSessions: @unchecked Sendable {
                 entry.handoffFrom = saved.handoffFrom
                 entry.turnForkPoints = saved.turnForkPoints ?? [:]
                 entry.alwaysAllowedTools = Set(saved.alwaysAllowedTools ?? [])
+                entry.resumeAfterRestart = saved.resumeAfterRestart == true && !entry.archived
+                    && entry.snapshot.status == .failed
                 // Snapshots saved before tool bodies were stored once still carry both copies.
                 for index in entry.snapshot.items.indices { Self.dropDuplicateDetail(&entry.snapshot.items[index]) }
                 bound(entry)
@@ -449,7 +456,11 @@ final class AgentSessions: @unchecked Sendable {
                 writer.async { self.retainedCheckpointIDs[sessionID] = checkpointIDs }
                 restoreCheckpoints(entry)
                 if entry.snapshot.status == .working || entry.snapshot.status == .waiting {
-                    interrupted(entry, message: "Agent interrupted when the server stopped. Send a message to resume.")
+                    // The previous runtime ended without stopping the turn, as when the app crashed.
+                    entry.resumeAfterRestart = !entry.archived
+                        && AgentRestartResume.resumes(entry.snapshot, handoff: entry.handoffFrom != nil)
+                    interrupted(entry, message: entry.resumeAfterRestart ? AgentRestartResume.stoppedNotice
+                        : AgentRestartResume.interruptedNotice)
                 } else {
                     updateTurn(entry, status: entry.snapshot.status)
                 }
@@ -465,6 +476,33 @@ final class AgentSessions: @unchecked Sendable {
             self.reclaimAbandonedCopies()
             self.settleUnsettledPins()
             self.recordRepositories()
+        }
+    }
+
+    /// Carries on turns the previous runtime stopping cut short. The runtime calls it once it
+    /// has set up how providers launch, as a resume starts a provider.
+    func resumeWorkEndedByRestart() {
+        queue.async { [self] in
+            for entry in entries.values where entry.resumeAfterRestart { resumeAfterRestart(entry) }
+        }
+    }
+
+    /// Relaunches `entry`'s provider on its conversation and asks it to continue the turn the
+    /// runtime stopping cut short. Call on `queue`.
+    private func resumeAfterRestart(_ entry: Entry) {
+        entry.resumeAfterRestart = false
+        guard !stopping, entry.snapshot.status == .failed else { persist(entry); return }
+        let snapshot = entry.snapshot
+        do {
+            try begin(.send(session: snapshot.session, text: AgentRestartResume.prompt, model: snapshot.model,
+                            reasoningEffort: snapshot.reasoningEffort, provider: snapshot.provider,
+                            attachments: nil, providerID: snapshot.providerID),
+                      continuation: Reply { _ in }, restartResume: true)
+        } catch {
+            entry.snapshot.items.append(AgentChatItem(kind: .notice, text:
+                "The agent couldn't continue after the restart: \(error.localizedDescription) Send a message to resume."))
+            touch(entry)
+            persist(entry)
         }
     }
 
@@ -1084,8 +1122,9 @@ final class AgentSessions: @unchecked Sendable {
         }
     }
 
+    /// `restartResume` carries on a turn the runtime stopping cut short; see `AgentRestartResume`.
     private func begin(_ request: AgentChatRequest,
-                       continuation: Reply, deliveryID: String? = nil) throws {
+                       continuation: Reply, deliveryID: String? = nil, restartResume: Bool = false) throws {
         if case .create(let id, let project, let provider) = request {
             if let entry = entries[id] {
                 guard entry.snapshot.project == project else {
@@ -1379,9 +1418,13 @@ final class AgentSessions: @unchecked Sendable {
                                        earlierFile: earlierFile(session: id))
             }
             entry.snapshot.provider = provider
-            entry.snapshot.providerID = Self.sameProvider(providerID, nil, kind: provider) ? nil : providerID
-            let user = AgentChatItem(id: userID, kind: .user, text: text,
-                                     attachments: attachments?.map(\.descriptor))
+            // Kept as named: without an ID the conversation runs the first configured provider
+            // of its kind, which need not be the built-in one asked for.
+            entry.snapshot.providerID = providerID
+            entry.resumeAfterRestart = false
+            let user = AgentChatItem(id: userID, kind: .user, text: restartResume ? AgentRestartResume.note : text,
+                                     attachments: attachments?.map(\.descriptor),
+                                     workContext: restartResume ? .init(itemType: AgentChatItem.restartResumeType) : nil)
             let firstMessage = !entry.snapshot.items.contains { $0.kind == .user && !$0.isProviderTurn }
             entry.snapshot.items.append(observedItem(user, entry: entry))
             if let session = entry.snapshot.providerSession, let message = entry.lastProviderMessage {
@@ -2028,6 +2071,7 @@ final class AgentSessions: @unchecked Sendable {
         var snapshot = entries[request.session]?.snapshot
             ?? AgentChatSnapshot(session: request.session, project: request.project, provider: request.provider)
         snapshot.provider = request.provider
+        snapshot.providerID = request.providerID
         snapshot.providerSession = request.providerSession
         snapshot.model = nil
         snapshot.reasoningEffort = nil
@@ -2038,7 +2082,7 @@ final class AgentSessions: @unchecked Sendable {
         snapshot.items = saved.items
         Self.finishItems(&snapshot.items)
         snapshot.items.append(AgentChatItem(kind: .notice,
-            text: "Continued from \(request.provider.name). New messages carry on this conversation."))
+            text: "Continued from \(providers(request.providerID, request.provider).title). New messages carry on this conversation."))
         let entry = Entry(snapshot, directory: directory)
         entry.hasSuccessfulTurn = true
         entries[request.session] = entry
@@ -2654,7 +2698,11 @@ final class AgentSessions: @unchecked Sendable {
                 if let runtime = entry.runtime { runtimes.append(runtime) }
                 entry.runtime = nil
                 if entry.snapshot.status == .working || entry.snapshot.status == .waiting {
-                    interrupted(entry, message: "Agent interrupted when the server stopped. Send a message to resume.")
+                    // A turn the user was stopping stays stopped.
+                    entry.resumeAfterRestart = entry.interrupting == nil && !entry.archived
+                        && AgentRestartResume.resumes(entry.snapshot, handoff: entry.handoffFrom != nil)
+                    interrupted(entry, message: entry.resumeAfterRestart ? AgentRestartResume.stoppedNotice
+                        : AgentRestartResume.interruptedNotice)
                 }
                 entry.submitting = false
                 entry.approving.removeAll()
@@ -3429,7 +3477,8 @@ final class AgentSessions: @unchecked Sendable {
                           forkSource: entry.forkSource, forkPoint: entry.forkPoint,
                           lastProviderMessage: entry.lastProviderMessage, handoffFrom: entry.handoffFrom,
                           archived: entry.archived ? true : nil,
-                          closedAt: entry.snapshot.status == .closed ? entry.closedAt : nil)
+                          closedAt: entry.snapshot.status == .closed ? entry.closedAt : nil,
+                          resumeAfterRestart: entry.resumeAfterRestart ? true : nil)
         let file = root.appendingPathComponent(entry.snapshot.session.description + ".json")
         write {
             do {

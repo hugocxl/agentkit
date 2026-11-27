@@ -104,7 +104,12 @@ public final class AgentRuntimeService: @unchecked Sendable {
         let providerStore = AgentProviderStore(url: storageDirectory.appendingPathComponent("agent-providers.json"),
                                                environment: { AgentProcess.environment().merging(environment) { _, value in value } })
         self.providers = providerStore
-        self.usageLimitsService = AgentUsageLimitsService(providers: { providerStore.provider(nil, kind: $0) })
+        // Hosts without provider settings keep reading the built-in Claude and Codex accounts.
+        let usageLimitsService = AgentUsageLimitsService(providers: {
+            let configured = providerStore.settings.providers
+            return configured.isEmpty ? [.builtIn(.claude), .builtIn(.codex)] : configured
+        })
+        self.usageLimitsService = usageLimitsService
         let discoveries = discoveries
         composer = AgentComposerContextService(home: home, environment: providerEnvironment,
             discoverProvider: { provider, directory in
@@ -118,11 +123,21 @@ public final class AgentRuntimeService: @unchecked Sendable {
             providers: { providerStore.provider($0, kind: $1) },
             projectDirectory: projectDirectory)
         models = modelService
-        providerStore.onChange = { Task { await modelService.invalidate() } }
+        providerStore.onChange = {
+            Task {
+                await modelService.invalidate()
+                await usageLimitsService.invalidate()
+            }
+        }
         historyStore = AgentHistory(home: home, environment: providerEnvironment)
         let store = historyStore
-        listHistory = { store.list(directory: $0, excluding: $1) }
-        titles = AgentTitles(history: historyStore)
+        // Each added Claude Code and Codex provider's own folder, or each kind's default one.
+        listHistory = { directory, excluding in
+            let settings = providerStore.settings
+            return AgentHistory.sources(settings).isEmpty ? store.list(directory: directory, excluding: excluding)
+                : store.list(settings, directory: directory, excluding: excluding)
+        }
+        titles = AgentTitles { id, kind in store.of(id, kind: kind, settings: providerStore.settings) }
         // Encoded before the store opens, which starts recovering its checkpoints: a failure
         // here must leave nothing running.
         let toolSignature = try tools.map { tools in
@@ -156,6 +171,7 @@ public final class AgentRuntimeService: @unchecked Sendable {
             self.observations.publish(.init(session: session, revision: revision))
             self.changed(session, revision)
         }
+        sessions.resumeWorkEndedByRestart()
     }
 
     /// Each observer receives independent, coalesced revision notifications.
@@ -202,8 +218,13 @@ public final class AgentRuntimeService: @unchecked Sendable {
     }
     public func importHistory(_ request: AgentHistoryImport) async throws -> AgentChatSnapshot {
         guard !applicationToolsOnly else { throw ServiceError(.unsupported, "Provider history is unavailable for application tools.") }
-        return try await sessions.importHistory(request) { [historyStore] directory in
-            try historyStore.transcript(provider: request.provider, session: request.providerSession, directory: directory)
+        let settings = providers.settings
+        var request = request
+        request.providerID = AgentHistory.source(request.providerID, kind: request.provider, settings: settings)?.id
+        let history = historyStore.of(request.providerID, kind: request.provider, settings: settings)
+        let resolved = request
+        return try await sessions.importHistory(resolved) { directory in
+            try history.transcript(provider: resolved.provider, session: resolved.providerSession, directory: directory)
         }
     }
     /// Reads provider metadata; call off the main or request-handling queue.

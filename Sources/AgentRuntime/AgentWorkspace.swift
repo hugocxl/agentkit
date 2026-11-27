@@ -90,12 +90,13 @@ public final class AgentWorkspace: @unchecked Sendable {
         connection.modelsForProvider = { [runtime, project] provider, providerID, refresh in
             try await runtime.modelCatalog(.init(project: project, provider: provider, forceRefresh: refresh, providerID: providerID)).models
         }
+        connection.modelCatalog = { [runtime] request in try await runtime.modelCatalog(request) }
         connection.providers = { [runtime] in runtime.providers.refreshingState() }
         connection.usageLimits = { [runtime] in await runtime.usageLimits($0) }
         connection.history = { [runtime, project] in try await runtime.history(.init(project: project)) }
         connection.importHistory = { [runtime, project] entry, session in
             try await runtime.importHistory(.init(session: session, project: project, provider: entry.provider,
-                                                 providerSession: entry.providerSession))
+                                                 providerSession: entry.providerSession, providerID: entry.providerID))
         }
         connection.composerContext = { [runtime, project] provider in
             try await runtime.composerContext(.init(project: project, provider: provider, forceRefresh: true))

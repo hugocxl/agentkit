@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.9.0 - 2026-11-27
+
+### Changed
+
+- Bring Tab's agent improvements: added-only providers, one composer action, SF Symbols and resumed turns.
+
 ## 1.8.0 - 2026-11-27
 
 ### Added

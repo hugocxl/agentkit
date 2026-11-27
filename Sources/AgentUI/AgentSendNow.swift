@@ -45,13 +45,6 @@ extension AgentPaneController {
         sendNowApplies && canSendDraft && composerWork.sendNow == nil && composerWork.sendNowTask == nil
     }
 
-    func updateSendNow() {
-        surface.sendNowAvailable = sendNowApplies
-        surface.sendNow.isEnabled = canSendNow
-        surface.sendNow.toolTip = "Send this message into the current response instead of queueing it"
-            + (keyDisplay?(.sendAgentPromptNow).map { " (\($0))" } ?? "")
-    }
-
     /// The host's Send Now key: only from the composer, and only when it applies.
     func performSendNowShortcut() -> Bool {
         guard surface.composerHasFocus, !surface.composer.hasMarkedText(), surface.suggestions.isHidden, canSendNow else { return false }

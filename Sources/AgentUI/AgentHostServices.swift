@@ -23,6 +23,12 @@ public struct AgentHostServices {
     /// Shows a short notice, such as an image copy's progress or failure, where the
     /// host shows its own; without it AgentKit uses the notice stack in the window.
     public var showNotice: ((String, Toast.Style) -> Void)?
+    /// Opens the host's agent settings, on the page of the provider ID it names, if any:
+    /// where providers are added, configured, installed and updated. With it, a new
+    /// conversation that has no provider to start with offers to add one.
+    public var openAgentSettings: ((String?) -> Void)?
+    /// Opens the host's agent settings with its Add Provider form.
+    public var addAgentProvider: (() -> Void)?
 
     /// Creates host services. Omitted integrations report that the action is unavailable.
     public init(directory: @escaping () -> String? = { nil }, isLocal: @escaping () -> Bool = { false }) {
@@ -157,4 +163,10 @@ final class AgentHostActions: AgentConversationProjectActions {
         guard let open = services.openConversation else { throw ModelError("Conversation navigation is unavailable in this application.") }
         try await open(target, project, citation)
     }
+}
+
+extension Notification.Name {
+    /// Posted after a host or AgentKit's agent settings change the configured providers,
+    /// so every open conversation reloads its model menu.
+    public static let agentProviderSettingsDidChange = Notification.Name("AgentKit.agentProviderSettingsDidChange")
 }

@@ -37,7 +37,7 @@ final class AgentProviderStoreTests: XCTestCase {
 
         try Data("{ not json".utf8).write(to: url)
         let damaged = AgentProviderStore(url: url)
-        XCTAssertEqual(damaged.settings.providers.map(\.id), AgentChatProvider.builtIn.map(\.rawValue))
+        XCTAssertEqual(damaged.settings.providers, [])
         XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "{ not json", "a file this build can't read is left for the user")
         XCTAssertThrowsError(try damaged.write(AgentProviderSettings(providers: [AgentProviderConfig(id: "has space", kind: .claude)])))
     }
@@ -49,12 +49,10 @@ final class AgentProviderStoreTests: XCTestCase {
         let store = AgentProviderStore(url: directory.appendingPathComponent("agent-providers.json"),
                                        environment: { ["PATH": "/usr/bin:/bin"] },
                                        latestVersions: AgentProviderLatestVersions(lookup: { _ in "2.1.500" }))
-        var settings = store.settings
-        settings.providers = settings.providers.map { provider in
-            var provider = provider
-            provider.executable = claude.path
-            return provider
-        }
+        var settings = AgentProviderSettings(providers: [
+            AgentProviderConfig(id: "claude", kind: .claude, executable: claude.path),
+            AgentProviderConfig(id: "codex", kind: .codex, executable: claude.path),
+        ])
         _ = try store.write(settings)
         let state = await store.check()
         let health = try XCTUnwrap(state.health("claude"))
@@ -75,6 +73,33 @@ final class AgentProviderStoreTests: XCTestCase {
         settings.providers[0].home = "~/.claude-other"
         XCTAssertNil(try store.write(settings).health("claude"), "another config folder may be another account")
         XCTAssertNotNil(store.state().health("codex"))
+    }
+
+    func testProbingAProviderBeingAddedChangesNothing() async throws {
+        let directory = try root()
+        let claude = try fakeCLI(in: directory, version: "2.1.400",
+                                 auth: #"{"loggedIn":true,"subscriptionType":"max","email":"me@example.com"}"#)
+        let url = directory.appendingPathComponent("agent-providers.json")
+        let store = AgentProviderStore(url: url, environment: { ["PATH": "/usr/bin:/bin"] },
+                                       latestVersions: AgentProviderLatestVersions(lookup: { _ in nil }))
+        let found = await store.probe(AgentProviderConfig(id: "claude", kind: .claude, executable: claude.path))
+        XCTAssertEqual(found.version, "2.1.400")
+        XCTAssertEqual(found.email, "me@example.com")
+        XCTAssertEqual(found.executablePath, claude.path)
+
+        // Another account's folder doesn't exist until it signs in; probing it doesn't make it.
+        let work = directory.appendingPathComponent("claude-work").path
+        let fresh = await store.probe(AgentProviderConfig(id: "claude", kind: .claude, executable: claude.path, home: work))
+        XCTAssertTrue(fresh.installed)
+        XCTAssertEqual(fresh.auth, .signedOut)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: work))
+        let shadow = directory.appendingPathComponent("codex-personal").path
+        _ = await store.probe(AgentProviderConfig(id: "codex", kind: .codex, executable: claude.path, shadowHome: shadow))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: shadow), "a Codex account folder is linked only once it is added")
+
+        XCTAssertTrue(store.settings.providers.isEmpty)
+        XCTAssertTrue(store.state().health.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
     func testAMissingCLIOrSignInSaysWhatToDo() throws {
@@ -167,6 +192,11 @@ final class AgentProviderStoreTests: XCTestCase {
         XCTAssertEqual(environment["PATH"], "/custom/bin", "the user's own variables win")
         XCTAssertEqual(environment["HOME"], "/Users/me", "HOME stays, so Keychain sign-ins keep working")
         XCTAssertNil(AgentProviderLaunch.environment(.builtIn(.codex), base: [:])["CODEX_HOME"])
+
+        let spaced = AgentProviderConfig(id: "claude-personal", kind: .claude, home: "/Users/me/Claude Personal")
+        XCTAssertEqual(AgentProviderLaunch.signInCommand(spaced, executable: nil),
+                       "CLAUDE_CONFIG_DIR='/Users/me/Claude Personal' claude auth login",
+                       "the variable name stays unquoted so shells treat it as an env assignment")
     }
 
     func testModelMenusUseEachProvidersHomeAndPreferences() async throws {
@@ -177,6 +207,7 @@ final class AgentProviderStoreTests: XCTestCase {
         try JSONSerialization.data(withJSONObject: ["models": [row("alpha"), row("beta"), row("gamma")]])
             .write(to: work.appendingPathComponent("models_cache.json"))
         let settings = AgentProviderSettings(providers: [
+            .builtIn(.codex),
             AgentProviderConfig(id: "codex-2", kind: .codex, home: work.path,
                                 models: AgentProviderModels(favorites: ["gamma"], hidden: ["alpha"], custom: [AgentCustomModel(id: "next")])),
             AgentProviderConfig(id: "off", kind: .codex, enabled: false),
@@ -295,10 +326,9 @@ final class AgentProviderStoreTests: XCTestCase {
         let store = AgentProviderStore(url: directory.appendingPathComponent("agent-providers.json"),
                                        environment: { ["PATH": "/usr/bin:/bin"] },
                                        latestVersions: AgentProviderLatestVersions(lookup: { _ in "1.2.0" }))
-        var settings = store.settings
-        settings.providers = settings.providers.filter { $0.kind == .grok }
-        settings.providers[0].executable = cli.path
-        _ = try store.write(AgentProviderSettings(providers: settings.providers))
+        var grok = AgentProviderConfig.builtIn(.grok)
+        grok.executable = cli.path
+        _ = try store.write(AgentProviderSettings(providers: [grok]))
         let before = await store.check()
         XCTAssertEqual(before.health("grok")?.auth, .signedIn)
         XCTAssertEqual(before.health("grok")?.versionAdvisory?.status, .behindLatest)

@@ -59,6 +59,13 @@ public struct AgentProviderConfig: Hashable, Codable, Sendable, Identifiable {
 
     public var isBuiltIn: Bool { kind.hasBuiltIn && id == kind.rawValue }
 
+    /// A built-in provider as older builds added it by themselves: nothing set but whether it is on.
+    var isUnchangedBuiltIn: Bool {
+        var unchanged = AgentProviderConfig.builtIn(kind)
+        unchanged.enabled = enabled
+        return isBuiltIn && self == unchanged
+    }
+
     /// The name the UI shows: the chosen one, else the kind's.
     public var title: String {
         let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -73,6 +80,35 @@ public struct AgentProviderConfig: Hashable, Codable, Sendable, Identifiable {
 
     /// Whether the kind can keep an account's sign-in in a shadow home.
     public var supportsShadowHome: Bool { kind == .codex }
+
+    /// The API key it signs in with: the first of its kind's key variables that has a value.
+    public var apiKey: String? {
+        environment.first { kind.spec.apiKeyVariables.contains($0.name) && !$0.value.isEmpty }?.value
+    }
+
+    /// The folder its CLI keeps its sign-in in, written from `~`: a Codex account folder, else
+    /// its config folder, else its kind's default. Nil when the kind keeps one sign-in per
+    /// Mac, such as Antigravity CLI in the keychain.
+    public var signInFolder: String? {
+        guard homeVariable != nil else { return nil }
+        func folder(_ path: String?) -> String? {
+            var path = path?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            while path.count > 1, path.hasSuffix("/") { path.removeLast() }
+            guard !path.isEmpty else { return nil }
+            let home = NSHomeDirectory()
+            if path == home || path.hasPrefix(home + "/") { path = "~" + path.dropFirst(home.count) }
+            return path
+        }
+        return (supportsShadowHome ? folder(shadowHome) : nil) ?? folder(home) ?? folder(kind.spec.defaultHome)
+    }
+
+    /// Whether it and `other` would run signed in to the same account: the same API key, or
+    /// without one the same sign-in folder. Custom ACP agents are told apart by their commands.
+    public func sharesSignIn(with other: AgentProviderConfig) -> Bool {
+        guard kind == other.kind, kind != .acp else { return false }
+        if apiKey != nil || other.apiKey != nil { return apiKey == other.apiKey }
+        return signInFolder == other.signInFolder
+    }
 
     /// Marker colors the UI offers for `accentColor`.
     public static let accentColors = ["#F2701B", "#E5484D", "#D6409F", "#8E4BF2", "#1F6FEB", "#1E9AA0", "#2FA84A", "#F29D1B"]
@@ -192,10 +228,10 @@ public struct AgentCustomModel: Hashable, Codable, Sendable {
 
 /// A backend's coding agents, kept in its `agent-providers.json`.
 public struct AgentProviderSettings: Hashable, Codable, Sendable {
-    public static let maxProviders = 32
+    public static let maxProviders = 128
     public static let defaultHealthCheckInterval = 300
 
-    /// Every provider, built-in ones included, in the order the UI lists them.
+    /// Configured providers, in the order the UI lists them.
     public var providers: [AgentProviderConfig]
     /// Seconds between background checks of each provider's version and sign-in; 0 checks only on request.
     public var healthCheckInterval: Int
@@ -206,22 +242,39 @@ public struct AgentProviderSettings: Hashable, Codable, Sendable {
         normalize()
     }
 
-    private enum CodingKeys: String, CodingKey { case providers, healthCheckInterval }
+    /// 2 since providers are only ever added by the user. Older builds wrote none and
+    /// filled the list with every built-in kind.
+    static let revision = 2
+
+    private enum CodingKeys: String, CodingKey { case providers, healthCheckInterval, revision }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         providers = (try? c.decodeIfPresent(LossyProviders.self, forKey: .providers))?.providers ?? []
         healthCheckInterval = try c.decodeIfPresent(Int.self, forKey: .healthCheckInterval) ?? Self.defaultHealthCheckInterval
         normalize()
+        if (try? c.decodeIfPresent(Int.self, forKey: .revision)) == nil { dropSeededProviders() }
     }
 
-    /// Adds a missing built-in provider and drops repeated IDs.
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(providers, forKey: .providers)
+        try c.encode(healthCheckInterval, forKey: .healthCheckInterval)
+        try c.encode(Self.revision, forKey: .revision)
+    }
+
+    /// Drops repeated IDs.
     private mutating func normalize() {
         var seen = Set<String>()
         providers = providers.filter { seen.insert($0.id).inserted }
-        for kind in AgentChatProvider.builtIn where !seen.contains(kind.rawValue) {
-            providers.append(.builtIn(kind))
-        }
+    }
+
+    /// Older builds, and older apps saving to this backend, list every built-in kind whether
+    /// the user added it or not. Such a list keeps only the providers the user changed.
+    private mutating func dropSeededProviders() {
+        let ids = Set(providers.map(\.id))
+        guard AgentChatProvider.builtIn.allSatisfy({ ids.contains($0.rawValue) }) else { return }
+        providers.removeAll(where: \.isUnchangedBuiltIn)
     }
 
     public func provider(_ id: String?) -> AgentProviderConfig? {
@@ -229,10 +282,11 @@ public struct AgentProviderSettings: Hashable, Codable, Sendable {
         return providers.first { $0.id == id }
     }
 
-    /// The provider a conversation runs: `id`'s, or else its kind's built-in one. A custom
-    /// ACP agent has no built-in one, so a missing one is a provider with no command.
+    /// The provider a conversation runs: `id`'s, or the first configured provider of `kind`,
+    /// falling back to a default configuration for legacy conversations.
     public func provider(_ id: String?, kind: AgentChatProvider) -> AgentProviderConfig {
         if let found = provider(id), found.kind == kind { return found }
+        if id == nil, let first = providers.first(where: { $0.kind == kind }) { return first }
         return provider(kind.rawValue) ?? .builtIn(kind)
     }
 
@@ -243,13 +297,22 @@ public struct AgentProviderSettings: Hashable, Codable, Sendable {
         return "\(kind.rawValue)-\(number)"
     }
 
-    /// A new provider's ID from its label, such as `claude-work` for “Work”, unused by any
-    /// other; `newID` when the label has no letters or digits.
+    /// A new provider's ID from its label, such as `claude-work` for “Work” or “Claude Work”,
+    /// unused by any other; `newID` when the label has no letters or digits.
     public func newID(_ kind: AgentChatProvider, label: String) -> String {
-        let words = label.lowercased().folding(options: .diacriticInsensitive, locale: nil)
-            .split { !($0.isASCII && ($0.isLetter || $0.isNumber)) }
-        let kindName = kind.name.lowercased()
-        guard !words.isEmpty, words.joined(separator: " ") != kindName else {
+        func tokens(_ text: String) -> [String] {
+            text.lowercased().folding(options: .diacriticInsensitive, locale: nil)
+                .split { !($0.isASCII && ($0.isLetter || $0.isNumber)) }.map(String.init)
+        }
+        var words = tokens(label)
+        let nameWords = tokens(kind.name)
+        let idWords = tokens(kind.rawValue)
+        if !nameWords.isEmpty, words.starts(with: nameWords) {
+            words.removeFirst(nameWords.count)
+        } else if !idWords.isEmpty, words.starts(with: idWords) {
+            words.removeFirst(idWords.count)
+        }
+        guard !words.isEmpty else {
             return provider(kind.rawValue) == nil ? kind.rawValue : newID(kind)
         }
         let base = String((kind.rawValue + "-" + words.joined(separator: "-")).prefix(60))
