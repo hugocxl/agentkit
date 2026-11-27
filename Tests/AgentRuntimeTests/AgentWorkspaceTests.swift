@@ -30,6 +30,24 @@ final class AgentWorkspaceTests: XCTestCase {
         XCTAssertEqual(restored.project, project)
     }
 
+    func testWorkspacesSharingAProviderStoreSeeEachOthersProviders() async throws {
+        let (work, storage) = try folders(), (otherWork, otherStorage) = try folders()
+        let store = AgentProviderStore(url: storage.deletingLastPathComponent().appendingPathComponent("agent-providers.json"))
+        let first = try AgentWorkspace(workingDirectory: work, storageDirectory: storage, project: ProjectId(), providers: store)
+        defer { first.shutdown() }
+        let second = try AgentWorkspace(workingDirectory: otherWork, storageDirectory: otherStorage, project: ProjectId(), providers: store)
+        defer { second.shutdown() }
+        XCTAssertTrue(first.providers === second.providers)
+        let management = try XCTUnwrap(first.connect(provider: .claude).providerManagement)
+        let account = AgentProviderConfig(id: "claude-work", kind: .claude, name: "Work", home: "~/.claude-work")
+        let saved = try await management.write(AgentProviderSettings(providers: [account]))
+        XCTAssertEqual(saved.settings.providers.map(\.id), ["claude-work"])
+        let shared = try await second.providerManagement.state()
+        XCTAssertEqual(shared.settings.providers, [account])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storage.appendingPathComponent("conversations/agent-providers.json").path),
+                       "a shared store keeps no copy beside a workspace's conversations")
+    }
+
     func testObserversReceiveTheSameRevisionAndFinishAtShutdown() async throws {
         let (work, storage) = try folders(), project = ProjectId()
         let workspace = try AgentWorkspace(workingDirectory: work, storageDirectory: storage, project: project)

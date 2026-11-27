@@ -63,6 +63,10 @@ public struct AgentConnection: Sendable {
     /// returned at once while the backend refreshes, and a forced request waits for it.
     /// Preferred over `modelsForProvider` when both are set.
     public var modelCatalog: (@Sendable (AgentModelCatalogRequest) async throws -> AgentModelCatalogReply)?
+    /// Adds, configures, checks, installs and updates the backend's providers, for agent
+    /// settings. With it, the conversation offers its own agent settings window unless the
+    /// host supplies `openAgentSettings`.
+    public var providerManagement: AgentProviderManagement?
     /// The backend's configured providers and their last health checks.
     public var providers: (@Sendable () async throws -> AgentProvidersState)?
     /// Subscription usage limits for signed-in providers.

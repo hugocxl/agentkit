@@ -68,6 +68,12 @@ final class ExampleApp: NSObject, NSApplicationDelegate {
             self.window = window
             let menu = NSMenu()
             let appMenu = NSMenuItem(); menu.addItem(appMenu); appMenu.submenu = NSMenu()
+            if workspace != nil {
+                let settings = NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
+                settings.target = self
+                appMenu.submenu?.addItem(settings)
+                appMenu.submenu?.addItem(.separator())
+            }
             appMenu.submenu?.addItem(withTitle: "Quit AgentKit Example", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
             let edit = NSMenuItem(); menu.addItem(edit); edit.submenu = NSMenu(title: "Edit")
             for (name, action, key) in [("Copy", "copy:", "c"), ("Paste", "paste:", "v"), ("Select All", "selectAll:", "a")] {
@@ -76,9 +82,15 @@ final class ExampleApp: NSObject, NSApplicationDelegate {
             NSApplication.shared.mainMenu = menu
             NSApplication.shared.activate(ignoringOtherApps: true)
             controller.refresh(); controller.focusComposer()
+            if arguments.contains("--settings") { showSettings() }
         } catch {
             let alert = NSAlert(error: error); alert.runModal(); NSApplication.shared.terminate(nil)
         }
+    }
+    /// Providers, accounts and models, in AgentKit's agent settings window.
+    @objc private func showSettings() {
+        guard let workspace else { return }
+        AgentSettingsWindowController.show(workspace.providerManagement)
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

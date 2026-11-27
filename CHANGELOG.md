@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.10.0 - 2026-11-27
+
+### Added
+
+- An agent settings window to add, configure, check, install and update providers and arrange their models.
+
 ## 1.9.0 - 2026-11-27
 
 ### Changed

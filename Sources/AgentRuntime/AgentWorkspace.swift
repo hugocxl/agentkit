@@ -17,12 +17,15 @@ public final class AgentWorkspace: @unchecked Sendable {
 
     /// Creates an independent workspace. `storageDirectory` must be dedicated to
     /// this workspace; reuse it and `project` to restore saved conversations.
-    /// Provider executables otherwise resolve from the user's CLI search path.
+    /// Provider executables otherwise resolve from the user's CLI search path. Pass one
+    /// `providers` store to every workspace so the person adds providers once for the app;
+    /// without it each workspace keeps its own in `storageDirectory`.
     public init(workingDirectory: URL, storageDirectory: URL,
                 project: ProjectId,
                 executables: [AgentChatProvider: URL] = [:],
                 environment: [String: String] = [:], instructions: String? = nil,
-                tools: AgentToolConfiguration? = nil, retention: AgentConversationRetention = .keepClosed) throws {
+                tools: AgentToolConfiguration? = nil, retention: AgentConversationRetention = .keepClosed,
+                providers: AgentProviderStore? = nil) throws {
         try tools?.validate()
         self.applicationToolsOnly = tools?.applicationOnly == true
         self.project = project
@@ -51,7 +54,8 @@ public final class AgentWorkspace: @unchecked Sendable {
         }
         runtime = try AgentRuntimeService(storageDirectory: storageDirectory.appendingPathComponent("conversations"),
             modelCacheDirectory: storageDirectory.appendingPathComponent("models"), executables: executables,
-            environment: environment, tools: tools, retention: retention, projectDirectory: { URL(fileURLWithPath: try resolve($0)) },
+            environment: environment, tools: tools, retention: retention, providers: providers,
+            projectDirectory: { URL(fileURLWithPath: try resolve($0)) },
             launchContext: { _, _ in .init(instructions: instructions) })
         // A deleted conversation's draft goes with it.
         let drafts = self.storageDirectory.appendingPathComponent("drafts", isDirectory: true)
@@ -64,6 +68,16 @@ public final class AgentWorkspace: @unchecked Sendable {
 
     /// Configured agent providers and their health checks for this workspace.
     public var providers: AgentProviderStore { runtime.providers }
+
+    /// Agent settings' access to the providers, with each one's models as this workspace
+    /// lists them; pass it to `AgentSettingsWindowController.show(_:)`.
+    public var providerManagement: AgentProviderManagement {
+        let runtime = runtime, project = project
+        return runtime.providers.management { config, refresh in
+            try await runtime.modelCatalog(AgentModelCatalogRequest(project: project, provider: config.kind, forceRefresh: refresh,
+                                                                    providerID: config.id, includeHidden: true)).models
+        }
+    }
 
     /// Reads subscription usage limits for signed-in providers.
     public func usageLimits(_ request: AgentUsageLimitsRequest = .init()) async -> AgentUsageLimitsReply {
@@ -92,6 +106,7 @@ public final class AgentWorkspace: @unchecked Sendable {
         }
         connection.modelCatalog = { [runtime] request in try await runtime.modelCatalog(request) }
         connection.providers = { [runtime] in runtime.providers.refreshingState() }
+        connection.providerManagement = providerManagement
         connection.usageLimits = { [runtime] in await runtime.usageLimits($0) }
         connection.history = { [runtime, project] in try await runtime.history(.init(project: project)) }
         connection.importHistory = { [runtime, project] entry, session in

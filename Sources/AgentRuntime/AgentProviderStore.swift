@@ -19,6 +19,8 @@ public final class AgentProviderStore: @unchecked Sendable {
     private var maintenanceChain: Task<Void, Never>?
     /// Runs after the providers change, so cached model lists are dropped.
     public var onChange: (@Sendable () -> Void)?
+    /// Every runtime sharing this store, told as `onChange` is.
+    private var changeHandlers: [@Sendable () -> Void] = []
 
     /// How long an install or update may run.
     static let maintenanceTimeout: TimeInterval = 30 * 60
@@ -87,7 +89,7 @@ public final class AgentProviderStore: @unchecked Sendable {
                 changed[next.id].map { !Self.runsTheSameCLI($0, next) } ?? true
             }
         }
-        if cliChanged { onChange?() }
+        if cliChanged { changed() }
         return state()
     }
 
@@ -126,9 +128,33 @@ public final class AgentProviderStore: @unchecked Sendable {
         return state()
     }
 
+    /// Runs `handler` after the providers change, as `onChange` does, without replacing the
+    /// handlers of other runtimes sharing this store.
+    public func addChangeHandler(_ handler: @escaping @Sendable () -> Void) {
+        lock.withLock { changeHandlers.append(handler) }
+    }
+
+    private func changed() {
+        onChange?()
+        for handler in lock.withLock({ changeHandlers }) { handler() }
+    }
+
+    /// Agent settings' access to this store. `models` lists a provider's models, hidden
+    /// ones included, when a runtime serves them.
+    public func management(models: (@Sendable (AgentProviderConfig, Bool) async throws -> [AgentModelDescriptor])? = nil)
+        -> AgentProviderManagement {
+        AgentProviderManagement(
+            state: { [self] in refreshingState() },
+            check: { [self] in await check() },
+            write: { [self] in try write($0) },
+            maintain: { [self] in try maintain($0, action: $1) },
+            probe: { [self] in await probe($0) },
+            models: models)
+    }
+
     /// Checks `provider` as `check` would, saved or not, changing nothing: the Add Provider
     /// dialog's view of what it is filling in.
-    func probe(_ provider: AgentProviderConfig) async -> AgentProviderHealth {
+    public func probe(_ provider: AgentProviderConfig) async -> AgentProviderHealth {
         await checked(provider, prepare: false)
     }
 
@@ -274,7 +300,7 @@ public final class AgentProviderStore: @unchecked Sendable {
         update(provider.id) { $0.message = "Checking the installed version" }
         let checked = await checked(provider, freshLatest: true)
         record(checked)
-        onChange?()
+        changed()
         update(provider.id) { run in
             run.finishedAt = now()
             switch result {

@@ -127,6 +127,8 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         var resolvedModel: String?
         var providers: [AgentProviderConfig]
         var health: [String: AgentProviderHealth]
+        var providersLoaded = false
+        var settingsAvailable = false
     }
     var connectionGeneration: UInt64 = 0
     var needsAuthoritativeSnapshot = false
@@ -2198,7 +2200,7 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         } else {
             guard modelCatalogTask == nil, Date().timeIntervalSince(modelCatalogLoadedAt) > 60 else { return }
         }
-        guard modelCatalogLoader != nil else { return }
+        guard modelCatalogLoader != nil || loadProviders != nil else { return }
         modelCatalogLoadedAt = Date()
         let generation = connectionGeneration
         let taskID = UUID()
@@ -2421,6 +2423,8 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
             refreshModelCatalog(force: true)
         } else if item.representedObject as? String == "open-agent-settings" {
             setUpProviders()
+        } else if item.representedObject as? String == "agent-settings" {
+            openAgentSettings?(selection.providerKey)
         }
     }
 
@@ -2459,7 +2463,8 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         guard !modelMenuOpen else { return }
         let state = PickerState(selection: selection, effort: reasoningEffort,
                                 handsOff: switchingHandsOff,
-                                resolvedModel: effectiveModel, providers: menuProviders, health: providerHealth)
+                                resolvedModel: effectiveModel, providers: menuProviders, health: providerHealth,
+                                providersLoaded: providersLoaded, settingsAvailable: openAgentSettings != nil)
         guard menuState != state else { return }
         menuState = state
         let displayedSelection = AgentModelSelection(provider: selection.provider, providerID: selection.providerID, model: effectiveModel)
@@ -2547,6 +2552,12 @@ final class AgentPaneController: NSObject, NSTextViewDelegate, NSMenuDelegate {
         let refreshModels = NSMenuItem(title: "Refresh models…", action: nil, keyEquivalent: "")
         refreshModels.representedObject = "refresh-models"
         menu.addItem(refreshModels)
+        if openAgentSettings != nil, !noProvider {
+            let settings = NSMenuItem(title: "Agent Settings…", action: nil, keyEquivalent: "")
+            settings.representedObject = "agent-settings"
+            settings.toolTip = "Add providers and accounts, and choose which models the menu offers"
+            menu.addItem(settings)
+        }
         surface.model.menu = menu
         surface.model.menuLogos = menuLogos
         surface.model.providerLogo = noProvider ? nil : selection.provider

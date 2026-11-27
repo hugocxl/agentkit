@@ -25,7 +25,7 @@ One Swift package, three library products:
 Add `https://github.com/hugocxl/agentkit.git` in Xcode's package dependencies, or add:
 
 ```swift
-.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.9.0")
+.package(url: "https://github.com/hugocxl/agentkit.git", from: "1.10.0")
 ```
 
 Select the products your target needs:
@@ -150,6 +150,19 @@ let connection = workspace.connect(provider: .claude, providerID: "claude-work",
 ```
 
 The model menu lists enabled providers with their logos and explains why one can't run. When the host supplies `AgentHostServices.openAgentSettings`, a new conversation with no provider added offers to add one, and the menu links each problem to its provider's settings; without it, a backend with no providers keeps offering the built-in kinds. Post `Notification.Name.agentProviderSettingsDidChange` after changing providers elsewhere so open conversations reload their menus. Choosing another provider for a conversation that has begun hands it over: after the person confirms, the next message sends the new provider the conversation so far, because one provider can't resume another's. `workspace.usageLimits()` reads Claude and Codex plan limits; a custom transport offers both through `AgentConnection.providers` and `usageLimits`.
+
+## Agent settings
+
+`AgentSettingsWindowController` is a native window for everything about providers: the list with each one's status, adding another through a form that checks the CLI and sign-in as it is filled in and keeps a second account in a folder of its own, and each provider's page with install and update, sign-in, executable, folders, launch arguments, variables, Claude's auto-compact size and its models, which can be favorited, reordered, hidden or added by ID.
+
+A conversation whose connection has `providerManagement` opens it from its model menu, and from the empty conversation when no provider is added; `AgentWorkspace` supplies one. Open it yourself, for example from a toolbar button or a Settings menu item:
+
+```swift
+conversation.showAgentSettings()                                    // the conversation's backend
+AgentSettingsWindowController.show(workspace.providerManagement)    // a workspace directly
+```
+
+Pass one `AgentProviderStore` as `providers` to every `AgentWorkspace` so the person adds providers once for the app rather than once per workspace. A host with its own settings sets `AgentHostServices.openAgentSettings` and `addAgentProvider` instead, and a remote backend supplies its own `AgentProviderManagement`. Sign-in runs through `AgentHostServices.runCommand`, or in Terminal without it.
 
 ## Themes
 

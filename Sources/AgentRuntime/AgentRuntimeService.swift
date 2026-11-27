@@ -66,16 +66,19 @@ public final class AgentRuntimeService: @unchecked Sendable {
     /// logged and the store served. Pass an existing
     /// conversation store directly to retain its transcripts, queues and resources.
     /// `retention` says how long closed conversations are kept; see `AgentConversationRetention`.
+    /// `providers` shares one `AgentProviderStore` between runtimes, so an app adds its
+    /// providers once; without it the runtime keeps its own beside its conversations.
     public convenience init(storageDirectory: URL, modelCacheDirectory: URL? = nil,
                             home: URL = FileManager.default.homeDirectoryForCurrentUser,
                             executables: [AgentChatProvider: URL] = [:], environment: [String: String] = [:],
                             tools: AgentToolConfiguration? = nil, hostOwnsStore: Bool = false,
-                            retention: AgentConversationRetention = .keepClosed,
+                            retention: AgentConversationRetention = .keepClosed, providers: AgentProviderStore? = nil,
                             projectDirectory: @escaping @Sendable (ProjectId) throws -> URL,
                             launchContext: @escaping @Sendable (SessionId, ProjectId) -> AgentLaunchContext = { _, _ in .init() }) throws {
         try self.init(storageDirectory: storageDirectory, modelCacheDirectory: modelCacheDirectory, home: home,
                       executables: executables, environment: environment, tools: tools, hostOwnsStore: hostOwnsStore,
-                      retention: retention, checkpoints: AgentCheckpointStore(), projectDirectory: projectDirectory, launchContext: launchContext)
+                      retention: retention, providers: providers, checkpoints: AgentCheckpointStore(),
+                      projectDirectory: projectDirectory, launchContext: launchContext)
     }
 
     /// `checkpoints` takes and removes the store's checkpoints; tests stand in another Git.
@@ -84,7 +87,7 @@ public final class AgentRuntimeService: @unchecked Sendable {
          executables: [AgentChatProvider: URL] = [:], environment: [String: String] = [:],
          tools: AgentToolConfiguration? = nil, hostOwnsStore: Bool = false,
          retention: AgentConversationRetention = .keepClosed, now: @escaping @Sendable () -> Date = { Date() },
-         checkpoints: AgentCheckpointStore,
+         providers sharedProviders: AgentProviderStore? = nil, checkpoints: AgentCheckpointStore,
          projectDirectory: @escaping @Sendable (ProjectId) throws -> URL,
          launchContext: @escaping @Sendable (SessionId, ProjectId) -> AgentLaunchContext = { _, _ in .init() }) throws {
         try tools?.validate()
@@ -101,7 +104,7 @@ public final class AgentRuntimeService: @unchecked Sendable {
             ownership = nil
         }
         let providerEnvironment = AgentProcess.environment().merging(environment) { _, value in value }
-        let providerStore = AgentProviderStore(url: storageDirectory.appendingPathComponent("agent-providers.json"),
+        let providerStore = sharedProviders ?? AgentProviderStore(url: storageDirectory.appendingPathComponent("agent-providers.json"),
                                                environment: { AgentProcess.environment().merging(environment) { _, value in value } })
         self.providers = providerStore
         // Hosts without provider settings keep reading the built-in Claude and Codex accounts.
@@ -123,10 +126,10 @@ public final class AgentRuntimeService: @unchecked Sendable {
             providers: { providerStore.provider($0, kind: $1) },
             projectDirectory: projectDirectory)
         models = modelService
-        providerStore.onChange = {
+        providerStore.addChangeHandler { [weak modelService, weak usageLimitsService] in
             Task {
-                await modelService.invalidate()
-                await usageLimitsService.invalidate()
+                await modelService?.invalidate()
+                await usageLimitsService?.invalidate()
             }
         }
         historyStore = AgentHistory(home: home, environment: providerEnvironment)

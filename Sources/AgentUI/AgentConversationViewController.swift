@@ -14,6 +14,8 @@ public final class AgentConversationViewController: NSViewController {
     public var composerHasFocus: Bool { controller.view.window?.firstResponder === controller.surface.composer }
     public var snapshot: AgentChatSnapshot? { controller.snapshot }
     public var selectedProvider: AgentChatProvider { controller.selection.provider }
+    /// The configured provider the next message goes to, such as `claude-work`.
+    public var selectedProviderID: String { controller.selection.providerKey }
     public var conversationTitle: String { controller.title }
     public var conversationIcon: NSImage? { controller.icon }
     public var theme: AgentTheme {
@@ -76,6 +78,15 @@ public final class AgentConversationViewController: NSViewController {
                 return list.paths
             }
         }
+        // A backend that manages its providers gets AgentKit's own settings window.
+        if host.openAgentSettings == nil, let management = connection.providerManagement {
+            let run = host.runCommand
+            let windowTheme = theme ?? AgentTheme.shared
+            host.openAgentSettings = { AgentSettingsWindowController.show(management, provider: $0, theme: windowTheme, runCommand: run) }
+            if host.addAgentProvider == nil {
+                host.addAgentProvider = { AgentSettingsWindowController.show(management, addProvider: true, theme: windowTheme, runCommand: run) }
+            }
+        }
         controller.bind(connection, host: host, theme: theme ?? AgentTheme.shared)
         // Subscribe before the initial read, so a fast backend cannot lose an update.
         let changes = connection.observe()
@@ -100,6 +111,15 @@ public final class AgentConversationViewController: NSViewController {
     public func connectionChanged() { controller.connectionChanged() }
     public func sessionChanged(session: SessionId, revision: UInt64) { controller.sessionChanged(session: session, revision: revision) }
     public func focusComposer() { controller.focusContent() }
+    /// Opens the agent settings, on `provider`'s page when one is named: the host's own
+    /// through `AgentHostServices.openAgentSettings`, else AgentKit's window when the
+    /// connection manages its providers. False when neither is available.
+    @discardableResult
+    public func showAgentSettings(provider: String? = nil) -> Bool {
+        guard let open = controller.openAgentSettings else { return false }
+        open(provider)
+        return true
+    }
     public func stopVoice() { controller.didHide() }
     public func canClose() async -> Bool { await controller.willClose() }
     /// Stops the conversation and cancels queued prompts after the host has approved closing it.
